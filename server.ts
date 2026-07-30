@@ -8,7 +8,9 @@ import path from "path";
 import { createServer as createViteServer } from "vite";
 import jwt from "jsonwebtoken";
 import crypto from "crypto";
-import { db, hashPassword, UserDB, PurchaseOrderDB, AuditLogDB } from "./src/server/db.js";
+import { getDatabase, hashPassword, UserDB, PurchaseOrderDB, AuditLogDB } from "./src/server/db.js";
+import { AuthService } from "./src/server/authService.js";
+import { UserRepository } from "./src/server/userRepository.js";
 import {
   getAllowedPendingDocumentTypes,
   normalizeDocumentType,
@@ -41,7 +43,7 @@ app.use(express.static(path.join(process.cwd(), "public")));
  */
 function resolveNotificationsForDocument(docType: string, docId: string) {
   const normType = normalizeDocumentType(docType);
-  const notifs = db.getNotifications();
+  const notifs = getDatabase().getNotifications();
   let updated = false;
 
   notifs.forEach((n) => {
@@ -53,7 +55,7 @@ function resolveNotificationsForDocument(docType: string, docId: string) {
     if (isSameDoc && (n.status === "ACTIVE" || !n.status)) {
       n.status = "RESOLVED";
       updated = true;
-      db.saveNotification(n);
+      getDatabase().saveNotification(n);
     }
   });
 
@@ -96,7 +98,7 @@ function createDocumentNotification(params: {
     createdAt: now.toISOString()
   };
 
-  db.saveNotification(notif);
+  getDatabase().saveNotification(notif);
   return notif;
 }
 
@@ -162,7 +164,7 @@ function createTsdNotification(params: {
     createdAt: now.toISOString()
   };
 
-  db.saveNotification(notif);
+  getDatabase().saveNotification(notif);
   return notif;
 }
 
@@ -196,7 +198,7 @@ function logAudit(
     timestamp: new Date().toISOString()
   };
   
-  db.saveAuditLog(log);
+  getDatabase().saveAuditLog(log);
 }
 
 // Helper to resolve or auto-save suppliers (case-insensitive duplicate check)
@@ -206,7 +208,7 @@ function resolveOrCreateSupplier(supplierName: string, userId: string): { id: st
   }
   
   const trimmedName = supplierName.trim();
-  const suppliers = db.getSuppliers();
+  const suppliers = getDatabase().getSuppliers();
   
   // Case-insensitive check
   const existing = suppliers.find(
@@ -235,7 +237,7 @@ function resolveOrCreateSupplier(supplierName: string, userId: string): { id: st
     created_by: userId
   };
   
-  db.saveSupplier(newSupplier);
+  getDatabase().saveSupplier(newSupplier);
   return { id: newId, name: trimmedName };
 }
 
@@ -253,7 +255,7 @@ interface AuthRequest extends express.Request {
   };
 }
 
-const authenticateToken = (req: AuthRequest, res: express.Response, next: express.NextFunction) => {
+const authenticateToken = async (req: AuthRequest, res: express.Response, next: express.NextFunction) => {
   if (!JWT_SECRET) {
     return res.status(500).json({ error: "Server Configuration Error: JWT_SECRET environment variable is not configured." });
   }
@@ -264,13 +266,11 @@ const authenticateToken = (req: AuthRequest, res: express.Response, next: expres
     return res.status(401).json({ error: "Access token is missing" });
   }
 
-  jwt.verify(token, JWT_SECRET, (err, decoded: any) => {
-    if (err) {
-      return res.status(403).json({ error: "Invalid or expired token" });
-    }
+  try {
+    const decoded: any = await AuthService.verifyToken(token, JWT_SECRET);
     
     // Check if user is active/disabled/locked in DB
-    const dbUser = db.getUsers().find(u => u.id === decoded.id);
+    const dbUser = await UserRepository.getUserById(decoded.id);
     if (!dbUser) {
       return res.status(403).json({ error: "User no longer exists" });
     }
@@ -291,7 +291,9 @@ const authenticateToken = (req: AuthRequest, res: express.Response, next: expres
       realRole: dbUser.role
     };
     next();
-  });
+  } catch (err) {
+    return res.status(403).json({ error: "Invalid or expired token" });
+  }
 };
 
 // Admin Only Guard
@@ -307,65 +309,21 @@ const requireAdmin = (req: AuthRequest, res: express.Response, next: express.Nex
 // 1. AUTHENTICATION
 
 // Login
-app.post("/api/auth/login", (req, res) => {
+app.post("/api/auth/login", async (req, res) => {
   const { username, password } = req.body;
-  if (!username || !password) {
-    return res.status(400).json({ error: "Username and password are required" });
+  
+  const authResult = await AuthService.validateLogin(username, password);
+  if (authResult.error || !authResult.user) {
+    return res.status(authResult.status || 401).json({ error: authResult.error });
   }
 
-  const user = db.getUsers().find((u) => u.username.toLowerCase() === username.toLowerCase());
-
-  if (!user) {
-    return res.status(401).json({ error: "Invalid username or password" });
-  }
-
-  if (user.status === "Disabled") {
-    return res.status(403).json({ error: "Your account has been disabled. Please contact your Administrator." });
-  }
-
-  if (user.status === "Pending") {
-    return res.status(403).json({ error: "Your account is pending administrator approval." });
-  }
-
-  if (user.status === "Locked") {
-    return res.status(403).json({ error: "Your account is locked due to too many failed attempts." });
-  }
-
-  const hashed = hashPassword(password);
-  if (user.passwordHash !== hashed) {
-    // Track login attempts
-    const attempts = (user.loginAttempts || 0) + 1;
-    user.loginAttempts = attempts;
-    if (attempts >= 5) {
-      user.status = "Locked";
-      db.saveUser(user);
-      logAudit(user.id, user.username, user.role, "Account Locked", "Users", user.id, "Active", "Locked", req);
-      return res.status(403).json({ error: "Account locked due to 5 consecutive failed login attempts." });
-    }
-    db.saveUser(user);
-    return res.status(401).json({ error: "Invalid username or password" });
-  }
-
-  // Reset login attempts on success
-  user.loginAttempts = 0;
-  db.saveUser(user);
-
-  // Sign JWT with role and department details
-  const payload = {
-    id: user.id,
-    username: user.username,
-    fullName: user.fullName,
-    email: user.email,
-    role: user.role,
-    department: user.department,
-    position: user.position
-  };
+  const user = authResult.user;
 
   if (!JWT_SECRET) {
     return res.status(500).json({ error: "Server Configuration Error: JWT_SECRET environment variable is missing on server." });
   }
 
-  const token = jwt.sign(payload, JWT_SECRET, { expiresIn: "1h" });
+  const token = AuthService.generateToken(user, JWT_SECRET, "1h");
   
   logAudit(user.id, user.username, user.role, "User Logged In", "Auth", user.id, "-", "Token Issued", req);
 
@@ -391,9 +349,9 @@ app.post("/api/auth/login", (req, res) => {
 // Get and verify invitation
 
 
-app.get("/api/auth/invitation/:token", (req, res) => {
+app.get("/api/auth/invitation/:token", async (req, res) => {
   const { token } = req.params;
-  const invite = db.getInvitations().find((i) => i.token === token);
+  const invite = getDatabase().getInvitations().find((i) => i.token === token);
   if (!invite) {
     return res.status(404).json({ error: "Invalid invitation link." });
   }
@@ -407,7 +365,7 @@ app.get("/api/auth/invitation/:token", (req, res) => {
 });
 
 // Complete secure registration
-app.post("/api/auth/register-public", (req, res) => {
+app.post("/api/auth/register-public", async (req, res) => {
   const { username, password, fullName, department } = req.body;
   if (!username || !password || !fullName || !department) {
     return res.status(400).json({ error: "All registration fields are required." });
@@ -417,13 +375,13 @@ app.post("/api/auth/register-public", (req, res) => {
     return res.status(400).json({ error: "Password must be at least 6 characters long." });
   }
 
-  const dup = db.getUsers().find((u) => u.username.toLowerCase() === username.toLowerCase());
+  const dup = (await UserRepository.getAllUsers()).find((u) => u.username.toLowerCase() === username.toLowerCase());
   if (dup) {
     return res.status(400).json({ error: "Username is already taken." });
   }
 
   const userId = `u_${Date.now()}`;
-  const employeeId = db.getNextEmployeeId();
+  const employeeId = getDatabase().getNextEmployeeId();
   const newUser: UserDB = {
     id: userId,
     username,
@@ -437,19 +395,19 @@ app.post("/api/auth/register-public", (req, res) => {
     employeeId
   };
 
-  db.saveUser(newUser);
+  await UserRepository.saveUser(newUser);
   logAudit(userId, username, "Viewer", "User Registered", "Auth", userId, "-", "New account created via public registration (Pending Approval)", req);
 
   res.status(201).json({ message: "Registration successful. Please wait for an administrator to approve your account." });
 });
 
-app.post("/api/auth/register", (req, res) => {
+app.post("/api/auth/register", async (req, res) => {
   const { token, username, password, fullName } = req.body;
   if (!token || !username || !password || !fullName) {
     return res.status(400).json({ error: "All registration fields are required." });
   }
 
-  const invite = db.getInvitations().find((i) => i.token === token);
+  const invite = getDatabase().getInvitations().find((i) => i.token === token);
   if (!invite) {
     return res.status(404).json({ error: "Invalid invitation link." });
   }
@@ -465,13 +423,13 @@ app.post("/api/auth/register", (req, res) => {
   }
 
   // Check if username is already taken
-  const dup = db.getUsers().find((u) => u.username.toLowerCase() === username.toLowerCase());
+  const dup = (await UserRepository.getAllUsers()).find((u) => u.username.toLowerCase() === username.toLowerCase());
   if (dup) {
     return res.status(400).json({ error: "Username is already taken." });
   }
 
   const userId = `u_${Date.now()}`;
-  const employeeId = db.getNextEmployeeId();
+  const employeeId = getDatabase().getNextEmployeeId();
   const newUser: UserDB = {
     id: userId,
     username,
@@ -485,12 +443,12 @@ app.post("/api/auth/register", (req, res) => {
     employeeId
   };
 
-  db.saveUser(newUser);
+  await UserRepository.saveUser(newUser);
 
   // Mark invitation as used
   if (invite.isOneTime) {
     invite.used = true;
-    db.saveInvitation(invite);
+    getDatabase().saveInvitation(invite);
   }
 
   logAudit(userId, username, invite.role, "User Registered", "Auth", userId, "-", "New account created via invitation", req);
@@ -522,30 +480,21 @@ app.post("/api/auth/register", (req, res) => {
 });
 
 // Logout
-app.post("/api/auth/logout", authenticateToken, (req: AuthRequest, res) => {
+app.post("/api/auth/logout", authenticateToken, async (req: AuthRequest, res) => {
   const user = req.user!;
   logAudit(user.id, user.username, user.role, "User Logged Out", "Auth", user.id, "-", "Logged Out", req);
   res.json({ success: true });
 });
 
 // Refresh / Verify Session
-app.get("/api/auth/me", authenticateToken, (req: AuthRequest, res) => {
-  const user = db.getUsers().find((u) => u.id === req.user!.id);
+app.get("/api/auth/me", authenticateToken, async (req: AuthRequest, res) => {
+  const user = await UserRepository.getUserById(req.user!.id);
   if (!user) {
     return res.status(404).json({ error: "User not found" });
   }
 
   // Dynamically refresh JWT on active request to keep session alive for working users
-  const payload = {
-    id: user.id,
-    username: user.username,
-    fullName: user.fullName,
-    email: user.email,
-    role: req.user!.role,
-    department: user.department,
-    position: user.position
-  };
-  const refreshedToken = jwt.sign(payload, JWT_SECRET, { expiresIn: "1h" });
+  const refreshedToken = AuthService.generateToken({...user, role: req.user!.role}, JWT_SECRET, "1h");
 
   res.json({
     token: refreshedToken,
@@ -567,8 +516,8 @@ app.get("/api/auth/me", authenticateToken, (req: AuthRequest, res) => {
 });
 
 // Update Profile details
-app.put("/api/users/profile", authenticateToken, (req: AuthRequest, res) => {
-  const user = db.getUsers().find((u) => u.id === req.user!.id);
+app.put("/api/users/profile", authenticateToken, async (req: AuthRequest, res) => {
+  const user = (await UserRepository.getAllUsers()).find((u) => u.id === req.user!.id);
   if (!user) {
     return res.status(404).json({ error: "User not found" });
   }
@@ -622,7 +571,7 @@ app.put("/api/users/profile", authenticateToken, (req: AuthRequest, res) => {
   if (username !== undefined) {
     // Check username duplicate if changing
     if (username.toLowerCase() !== user.username.toLowerCase()) {
-      const dup = db.getUsers().find(u => u.username.toLowerCase() === username.toLowerCase());
+      const dup = (await UserRepository.getAllUsers()).find(u => u.username.toLowerCase() === username.toLowerCase());
       if (dup) {
         return res.status(400).json({ error: "Username is already taken" });
       }
@@ -634,7 +583,7 @@ app.put("/api/users/profile", authenticateToken, (req: AuthRequest, res) => {
     user.notificationPreferences = notificationPreferences;
   }
 
-  db.saveUser(user);
+  await UserRepository.saveUser(user);
   logAudit(user.id, user.username, user.role, "Update Profile", "Users", user.id, "-", "Profile Details Updated", req);
 
   res.json({
@@ -656,8 +605,8 @@ app.put("/api/users/profile", authenticateToken, (req: AuthRequest, res) => {
 });
 
 // Dedicated log-export route to prevent polluting the User Profile Update logs
-app.post("/api/audit/log-export", authenticateToken, (req: AuthRequest, res) => {
-  const user = db.getUsers().find((u) => u.id === req.user!.id);
+app.post("/api/audit/log-export", authenticateToken, async (req: AuthRequest, res) => {
+  const user = (await UserRepository.getAllUsers()).find((u) => u.id === req.user!.id);
   if (!user) {
     return res.status(404).json({ error: "User not found" });
   }
@@ -677,8 +626,8 @@ app.post("/api/audit/log-export", authenticateToken, (req: AuthRequest, res) => 
 });
 
 // Update Profile Avatar
-app.put("/api/users/profile/avatar", authenticateToken, (req: AuthRequest, res) => {
-  const user = db.getUsers().find((u) => u.id === req.user!.id);
+app.put("/api/users/profile/avatar", authenticateToken, async (req: AuthRequest, res) => {
+  const user = (await UserRepository.getAllUsers()).find((u) => u.id === req.user!.id);
   if (!user) {
     return res.status(404).json({ error: "User not found" });
   }
@@ -687,7 +636,7 @@ app.put("/api/users/profile/avatar", authenticateToken, (req: AuthRequest, res) 
   user.avatarUrl = avatarData || undefined;
   user.profile_image = avatarData || undefined;
 
-  db.saveUser(user);
+  await UserRepository.saveUser(user);
   logAudit(user.id, user.username, user.role, "Update Avatar", "Users", user.id, "-", avatarData ? "Uploaded avatar" : "Removed avatar", req);
 
   res.json({
@@ -699,24 +648,24 @@ app.put("/api/users/profile/avatar", authenticateToken, (req: AuthRequest, res) 
 
 
 // 2. USER MANAGEMENT (Admin Only)
-app.get("/api/users", authenticateToken, requireAdmin, (req, res) => {
-  const users = db.getUsers().map(({ passwordHash, ...rest }) => rest);
+app.get("/api/users", authenticateToken, requireAdmin, async (req, res) => {
+  const users = (await UserRepository.getAllUsers()).map(({ passwordHash, ...rest }) => rest);
   res.json(users);
 });
 
-app.get("/api/users/next-employee-id", authenticateToken, requireAdmin, (req, res) => {
-  const nextId = db.previewNextEmployeeId();
+app.get("/api/users/next-employee-id", authenticateToken, requireAdmin, async (req, res) => {
+  const nextId = getDatabase().previewNextEmployeeId();
   res.json({ nextEmployeeId: nextId });
 });
 
-app.post("/api/users", authenticateToken, requireAdmin, (req: AuthRequest, res) => {
+app.post("/api/users", authenticateToken, requireAdmin, async (req: AuthRequest, res) => {
   const { username, password, fullName, email, role, department, employeeId: requestedEmpId } = req.body;
   if (!username || !password || !fullName || !email || !role || !department) {
     return res.status(400).json({ error: "All fields are required" });
   }
 
   // Check if username already exists
-  const existingUsername = db.getUsers().find((u) => u.username.toLowerCase() === username.toLowerCase());
+  const existingUsername = (await UserRepository.getAllUsers()).find((u) => u.username.toLowerCase() === username.toLowerCase());
   if (existingUsername) {
     return res.status(400).json({ error: "Username already exists" });
   }
@@ -725,13 +674,13 @@ app.post("/api/users", authenticateToken, requireAdmin, (req: AuthRequest, res) 
   if (requestedEmpId && requestedEmpId.trim()) {
     const trimmed = requestedEmpId.trim();
     // Verify uniqueness
-    const existingEmpId = db.getUsers().find((u) => u.employeeId && u.employeeId.toLowerCase() === trimmed.toLowerCase());
+    const existingEmpId = (await UserRepository.getAllUsers()).find((u) => u.employeeId && u.employeeId.toLowerCase() === trimmed.toLowerCase());
     if (existingEmpId) {
       return res.status(400).json({ error: `Employee ID ${trimmed} already exists.` });
     }
     finalEmpId = trimmed;
   } else {
-    finalEmpId = db.getNextEmployeeId();
+    finalEmpId = getDatabase().getNextEmployeeId();
   }
 
   const newUser: UserDB = {
@@ -747,14 +696,14 @@ app.post("/api/users", authenticateToken, requireAdmin, (req: AuthRequest, res) 
     employeeId: finalEmpId
   };
 
-  db.saveUser(newUser);
+  await UserRepository.saveUser(newUser);
   logAudit(req.user!.id, req.user!.username, req.user!.role, "Create User", "Users", newUser.id, "-", `Created user: ${username} (${finalEmpId})`, req);
   
   const { passwordHash, ...safeUser } = newUser;
   res.status(201).json(safeUser);
 });
 
-app.post("/api/users/invite", authenticateToken, requireAdmin, (req: AuthRequest, res) => {
+app.post("/api/users/invite", authenticateToken, requireAdmin, async (req: AuthRequest, res) => {
   const { role, department, expiresIn, isOneTime } = req.body;
   if (!role || !department) {
     return res.status(400).json({ error: "Role and department are required for invitations." });
@@ -777,17 +726,17 @@ app.post("/api/users/invite", authenticateToken, requireAdmin, (req: AuthRequest
     used: false
   };
 
-  db.saveInvitation(newInvite);
+  getDatabase().saveInvitation(newInvite);
   logAudit(req.user!.id, req.user!.username, req.user!.role, "Generate Invitation Link", "Users", token, "-", `Generated link for ${role} in ${department}`, req);
 
   res.status(201).json({ token });
 });
 
-app.put("/api/users/:id", authenticateToken, requireAdmin, (req: AuthRequest, res) => {
+app.put("/api/users/:id", authenticateToken, requireAdmin, async (req: AuthRequest, res) => {
   const { fullName, email, role, department, status } = req.body;
   const targetId = req.params.id;
 
-  const user = db.getUsers().find((u) => u.id === targetId);
+  const user = (await UserRepository.getAllUsers()).find((u) => u.id === targetId);
   if (!user) {
     return res.status(404).json({ error: "User not found" });
   }
@@ -810,7 +759,7 @@ app.put("/api/users/:id", authenticateToken, requireAdmin, (req: AuthRequest, re
     }
   }
 
-  db.saveUser(user);
+  await UserRepository.saveUser(user);
   
   const newVal = `${user.role} | ${user.status} | ${user.department}`;
   logAudit(req.user!.id, req.user!.username, req.user!.role, "Update User Profile", "Users", user.id, oldVal, newVal, req);
@@ -819,7 +768,7 @@ app.put("/api/users/:id", authenticateToken, requireAdmin, (req: AuthRequest, re
   res.json(safeUser);
 });
 
-app.post("/api/users/:id/reset-password", authenticateToken, requireAdmin, (req: AuthRequest, res) => {
+app.post("/api/users/:id/reset-password", authenticateToken, requireAdmin, async (req: AuthRequest, res) => {
   const { newPassword } = req.body;
   const targetId = req.params.id;
 
@@ -827,7 +776,7 @@ app.post("/api/users/:id/reset-password", authenticateToken, requireAdmin, (req:
     return res.status(400).json({ error: "Password must be at least 6 characters long" });
   }
 
-  const user = db.getUsers().find((u) => u.id === targetId);
+  const user = (await UserRepository.getAllUsers()).find((u) => u.id === targetId);
   if (!user) {
     return res.status(404).json({ error: "User not found" });
   }
@@ -839,15 +788,15 @@ app.post("/api/users/:id/reset-password", authenticateToken, requireAdmin, (req:
     user.status = "Active";
   }
   
-  db.saveUser(user);
+  await UserRepository.saveUser(user);
   logAudit(req.user!.id, req.user!.username, req.user!.role, "Reset User Password", "Users", user.id, "-", "Password Reset Successful", req);
 
   res.json({ success: true, message: "Password reset successful" });
 });
 
-app.post("/api/users/:id/reveal-password", authenticateToken, requireAdmin, (req: AuthRequest, res) => {
+app.post("/api/users/:id/reveal-password", authenticateToken, requireAdmin, async (req: AuthRequest, res) => {
   const targetId = req.params.id;
-  const user = db.getUsers().find((u) => u.id === targetId);
+  const user = (await UserRepository.getAllUsers()).find((u) => u.id === targetId);
   if (!user) {
     return res.status(404).json({ error: "User not found" });
   }
@@ -892,19 +841,19 @@ app.post("/api/users/:id/reveal-password", authenticateToken, requireAdmin, (req
   });
 });
 
-app.delete("/api/users/:id", authenticateToken, requireAdmin, (req: AuthRequest, res) => {
+app.delete("/api/users/:id", authenticateToken, requireAdmin, async (req: AuthRequest, res) => {
   const targetId = req.params.id;
 
   if (targetId === req.user!.id) {
     return res.status(400).json({ error: "You cannot delete your own account" });
   }
 
-  const user = db.getUsers().find((u) => u.id === targetId);
+  const user = (await UserRepository.getAllUsers()).find((u) => u.id === targetId);
   if (!user) {
     return res.status(404).json({ error: "User not found" });
   }
 
-  db.deleteUser(targetId);
+  await UserRepository.deleteUser(targetId);
   logAudit(req.user!.id, req.user!.username, req.user!.role, "Delete User", "Users", targetId, user.username, "Deleted Account", req);
 
   res.json({ success: true, message: "User deleted successfully" });
@@ -913,7 +862,7 @@ app.delete("/api/users/:id", authenticateToken, requireAdmin, (req: AuthRequest,
 
 // 3. ROLE MANAGEMENT (Admin Only)
 app.get("/api/roles", authenticateToken, requireAdmin, (req, res) => {
-  res.json(db.getRoles());
+  res.json(getDatabase().getRoles());
 });
 
 app.post("/api/roles", authenticateToken, requireAdmin, (req: AuthRequest, res) => {
@@ -923,7 +872,7 @@ app.post("/api/roles", authenticateToken, requireAdmin, (req: AuthRequest, res) 
   }
 
   const trimmedName = name.trim();
-  const existing = db.getRoles().find(r => r.name.toLowerCase() === trimmedName.toLowerCase());
+  const existing = getDatabase().getRoles().find(r => r.name.toLowerCase() === trimmedName.toLowerCase());
   if (existing) {
     return res.status(400).json({ error: `Role '${trimmedName}' already exists.` });
   }
@@ -934,7 +883,7 @@ app.post("/api/roles", authenticateToken, requireAdmin, (req: AuthRequest, res) 
     permissions: permissions || []
   };
 
-  db.saveRole(newRole);
+  getDatabase().saveRole(newRole);
   logAudit(req.user!.id, req.user!.username, req.user!.role, "Create Role", "Roles", newRole.id, "-", newRole.name, req);
   res.status(201).json(newRole);
 });
@@ -943,13 +892,13 @@ app.put("/api/roles/:id", authenticateToken, requireAdmin, (req: AuthRequest, re
   const { permissions } = req.body;
   const roleId = req.params.id;
 
-  const role = db.getRoles().find((r) => r.id === roleId);
+  const role = getDatabase().getRoles().find((r) => r.id === roleId);
   if (!role) {
     return res.status(404).json({ error: "Role not found" });
 
 app.delete("/api/roles/:id", authenticateToken, requireAdmin, (req: AuthRequest, res) => {
   const { id } = req.params;
-  const roles = db.getRoles();
+  const roles = getDatabase().getRoles();
   const index = roles.findIndex((r) => r.id === id);
   if (index === -1) {
     return res.status(404).json({ error: "Role not found" });
@@ -961,7 +910,7 @@ app.delete("/api/roles/:id", authenticateToken, requireAdmin, (req: AuthRequest,
   
   const roleName = roles[index].name;
   roles.splice(index, 1);
-  db.saveRoles(roles);
+  getDatabase().saveRoles(roles);
   
   if (req.user) {
     logAudit(req.user.id, req.user.username, req.user.role, "Delete Role", "Roles", id, roleName, "-", req);
@@ -974,7 +923,7 @@ app.delete("/api/roles/:id", authenticateToken, requireAdmin, (req: AuthRequest,
 
   const oldVal = role.permissions.join(", ");
   role.permissions = permissions;
-  db.saveRole(role);
+  getDatabase().saveRole(role);
 
   logAudit(req.user!.id, req.user!.username, req.user!.role, "Update Role Permissions", "Roles", role.id, oldVal, permissions.join(", "), req);
 
@@ -984,11 +933,11 @@ app.delete("/api/roles/:id", authenticateToken, requireAdmin, (req: AuthRequest,
 
 // 4. DEPARTMENTS & SUPPLIERS
 app.get("/api/departments", authenticateToken, (req, res) => {
-  res.json(db.getDepartments());
+  res.json(getDatabase().getDepartments());
 });
 
 app.get("/api/suppliers", authenticateToken, (req, res) => {
-  res.json(db.getSuppliers());
+  res.json(getDatabase().getSuppliers());
 });
 
 app.post("/api/suppliers", authenticateToken, (req: AuthRequest, res) => {
@@ -1001,14 +950,14 @@ app.post("/api/suppliers", authenticateToken, (req: AuthRequest, res) => {
   }
 
   const trimmedName = name.trim();
-  const existing = db.getSuppliers().find(
+  const existing = getDatabase().getSuppliers().find(
     s => s.name.toLowerCase() === trimmedName.toLowerCase()
   );
   if (existing) {
     return res.status(400).json({ error: `Supplier '${trimmedName}' already exists.` });
   }
 
-  const existingSuppliers = db.getSuppliers();
+  const existingSuppliers = getDatabase().getSuppliers();
   let maxIdNum = 0;
   existingSuppliers.forEach(s => {
     const match = s.id.match(/^[sS]_?(\d+)$/);
@@ -1034,7 +983,7 @@ app.post("/api/suppliers", authenticateToken, (req: AuthRequest, res) => {
     created_by: req.user!.fullName || req.user!.username
   };
 
-  db.saveSupplier(newSupplier);
+  getDatabase().saveSupplier(newSupplier);
   logAudit(req.user!.id, req.user!.username, req.user!.role, "Create Supplier", "Suppliers", newSupplier.id, "-", `Created: ${name}`, req);
 
   res.status(201).json(newSupplier);
@@ -1045,7 +994,7 @@ app.put("/api/suppliers/:id", authenticateToken, (req: AuthRequest, res) => {
     return res.status(403).json({ error: "Access Denied: You do not have permission to update suppliers." });
   }
   const supplierId = req.params.id;
-  const supplier = db.getSuppliers().find((s) => s.id === supplierId);
+  const supplier = getDatabase().getSuppliers().find((s) => s.id === supplierId);
   if (!supplier) {
     return res.status(404).json({ error: "Supplier not found" });
   }
@@ -1055,7 +1004,7 @@ app.put("/api/suppliers/:id", authenticateToken, (req: AuthRequest, res) => {
 
   if (name && name.trim().toLowerCase() !== supplier.name.toLowerCase()) {
     const trimmedName = name.trim();
-    const existing = db.getSuppliers().find(
+    const existing = getDatabase().getSuppliers().find(
       s => s.id !== supplierId && s.name.toLowerCase() === trimmedName.toLowerCase()
     );
     if (existing) {
@@ -1070,7 +1019,7 @@ app.put("/api/suppliers/:id", authenticateToken, (req: AuthRequest, res) => {
   if (category) supplier.category = category;
   if (status) supplier.status = status;
 
-  db.saveSupplier(supplier);
+  getDatabase().saveSupplier(supplier);
   logAudit(req.user!.id, req.user!.username, req.user!.role, "Update Supplier", "Suppliers", supplier.id, oldVal, `${supplier.name} (${supplier.status || "Active"})`, req);
 
   res.json(supplier);
@@ -1085,7 +1034,7 @@ app.post("/api/suppliers/merge", authenticateToken, (req: AuthRequest, res) => {
   if (!sourceId || !targetId) {
     return res.status(400).json({ error: "Source and Target suppliers are required" });
   }
-  const suppliers = db.getSuppliers();
+  const suppliers = getDatabase().getSuppliers();
   const source = suppliers.find(s => s.id === sourceId);
   const target = suppliers.find(s => s.id === targetId);
   if (!source || !target) {
@@ -1093,19 +1042,19 @@ app.post("/api/suppliers/merge", authenticateToken, (req: AuthRequest, res) => {
   }
 
   // Update all POs pointing to sourceId to targetId
-  const pos = db.getPurchaseOrders();
+  const pos = getDatabase().getPurchaseOrders();
   let updatedCount = 0;
   pos.forEach(po => {
     if (po.supplierId === sourceId) {
       po.supplierId = targetId;
       po.supplierName = target.name;
-      db.savePurchaseOrder(po);
+      getDatabase().savePurchaseOrder(po);
       updatedCount++;
     }
   });
 
   // Delete source supplier
-  db.deleteSupplier(sourceId);
+  getDatabase().deleteSupplier(sourceId);
 
   logAudit(req.user!.id, req.user!.username, req.user!.role, "Merge Supplier", "Suppliers", targetId, source.name, `Merged into: ${target.name} (Updated ${updatedCount} POs)`, req);
 
@@ -1117,13 +1066,13 @@ app.delete("/api/suppliers/:id", authenticateToken, (req: AuthRequest, res) => {
     return res.status(403).json({ error: "Access Denied: You do not have permission to delete suppliers." });
   }
   const supplierId = req.params.id;
-  const supplier = db.getSuppliers().find((s) => s.id === supplierId);
+  const supplier = getDatabase().getSuppliers().find((s) => s.id === supplierId);
   if (!supplier) {
     return res.status(404).json({ error: "Supplier not found" });
   }
 
   // Check if there are any purchase orders linked to this supplier
-  const linkedPOs = db.getPurchaseOrders().filter(po => po.supplierId === supplierId);
+  const linkedPOs = getDatabase().getPurchaseOrders().filter(po => po.supplierId === supplierId);
   if (linkedPOs.length > 0) {
     return res.status(400).json({ 
       error: "This supplier is linked to existing Purchase Orders.", 
@@ -1131,7 +1080,7 @@ app.delete("/api/suppliers/:id", authenticateToken, (req: AuthRequest, res) => {
     });
   }
 
-  db.deleteSupplier(supplierId);
+  getDatabase().deleteSupplier(supplierId);
   logAudit(req.user!.id, req.user!.username, req.user!.role, "Delete Supplier", "Suppliers", supplierId, supplier.name, "-", req);
 
   res.json({ success: true });
@@ -1140,7 +1089,7 @@ app.delete("/api/suppliers/:id", authenticateToken, (req: AuthRequest, res) => {
 function getNextPONumber(): string {
   const currentYear = new Date().getFullYear();
   const prefix = `SMEI-${currentYear}-`;
-  const records = db.getPurchaseOrders();
+  const records = getDatabase().getPurchaseOrders();
   let maxSeq = 0;
   for (const r of records) {
     if (r.poNumber && r.poNumber.startsWith(prefix)) {
@@ -1170,9 +1119,9 @@ app.get("/api/pos/next-number", authenticateToken, (req: AuthRequest, res) => {
 });
 
 app.get("/api/pos", authenticateToken, (req: AuthRequest, res) => {
-  db.logDatabaseOperation("SMEI_MANAGEMENT_SYSTEM", "PurchaseOrder", "READ");
+  getDatabase().logDatabaseOperation("SMEI_MANAGEMENT_SYSTEM", "PurchaseOrder", "READ");
   const user = req.user!;
-  let pos = db.getPurchaseOrders();
+  let pos = getDatabase().getPurchaseOrders();
 
   // 10. DEPARTMENT RESTRICTIONS
   // Department Heads only see Purchase Orders from their department
@@ -1256,7 +1205,7 @@ app.post("/api/pos", authenticateToken, (req: AuthRequest, res) => {
   poData.supplierName = resolvedSupplier.name;
 
   // Check for duplicate PO Number
-  const duplicate = db.getPurchaseOrders().find(p => p.poNumber.toUpperCase() === poData.poNumber.toUpperCase());
+  const duplicate = getDatabase().getPurchaseOrders().find(p => p.poNumber.toUpperCase() === poData.poNumber.toUpperCase());
   if (duplicate) {
     return res.status(400).json({ error: `Purchase Order Number '${poData.poNumber}' already exists.` });
   }
@@ -1274,7 +1223,7 @@ app.post("/api/pos", authenticateToken, (req: AuthRequest, res) => {
     updatedAt: new Date().toISOString()
   };
 
-  db.savePurchaseOrder(newPO);
+  getDatabase().savePurchaseOrder(newPO);
   logAudit(user.id, user.username, user.role, "Create PO", "Purchase Orders", newPO.id, "-", `${newPO.poNumber} (Draft)`, req);
 
   res.status(201).json(newPO);
@@ -1284,7 +1233,7 @@ app.post("/api/pos", authenticateToken, (req: AuthRequest, res) => {
 app.put("/api/pos/:id", authenticateToken, (req: AuthRequest, res) => {
   const user = req.user!;
   const poId = req.params.id;
-  const po = db.getPurchaseOrders().find(p => p.id === poId);
+  const po = getDatabase().getPurchaseOrders().find(p => p.id === poId);
 
   if (!po) {
     return res.status(404).json({ error: "Purchase Order not found" });
@@ -1316,7 +1265,7 @@ app.put("/api/pos/:id", authenticateToken, (req: AuthRequest, res) => {
 
   // Check for duplicate PO Number
   if (updateData.poNumber && updateData.poNumber.toUpperCase() !== po.poNumber.toUpperCase()) {
-    const duplicate = db.getPurchaseOrders().find(p => p.poNumber.toUpperCase() === updateData.poNumber.toUpperCase());
+    const duplicate = getDatabase().getPurchaseOrders().find(p => p.poNumber.toUpperCase() === updateData.poNumber.toUpperCase());
     if (duplicate) {
       return res.status(400).json({ error: `Purchase Order Number '${updateData.poNumber}' already exists.` });
     }
@@ -1344,7 +1293,7 @@ app.put("/api/pos/:id", authenticateToken, (req: AuthRequest, res) => {
     updatedAt: new Date().toISOString()
   });
 
-  db.savePurchaseOrder(po);
+  getDatabase().savePurchaseOrder(po);
   logAudit(user.id, user.username, user.role, "Edit PO", "Purchase Orders", po.id, oldVal, po.status, req);
 
   res.json(po);
@@ -1354,7 +1303,7 @@ app.put("/api/pos/:id", authenticateToken, (req: AuthRequest, res) => {
 app.delete("/api/pos/:id", authenticateToken, (req: AuthRequest, res) => {
   const user = req.user!;
   const poId = req.params.id;
-  const po = db.getPurchaseOrders().find(p => p.id === poId);
+  const po = getDatabase().getPurchaseOrders().find(p => p.id === poId);
 
   if (!po) {
     return res.status(404).json({ error: "Purchase Order not found" });
@@ -1380,7 +1329,7 @@ app.delete("/api/pos/:id", authenticateToken, (req: AuthRequest, res) => {
   }
 
   resolveNotificationsForDocument("PO", poId);
-  db.deletePurchaseOrder(poId);
+  getDatabase().deletePurchaseOrder(poId);
   logAudit(user.id, user.username, user.role, "Delete PO", "Purchase Orders", poId, po.poNumber, "-", req);
 
   res.json({ success: true });
@@ -1392,7 +1341,7 @@ app.post("/api/pos/:id/workflow", authenticateToken, (req: AuthRequest, res) => 
   const poId = req.params.id;
   const { action, remarks } = req.body; // action: "Submit", "Approve", "Verify", "Final Approve", "Reject", "Return"
   
-  const po = db.getPurchaseOrders().find(p => p.id === poId);
+  const po = getDatabase().getPurchaseOrders().find(p => p.id === poId);
   if (!po) {
     return res.status(404).json({ error: "Purchase Order not found" });
   }
@@ -1522,7 +1471,7 @@ app.post("/api/pos/:id/workflow", authenticateToken, (req: AuthRequest, res) => 
       newStatus = "Rejected"; // Move back to Rejected (which functions as an editable draft)
       
       // Save approval action log
-      db.saveApprovalLog({
+      getDatabase().saveApprovalLog({
         id: `app_${Date.now()}`,
         poId: po.id,
         userId: user.id,
@@ -1552,10 +1501,10 @@ app.post("/api/pos/:id/workflow", authenticateToken, (req: AuthRequest, res) => 
 
   po.status = newStatus;
   po.updatedAt = new Date().toISOString();
-  db.savePurchaseOrder(po);
+  getDatabase().savePurchaseOrder(po);
 
   // Save Approval History Log
-  db.saveApprovalLog({
+  getDatabase().saveApprovalLog({
     id: `app_${Date.now()}`,
     poId: po.id,
     userId: user.id,
@@ -1573,14 +1522,14 @@ app.post("/api/pos/:id/workflow", authenticateToken, (req: AuthRequest, res) => 
 
 // Get PO approvals logs
 app.get("/api/pos/:id/approvals", authenticateToken, (req, res) => {
-  const approvals = db.getApprovals().filter(a => a.poId === req.params.id);
+  const approvals = getDatabase().getApprovals().filter(a => a.poId === req.params.id);
   res.json(approvals);
 });
 
 
 // 6. AUDIT TRAIL LOGS (Admin Only)
 app.get("/api/audit-logs", authenticateToken, requireAdmin, (req, res) => {
-  res.json(db.getAuditLogs());
+  res.json(getDatabase().getAuditLogs());
 });
 
 app.post("/api/audit-logs", authenticateToken, (req: AuthRequest, res) => {
@@ -1609,7 +1558,7 @@ app.get("/api/notifications", authenticateToken, (req: AuthRequest, res) => {
   const user = req.user!;
   const portalQuery = req.query.portal ? String(req.query.portal).toUpperCase().trim() : undefined;
   const allowedDocTypes = getAllowedPendingDocumentTypes(user.role);
-  let notifs = db.getNotifications();
+  let notifs = getDatabase().getNotifications();
 
   // Filter based on role or specific user ID and allowed document types
   notifs = notifs.filter((n) => {
@@ -1666,7 +1615,7 @@ app.post("/api/notifications", authenticateToken, (req: AuthRequest, res) => {
     createdAt: notifData.createdAt || now.toISOString()
   };
 
-  db.saveNotification(notif);
+  getDatabase().saveNotification(notif);
   res.json(notif);
 });
 
@@ -1674,10 +1623,10 @@ app.get("/api/procurement-approvals/pending", authenticateToken, (req: AuthReque
   const user = req.user!;
   const allowedTypes = getAllowedPendingDocumentTypes(user.role);
 
-  const pendingPOs = allowedTypes.includes("PO") ? db.getPurchaseOrders().filter(isPOPending) : [];
-  const pendingPIS = allowedTypes.includes("PIS") ? db.getPaymentInstructionSlips().filter(isPISPending) : [];
-  const pendingRFS = allowedTypes.includes("RFS") ? db.getRequestsForSupply().filter(isRFSPending) : [];
-  const pendingCanvasses = allowedTypes.includes("CANVASS") ? db.getCanvassSheets().filter(isCanvassPending) : [];
+  const pendingPOs = allowedTypes.includes("PO") ? getDatabase().getPurchaseOrders().filter(isPOPending) : [];
+  const pendingPIS = allowedTypes.includes("PIS") ? getDatabase().getPaymentInstructionSlips().filter(isPISPending) : [];
+  const pendingRFS = allowedTypes.includes("RFS") ? getDatabase().getRequestsForSupply().filter(isRFSPending) : [];
+  const pendingCanvasses = allowedTypes.includes("CANVASS") ? getDatabase().getCanvassSheets().filter(isCanvassPending) : [];
 
   res.json({
     allowedTypes,
@@ -1690,17 +1639,17 @@ app.get("/api/procurement-approvals/pending", authenticateToken, (req: AuthReque
 });
 
 app.put("/api/notifications/:id/read", authenticateToken, (req, res) => {
-  const notif = db.getNotifications().find(n => n.id === req.params.id);
+  const notif = getDatabase().getNotifications().find(n => n.id === req.params.id);
   if (notif) {
     notif.isRead = true;
-    db.saveNotification(notif);
+    getDatabase().saveNotification(notif);
   }
   res.json({ success: true });
 });
 
 app.put("/api/notifications/read-all", authenticateToken, (req: AuthRequest, res) => {
   const user = req.user!;
-  const notifs = db.getNotifications().filter(n => {
+  const notifs = getDatabase().getNotifications().filter(n => {
     if (n.userId && n.userId === user.id) return true;
     if (!n.userId && n.role === user.role) return true;
     return false;
@@ -1708,7 +1657,7 @@ app.put("/api/notifications/read-all", authenticateToken, (req: AuthRequest, res
 
   notifs.forEach(n => {
     n.isRead = true;
-    db.saveNotification(n);
+    getDatabase().saveNotification(n);
   });
 
   res.json({ success: true });
@@ -1716,7 +1665,7 @@ app.put("/api/notifications/read-all", authenticateToken, (req: AuthRequest, res
 
 app.delete("/api/notifications/clear-read", authenticateToken, (req: AuthRequest, res) => {
   const user = req.user!;
-  const notifs = db.getNotifications().filter(n => {
+  const notifs = getDatabase().getNotifications().filter(n => {
     const matchesUser =
       (n.userId && n.userId === user.id) ||
       (!n.userId && n.role === user.role) ||
@@ -1725,7 +1674,7 @@ app.delete("/api/notifications/clear-read", authenticateToken, (req: AuthRequest
   });
 
   notifs.forEach(n => {
-    db.deleteNotification(n.id);
+    getDatabase().deleteNotification(n.id);
   });
 
   res.json({ success: true, count: notifs.length });
@@ -1740,7 +1689,7 @@ app.delete("/api/notifications/clear-read", authenticateToken, (req: AuthRequest
 function getNextPISNumber(): string {
   const yearStr = new Date().getFullYear().toString().slice(-2); // "26"
   const prefix = `PURC-PIS-${yearStr}-`;
-  const records = db.getPaymentInstructionSlips();
+  const records = getDatabase().getPaymentInstructionSlips();
   let maxSeq = 0;
   for (const r of records) {
     if (r.pisNumber && r.pisNumber.startsWith(prefix)) {
@@ -1761,7 +1710,7 @@ function getNextRFSNumber(): string {
   const yyyy = date.getFullYear().toString();
   const mm = (date.getMonth() + 1).toString().padStart(2, "0");
   const prefix = `${yyyy}-${mm}-`;
-  const records = db.getRequestsForSupply();
+  const records = getDatabase().getRequestsForSupply();
   let maxSeq = 0;
   for (const r of records) {
     if (r.rfsNumber && r.rfsNumber.startsWith(prefix)) {
@@ -1778,7 +1727,7 @@ function getNextRFSNumber(): string {
 }
 
 function getNextCanvassNumber(): string {
-  const records = db.getCanvassSheets();
+  const records = getDatabase().getCanvassSheets();
   let maxSeq = 0;
   for (const r of records) {
     if (r.canvassNumber) {
@@ -1794,8 +1743,8 @@ function getNextCanvassNumber(): string {
 
 // 1. PAYMENT INSTRUCTION SLIP (PIS) ROUTES
 app.get("/api/pis", authenticateToken, (req: AuthRequest, res) => {
-  db.logDatabaseOperation("SMEI_MANAGEMENT_SYSTEM", "PIS", "READ");
-  res.json(db.getPaymentInstructionSlips());
+  getDatabase().logDatabaseOperation("SMEI_MANAGEMENT_SYSTEM", "PIS", "READ");
+  res.json(getDatabase().getPaymentInstructionSlips());
 });
 
 app.get("/api/pis/next-number", authenticateToken, (req: AuthRequest, res) => {
@@ -1803,7 +1752,7 @@ app.get("/api/pis/next-number", authenticateToken, (req: AuthRequest, res) => {
 });
 
 app.get("/api/pis/:id", authenticateToken, (req: AuthRequest, res) => {
-  const item = db.getPaymentInstructionSlips().find(p => p.id === req.params.id);
+  const item = getDatabase().getPaymentInstructionSlips().find(p => p.id === req.params.id);
   if (!item) return res.status(404).json({ error: "Payment Instruction Slip not found" });
   res.json(item);
 });
@@ -1826,7 +1775,7 @@ app.post("/api/pis", authenticateToken, (req: AuthRequest, res) => {
   }
 
   // Check duplicate PIS number
-  const duplicate = db.getPaymentInstructionSlips().find(p => p.pisNumber.toUpperCase() === data.pisNumber.toUpperCase());
+  const duplicate = getDatabase().getPaymentInstructionSlips().find(p => p.pisNumber.toUpperCase() === data.pisNumber.toUpperCase());
   if (duplicate) {
     return res.status(400).json({ error: `Payment Instruction Slip Number '${data.pisNumber}' already exists.` });
   }
@@ -1849,7 +1798,7 @@ app.post("/api/pis", authenticateToken, (req: AuthRequest, res) => {
     updatedAt: new Date().toISOString()
   };
 
-  db.savePaymentInstructionSlip(newPIS);
+  getDatabase().savePaymentInstructionSlip(newPIS);
   logAudit(user.id, user.username, user.role, "Create Payment Instruction Slip", "PIS", newPIS.id, "-", newPIS.pisNumber, req);
   res.status(201).json(newPIS);
 });
@@ -1860,7 +1809,7 @@ app.put("/api/pis/:id", authenticateToken, (req: AuthRequest, res) => {
     return res.status(403).json({ error: "Access Denied: Viewers cannot edit or approve Payment Instruction Slips." });
   }
 
-  const existing = db.getPaymentInstructionSlips().find(p => p.id === req.params.id);
+  const existing = getDatabase().getPaymentInstructionSlips().find(p => p.id === req.params.id);
   if (!existing) return res.status(404).json({ error: "Payment Instruction Slip not found" });
 
   const data = req.body;
@@ -1871,7 +1820,7 @@ app.put("/api/pis/:id", authenticateToken, (req: AuthRequest, res) => {
       return res.status(400).json({ error: "Invalid PIS Number format. Expected: PURC-PIS-YY-###" });
     }
     // Check duplicate
-    const duplicate = db.getPaymentInstructionSlips().find(p => p.id !== req.params.id && p.pisNumber.toUpperCase() === data.pisNumber.toUpperCase());
+    const duplicate = getDatabase().getPaymentInstructionSlips().find(p => p.id !== req.params.id && p.pisNumber.toUpperCase() === data.pisNumber.toUpperCase());
     if (duplicate) {
       return res.status(400).json({ error: `PIS Number '${data.pisNumber}' already exists.` });
     }
@@ -1887,7 +1836,7 @@ app.put("/api/pis/:id", authenticateToken, (req: AuthRequest, res) => {
     updatedAt: new Date().toISOString()
   };
 
-  db.savePaymentInstructionSlip(updatedPIS);
+  getDatabase().savePaymentInstructionSlip(updatedPIS);
   logAudit(user.id, user.username, user.role, "Update Payment Instruction Slip", "PIS", updatedPIS.id, existing.pisNumber, updatedPIS.pisNumber, req);
   res.json(updatedPIS);
 });
@@ -1898,18 +1847,18 @@ app.delete("/api/pis/:id", authenticateToken, (req: AuthRequest, res) => {
     return res.status(403).json({ error: "Access Denied: Only Purchasing Staff or Admin can delete Payment Instruction Slips." });
   }
 
-  const existing = db.getPaymentInstructionSlips().find(p => p.id === req.params.id);
+  const existing = getDatabase().getPaymentInstructionSlips().find(p => p.id === req.params.id);
   if (!existing) return res.status(404).json({ error: "Payment Instruction Slip not found" });
 
   resolveNotificationsForDocument("PIS", req.params.id);
-  db.deletePaymentInstructionSlip(req.params.id);
+  getDatabase().deletePaymentInstructionSlip(req.params.id);
   logAudit(user.id, user.username, user.role, "Delete Payment Instruction Slip", "PIS", req.params.id, existing.pisNumber, "-", req);
   res.json({ success: true });
 });
 
 // 2. REQUEST FOR SUPPLY (RFS) ROUTES
 app.get("/api/rfs", authenticateToken, (req: AuthRequest, res) => {
-  res.json(db.getRequestsForSupply());
+  res.json(getDatabase().getRequestsForSupply());
 });
 
 app.get("/api/rfs/next-number", authenticateToken, (req: AuthRequest, res) => {
@@ -1917,7 +1866,7 @@ app.get("/api/rfs/next-number", authenticateToken, (req: AuthRequest, res) => {
 });
 
 app.get("/api/rfs/:id", authenticateToken, (req: AuthRequest, res) => {
-  const item = db.getRequestsForSupply().find(r => r.id === req.params.id);
+  const item = getDatabase().getRequestsForSupply().find(r => r.id === req.params.id);
   if (!item) return res.status(404).json({ error: "Request for Supply not found" });
   res.json(item);
 });
@@ -1940,7 +1889,7 @@ app.post("/api/rfs", authenticateToken, (req: AuthRequest, res) => {
   }
 
   // Check duplicate
-  const duplicate = db.getRequestsForSupply().find(r => r.rfsNumber.toUpperCase() === data.rfsNumber.toUpperCase());
+  const duplicate = getDatabase().getRequestsForSupply().find(r => r.rfsNumber.toUpperCase() === data.rfsNumber.toUpperCase());
   if (duplicate) {
     return res.status(400).json({ error: `RFS Number '${data.rfsNumber}' already exists.` });
   }
@@ -1969,14 +1918,14 @@ app.post("/api/rfs", authenticateToken, (req: AuthRequest, res) => {
     updatedAt: new Date().toISOString()
   };
 
-  db.saveRequestForSupply(newRFS);
+  getDatabase().saveRequestForSupply(newRFS);
   logAudit(user.id, user.username, user.role, "Create Request for Supply", "RFS", newRFS.id, "-", newRFS.rfsNumber, req);
   res.status(201).json(newRFS);
 });
 
 app.put("/api/rfs/:id", authenticateToken, (req: AuthRequest, res) => {
   const user = req.user!;
-  const roles = db.getRoles();
+  const roles = getDatabase().getRoles();
   const userRole = roles.find(r => r.name === user.role);
   const hasApproveRfs = userRole?.permissions.includes("approve_rfs");
 
@@ -1984,7 +1933,7 @@ app.put("/api/rfs/:id", authenticateToken, (req: AuthRequest, res) => {
     return res.status(403).json({ error: "Access Denied: Only Purchasing Staff, Admin, or users with RFS Approval permission can edit/approve Requests for Supply." });
   }
 
-  const existing = db.getRequestsForSupply().find(r => r.id === req.params.id);
+  const existing = getDatabase().getRequestsForSupply().find(r => r.id === req.params.id);
   if (!existing) return res.status(404).json({ error: "Request for Supply not found" });
 
   const data = req.body;
@@ -1995,7 +1944,7 @@ app.put("/api/rfs/:id", authenticateToken, (req: AuthRequest, res) => {
       return res.status(400).json({ error: "Invalid RFS Number format. Expected: YYYY-MM-###" });
     }
     // Check duplicate
-    const duplicate = db.getRequestsForSupply().find(r => r.id !== req.params.id && r.rfsNumber.toUpperCase() === data.rfsNumber.toUpperCase());
+    const duplicate = getDatabase().getRequestsForSupply().find(r => r.id !== req.params.id && r.rfsNumber.toUpperCase() === data.rfsNumber.toUpperCase());
     if (duplicate) {
       return res.status(400).json({ error: `RFS Number '${data.rfsNumber}' already exists.` });
     }
@@ -2023,7 +1972,7 @@ app.put("/api/rfs/:id", authenticateToken, (req: AuthRequest, res) => {
     updatedAt: new Date().toISOString()
   };
 
-  db.saveRequestForSupply(updatedRFS);
+  getDatabase().saveRequestForSupply(updatedRFS);
   logAudit(user.id, user.username, user.role, "Update Request for Supply", "RFS", updatedRFS.id, existing.rfsNumber, updatedRFS.rfsNumber, req);
   res.json(updatedRFS);
 });
@@ -2034,18 +1983,18 @@ app.delete("/api/rfs/:id", authenticateToken, (req: AuthRequest, res) => {
     return res.status(403).json({ error: "Access Denied: Only Purchasing Staff or Admin can delete Requests for Supply." });
   }
 
-  const existing = db.getRequestsForSupply().find(r => r.id === req.params.id);
+  const existing = getDatabase().getRequestsForSupply().find(r => r.id === req.params.id);
   if (!existing) return res.status(404).json({ error: "Request for Supply not found" });
 
   resolveNotificationsForDocument("RFS", req.params.id);
-  db.deleteRequestForSupply(req.params.id);
+  getDatabase().deleteRequestForSupply(req.params.id);
   logAudit(user.id, user.username, user.role, "Delete Request for Supply", "RFS", req.params.id, existing.rfsNumber, "-", req);
   res.json({ success: true });
 });
 
 // 3. CANVASS SHEET ROUTES
 app.get("/api/canvass", authenticateToken, (req: AuthRequest, res) => {
-  res.json(db.getCanvassSheets());
+  res.json(getDatabase().getCanvassSheets());
 });
 
 app.get("/api/canvass/next-number", authenticateToken, (req: AuthRequest, res) => {
@@ -2053,7 +2002,7 @@ app.get("/api/canvass/next-number", authenticateToken, (req: AuthRequest, res) =
 });
 
 app.get("/api/canvass/:id", authenticateToken, (req: AuthRequest, res) => {
-  const item = db.getCanvassSheets().find(c => c.id === req.params.id);
+  const item = getDatabase().getCanvassSheets().find(c => c.id === req.params.id);
   if (!item) return res.status(404).json({ error: "Canvass Sheet not found" });
   res.json(item);
 });
@@ -2076,7 +2025,7 @@ app.post("/api/canvass", authenticateToken, (req: AuthRequest, res) => {
   }
 
   // Check duplicate
-  const duplicate = db.getCanvassSheets().find(c => c.canvassNumber.toUpperCase() === data.canvassNumber.toUpperCase());
+  const duplicate = getDatabase().getCanvassSheets().find(c => c.canvassNumber.toUpperCase() === data.canvassNumber.toUpperCase());
   if (duplicate) {
     return res.status(400).json({ error: `Canvass Sheet Number '${data.canvassNumber}' already exists.` });
   }
@@ -2104,7 +2053,7 @@ app.post("/api/canvass", authenticateToken, (req: AuthRequest, res) => {
     updatedAt: new Date().toISOString()
   };
 
-  db.saveCanvassSheet(newCanvass);
+  getDatabase().saveCanvassSheet(newCanvass);
   logAudit(user.id, user.username, user.role, "Create Canvass Sheet", "Canvass", newCanvass.id, "-", newCanvass.canvassNumber, req);
   res.status(201).json(newCanvass);
 });
@@ -2115,7 +2064,7 @@ app.put("/api/canvass/:id", authenticateToken, (req: AuthRequest, res) => {
     return res.status(403).json({ error: "Access Denied: Viewers cannot edit or approve Canvass Sheets." });
   }
 
-  const existing = db.getCanvassSheets().find(c => c.id === req.params.id);
+  const existing = getDatabase().getCanvassSheets().find(c => c.id === req.params.id);
   if (!existing) return res.status(404).json({ error: "Canvass Sheet not found" });
 
   const data = req.body;
@@ -2126,7 +2075,7 @@ app.put("/api/canvass/:id", authenticateToken, (req: AuthRequest, res) => {
       return res.status(400).json({ error: "Invalid Canvass Number format. Expected: 5-digit sequential number (e.g. 00001)" });
     }
     // Check duplicate
-    const duplicate = db.getCanvassSheets().find(c => c.id !== req.params.id && c.canvassNumber.toUpperCase() === data.canvassNumber.toUpperCase());
+    const duplicate = getDatabase().getCanvassSheets().find(c => c.id !== req.params.id && c.canvassNumber.toUpperCase() === data.canvassNumber.toUpperCase());
     if (duplicate) {
       return res.status(400).json({ error: `Canvass Sheet Number '${data.canvassNumber}' already exists.` });
     }
@@ -2154,7 +2103,7 @@ app.put("/api/canvass/:id", authenticateToken, (req: AuthRequest, res) => {
     updatedAt: new Date().toISOString()
   };
 
-  db.saveCanvassSheet(updatedCanvass);
+  getDatabase().saveCanvassSheet(updatedCanvass);
   logAudit(user.id, user.username, user.role, "Update Canvass Sheet", "Canvass", updatedCanvass.id, existing.canvassNumber, updatedCanvass.canvassNumber, req);
   res.json(updatedCanvass);
 });
@@ -2165,11 +2114,11 @@ app.delete("/api/canvass/:id", authenticateToken, (req: AuthRequest, res) => {
     return res.status(403).json({ error: "Access Denied: Only Purchasing Staff or Admin can delete Canvass Sheets." });
   }
 
-  const existing = db.getCanvassSheets().find(c => c.id === req.params.id);
+  const existing = getDatabase().getCanvassSheets().find(c => c.id === req.params.id);
   if (!existing) return res.status(404).json({ error: "Canvass Sheet not found" });
 
   resolveNotificationsForDocument("CANVASS", req.params.id);
-  db.deleteCanvassSheet(req.params.id);
+  getDatabase().deleteCanvassSheet(req.params.id);
   logAudit(user.id, user.username, user.role, "Delete Canvass Sheet", "Canvass", req.params.id, existing.canvassNumber, "-", req);
   res.json({ success: true });
 });
@@ -2190,7 +2139,7 @@ app.post("/api/procurement-approvals/:docType/:docId/approve", authenticateToken
   let targetDoc: any = null;
 
   if (upperDocType === "PO") {
-    targetDoc = db.getPurchaseOrders().find(p => p.id === docId);
+    targetDoc = getDatabase().getPurchaseOrders().find(p => p.id === docId);
     if (!targetDoc) return res.status(404).json({ error: "Purchase Order not found" });
     docNumber = targetDoc.poNumber;
     targetDoc.status = "Approved";
@@ -2215,10 +2164,10 @@ app.post("/api/procurement-approvals/:docType/:docId/approve", authenticateToken
       timestamp,
       details: "Approved via Procurement Approval Module"
     });
-    db.savePurchaseOrder(targetDoc);
+    getDatabase().savePurchaseOrder(targetDoc);
 
   } else if (upperDocType === "PIS") {
-    targetDoc = db.getPaymentInstructionSlips().find(p => p.id === docId);
+    targetDoc = getDatabase().getPaymentInstructionSlips().find(p => p.id === docId);
     if (!targetDoc) return res.status(404).json({ error: "Payment Instruction Slip not found" });
     docNumber = targetDoc.pisNumber;
     targetDoc.status = "Approved";
@@ -2243,10 +2192,10 @@ app.post("/api/procurement-approvals/:docType/:docId/approve", authenticateToken
       timestamp,
       details: "Approved via Procurement Approval Module"
     });
-    db.savePaymentInstructionSlip(targetDoc);
+    getDatabase().savePaymentInstructionSlip(targetDoc);
 
   } else if (upperDocType === "RFS") {
-    targetDoc = db.getRequestsForSupply().find(r => r.id === docId);
+    targetDoc = getDatabase().getRequestsForSupply().find(r => r.id === docId);
     if (!targetDoc) return res.status(404).json({ error: "Request for Supply not found" });
     docNumber = targetDoc.rfsNumber;
     targetDoc.approvalStatus = "Approved";
@@ -2280,10 +2229,10 @@ app.post("/api/procurement-approvals/:docType/:docId/approve", authenticateToken
       timestamp,
       details: "Approved via Procurement Approval Module"
     });
-    db.saveRequestForSupply(targetDoc);
+    getDatabase().saveRequestForSupply(targetDoc);
 
   } else if (upperDocType === "CANVASS") {
-    targetDoc = db.getCanvassSheets().find(c => c.id === docId);
+    targetDoc = getDatabase().getCanvassSheets().find(c => c.id === docId);
     if (!targetDoc) return res.status(404).json({ error: "Canvass Sheet not found" });
     docNumber = targetDoc.canvassNumber;
     targetDoc.status = "Approved";
@@ -2306,7 +2255,7 @@ app.post("/api/procurement-approvals/:docType/:docId/approve", authenticateToken
       timestamp,
       details: "Approved via Procurement Approval Module"
     });
-    db.saveCanvassSheet(targetDoc);
+    getDatabase().saveCanvassSheet(targetDoc);
 
   } else {
     return res.status(400).json({ error: "Unsupported document type" });
@@ -2362,7 +2311,7 @@ app.post("/api/procurement-approvals/:docType/:docId/reject", authenticateToken,
   let targetDoc: any = null;
 
   if (upperDocType === "PO") {
-    targetDoc = db.getPurchaseOrders().find(p => p.id === docId);
+    targetDoc = getDatabase().getPurchaseOrders().find(p => p.id === docId);
     if (!targetDoc) return res.status(404).json({ error: "Purchase Order not found" });
     docNumber = targetDoc.poNumber;
     targetDoc.status = "Rejected";
@@ -2386,10 +2335,10 @@ app.post("/api/procurement-approvals/:docType/:docId/reject", authenticateToken,
       reason: reason.trim(),
       details: `Rejected: ${reason.trim()}`
     });
-    db.savePurchaseOrder(targetDoc);
+    getDatabase().savePurchaseOrder(targetDoc);
 
   } else if (upperDocType === "PIS") {
-    targetDoc = db.getPaymentInstructionSlips().find(p => p.id === docId);
+    targetDoc = getDatabase().getPaymentInstructionSlips().find(p => p.id === docId);
     if (!targetDoc) return res.status(404).json({ error: "Payment Instruction Slip not found" });
     docNumber = targetDoc.pisNumber;
     targetDoc.status = "Rejected";
@@ -2413,10 +2362,10 @@ app.post("/api/procurement-approvals/:docType/:docId/reject", authenticateToken,
       reason: reason.trim(),
       details: `Rejected: ${reason.trim()}`
     });
-    db.savePaymentInstructionSlip(targetDoc);
+    getDatabase().savePaymentInstructionSlip(targetDoc);
 
   } else if (upperDocType === "RFS") {
-    targetDoc = db.getRequestsForSupply().find(r => r.id === docId);
+    targetDoc = getDatabase().getRequestsForSupply().find(r => r.id === docId);
     if (!targetDoc) return res.status(404).json({ error: "Request for Supply not found" });
     docNumber = targetDoc.rfsNumber;
     targetDoc.approvalStatus = "Rejected";
@@ -2439,10 +2388,10 @@ app.post("/api/procurement-approvals/:docType/:docId/reject", authenticateToken,
       reason: reason.trim(),
       details: `Rejected: ${reason.trim()}`
     });
-    db.saveRequestForSupply(targetDoc);
+    getDatabase().saveRequestForSupply(targetDoc);
 
   } else if (upperDocType === "CANVASS") {
-    targetDoc = db.getCanvassSheets().find(c => c.id === docId);
+    targetDoc = getDatabase().getCanvassSheets().find(c => c.id === docId);
     if (!targetDoc) return res.status(404).json({ error: "Canvass Sheet not found" });
     docNumber = targetDoc.canvassNumber;
     targetDoc.status = "Rejected";
@@ -2466,7 +2415,7 @@ app.post("/api/procurement-approvals/:docType/:docId/reject", authenticateToken,
       reason: reason.trim(),
       details: `Rejected: ${reason.trim()}`
     });
-    db.saveCanvassSheet(targetDoc);
+    getDatabase().saveCanvassSheet(targetDoc);
 
   } else {
     return res.status(400).json({ error: "Unsupported document type" });
@@ -2535,7 +2484,7 @@ app.post("/api/procurement-approvals/:docType/:docId/export", authenticateToken,
   let docNumber = "";
 
   if (upperDocType === "PO") {
-    targetDoc = db.getPurchaseOrders().find(p => p.id === docId);
+    targetDoc = getDatabase().getPurchaseOrders().find(p => p.id === docId);
     if (!targetDoc) return res.status(404).json({ error: "Purchase Order not found" });
     docNumber = targetDoc.poNumber;
     if (targetDoc.approvalStatus !== "Approved" && targetDoc.status !== "Approved" && targetDoc.status !== "Closed" && user.role !== "Administrator") {
@@ -2560,10 +2509,10 @@ app.post("/api/procurement-approvals/:docType/:docId/export", authenticateToken,
       timestamp,
       details: "Exported via Procurement Approval Module"
     });
-    db.savePurchaseOrder(targetDoc);
+    getDatabase().savePurchaseOrder(targetDoc);
 
   } else if (upperDocType === "PIS") {
-    targetDoc = db.getPaymentInstructionSlips().find(p => p.id === docId);
+    targetDoc = getDatabase().getPaymentInstructionSlips().find(p => p.id === docId);
     if (!targetDoc) return res.status(404).json({ error: "Payment Instruction Slip not found" });
     docNumber = targetDoc.pisNumber;
     if (targetDoc.approvalStatus !== "Approved" && targetDoc.status !== "Approved" && user.role !== "Administrator") {
@@ -2588,10 +2537,10 @@ app.post("/api/procurement-approvals/:docType/:docId/export", authenticateToken,
       timestamp,
       details: "Exported via Procurement Approval Module"
     });
-    db.savePaymentInstructionSlip(targetDoc);
+    getDatabase().savePaymentInstructionSlip(targetDoc);
 
   } else if (upperDocType === "RFS") {
-    targetDoc = db.getRequestsForSupply().find(r => r.id === docId);
+    targetDoc = getDatabase().getRequestsForSupply().find(r => r.id === docId);
     if (!targetDoc) return res.status(404).json({ error: "Request for Supply not found" });
     docNumber = targetDoc.rfsNumber;
     if (targetDoc.approvalStatus !== "Approved" && targetDoc.status !== "Complete" && user.role !== "Administrator") {
@@ -2616,10 +2565,10 @@ app.post("/api/procurement-approvals/:docType/:docId/export", authenticateToken,
       timestamp,
       details: "Exported via Procurement Approval Module"
     });
-    db.saveRequestForSupply(targetDoc);
+    getDatabase().saveRequestForSupply(targetDoc);
 
   } else if (upperDocType === "CANVASS") {
-    targetDoc = db.getCanvassSheets().find(c => c.id === docId);
+    targetDoc = getDatabase().getCanvassSheets().find(c => c.id === docId);
     if (!targetDoc) return res.status(404).json({ error: "Canvass Sheet not found" });
     docNumber = targetDoc.canvassNumber;
     if (targetDoc.approvalStatus !== "Approved" && targetDoc.status !== "Approved" && user.role !== "Administrator") {
@@ -2644,7 +2593,7 @@ app.post("/api/procurement-approvals/:docType/:docId/export", authenticateToken,
       timestamp,
       details: "Exported via Procurement Approval Module"
     });
-    db.saveCanvassSheet(targetDoc);
+    getDatabase().saveCanvassSheet(targetDoc);
 
   } else {
     return res.status(400).json({ error: "Unsupported document type" });
@@ -2703,32 +2652,32 @@ app.post("/api/procurement-approvals/:docType/:docId/signature-note", authentica
   };
 
   if (upperDocType === "PO") {
-    targetDoc = db.getPurchaseOrders().find(p => p.id === docId);
+    targetDoc = getDatabase().getPurchaseOrders().find(p => p.id === docId);
     if (!targetDoc) return res.status(404).json({ error: "Purchase Order not found" });
     docNumber = targetDoc.poNumber;
     getUpdatedHistory(targetDoc, "PO", docNumber);
-    db.savePurchaseOrder(targetDoc);
+    getDatabase().savePurchaseOrder(targetDoc);
 
   } else if (upperDocType === "PIS") {
-    targetDoc = db.getPaymentInstructionSlips().find(p => p.id === docId);
+    targetDoc = getDatabase().getPaymentInstructionSlips().find(p => p.id === docId);
     if (!targetDoc) return res.status(404).json({ error: "Payment Instruction Slip not found" });
     docNumber = targetDoc.pisNumber;
     getUpdatedHistory(targetDoc, "PIS", docNumber);
-    db.savePaymentInstructionSlip(targetDoc);
+    getDatabase().savePaymentInstructionSlip(targetDoc);
 
   } else if (upperDocType === "RFS") {
-    targetDoc = db.getRequestsForSupply().find(r => r.id === docId);
+    targetDoc = getDatabase().getRequestsForSupply().find(r => r.id === docId);
     if (!targetDoc) return res.status(404).json({ error: "Request for Supply not found" });
     docNumber = targetDoc.rfsNumber;
     getUpdatedHistory(targetDoc, "RFS", docNumber);
-    db.saveRequestForSupply(targetDoc);
+    getDatabase().saveRequestForSupply(targetDoc);
 
   } else if (upperDocType === "CANVASS") {
-    targetDoc = db.getCanvassSheets().find(c => c.id === docId);
+    targetDoc = getDatabase().getCanvassSheets().find(c => c.id === docId);
     if (!targetDoc) return res.status(404).json({ error: "Canvass Sheet not found" });
     docNumber = targetDoc.canvassNumber;
     getUpdatedHistory(targetDoc, "CANVASS", docNumber);
-    db.saveCanvassSheet(targetDoc);
+    getDatabase().saveCanvassSheet(targetDoc);
 
   } else {
     return res.status(400).json({ error: "Unsupported document type" });
@@ -2744,8 +2693,8 @@ app.post("/api/procurement-approvals/:docType/:docId/signature-note", authentica
 
 // Helper: Calculate Document Type & Portal Statistics
 function computeMonitoringOverview() {
-  const settings = db.getMonitoringSettings();
-  const allFiles = db.getMonitoringFiles();
+  const settings = getDatabase().getMonitoringSettings();
+  const allFiles = getDatabase().getMonitoringFiles();
   const activeFiles = allFiles.filter((f) => f.status === "ACTIVE" || !f.status);
 
   let totalStorageBytes = 0;
@@ -2815,7 +2764,7 @@ function computeMonitoringOverview() {
 
   // DB Operation Logs for Today
   const today = new Date().toISOString().split("T")[0];
-  const todayOperations = db.getMonitoringOperations(today);
+  const todayOperations = getDatabase().getMonitoringOperations(today);
 
   let dbReadsToday = 0;
   let dbWritesToday = 0; // Creates
@@ -2868,7 +2817,7 @@ function computeMonitoringOverview() {
   }
 
   // Create or update today's snapshot
-  db.createMonitoringSnapshot({
+  getDatabase().createMonitoringSnapshot({
     date: today,
     totalStorageBytes,
     totalFilesCount: activeFiles.length,
@@ -2912,14 +2861,14 @@ function computeMonitoringOverview() {
 }
 
 app.get("/api/monitoring/overview", authenticateToken, (req, res) => {
-  db.logDatabaseOperation("SMEI_MANAGEMENT_SYSTEM", "SystemMonitoring", "READ");
+  getDatabase().logDatabaseOperation("SMEI_MANAGEMENT_SYSTEM", "SystemMonitoring", "READ");
   const overview = computeMonitoringOverview();
   res.json(overview);
 });
 
 app.get("/api/monitoring/files", authenticateToken, (req, res) => {
-  db.logDatabaseOperation("SMEI_MANAGEMENT_SYSTEM", "SystemMonitoring", "READ");
-  let files = db.getMonitoringFiles();
+  getDatabase().logDatabaseOperation("SMEI_MANAGEMENT_SYSTEM", "SystemMonitoring", "READ");
+  let files = getDatabase().getMonitoringFiles();
 
   const { portal, documentType, status, search, sortBy, sortOrder } = req.query;
 
@@ -2967,41 +2916,41 @@ app.get("/api/monitoring/files", authenticateToken, (req, res) => {
 });
 
 app.post("/api/monitoring/files/sync", authenticateToken, (req: AuthRequest, res) => {
-  db.logDatabaseOperation("SMEI_MANAGEMENT_SYSTEM", "SystemMonitoring", "CREATE");
+  getDatabase().logDatabaseOperation("SMEI_MANAGEMENT_SYSTEM", "SystemMonitoring", "CREATE");
   const { files } = req.body;
   if (Array.isArray(files)) {
-    db.bulkSyncMonitoringFiles(files);
+    getDatabase().bulkSyncMonitoringFiles(files);
   }
   res.json({ success: true, count: files ? files.length : 0 });
 });
 
 app.post("/api/monitoring/files", authenticateToken, (req: AuthRequest, res) => {
-  db.logDatabaseOperation("SMEI_MANAGEMENT_SYSTEM", "SystemMonitoring", "CREATE");
+  getDatabase().logDatabaseOperation("SMEI_MANAGEMENT_SYSTEM", "SystemMonitoring", "CREATE");
   const fileRecord = req.body;
   if (!fileRecord || !fileRecord.id) {
     return res.status(400).json({ error: "File record ID is required" });
   }
-  db.saveMonitoringFile(fileRecord);
+  getDatabase().saveMonitoringFile(fileRecord);
   res.json({ success: true, file: fileRecord });
 });
 
 app.delete("/api/monitoring/files/:id", authenticateToken, (req: AuthRequest, res) => {
-  db.logDatabaseOperation("SMEI_MANAGEMENT_SYSTEM", "SystemMonitoring", "DELETE");
+  getDatabase().logDatabaseOperation("SMEI_MANAGEMENT_SYSTEM", "SystemMonitoring", "DELETE");
   const { id } = req.params;
-  db.deleteMonitoringFile(id);
+  getDatabase().deleteMonitoringFile(id);
   res.json({ success: true, message: "File status marked as DELETED" });
 });
 
 app.get("/api/monitoring/history", authenticateToken, (req, res) => {
-  db.logDatabaseOperation("SMEI_MANAGEMENT_SYSTEM", "SystemMonitoring", "READ");
-  const snapshots = db.getMonitoringSnapshots();
-  const operationsLog = db.getMonitoringOperations();
+  getDatabase().logDatabaseOperation("SMEI_MANAGEMENT_SYSTEM", "SystemMonitoring", "READ");
+  const snapshots = getDatabase().getMonitoringSnapshots();
+  const operationsLog = getDatabase().getMonitoringOperations();
   res.json({ snapshots, operationsLog });
 });
 
 app.get("/api/monitoring/forecast", authenticateToken, (req, res) => {
-  db.logDatabaseOperation("SMEI_MANAGEMENT_SYSTEM", "SystemMonitoring", "READ");
-  const snapshots = db.getMonitoringSnapshots();
+  getDatabase().logDatabaseOperation("SMEI_MANAGEMENT_SYSTEM", "SystemMonitoring", "READ");
+  const snapshots = getDatabase().getMonitoringSnapshots();
   
   if (!snapshots || snapshots.length < 2) {
     return res.json({
@@ -3020,7 +2969,7 @@ app.get("/api/monitoring/forecast", authenticateToken, (req, res) => {
   const avgDailyGrowthBytes = Math.max(0, bytesGrowth / daysDiff);
 
   const currentStorage = last.totalStorageBytes || 0;
-  const settings = db.getMonitoringSettings();
+  const settings = getDatabase().getMonitoringSettings();
   const limit = settings.storageLimitBytes || 5368709120;
   const remainingBytes = Math.max(0, limit - currentStorage);
 
@@ -3039,14 +2988,14 @@ app.get("/api/monitoring/forecast", authenticateToken, (req, res) => {
 });
 
 app.get("/api/monitoring/settings", authenticateToken, (req, res) => {
-  db.logDatabaseOperation("SMEI_MANAGEMENT_SYSTEM", "SystemMonitoring", "READ");
-  res.json(db.getMonitoringSettings());
+  getDatabase().logDatabaseOperation("SMEI_MANAGEMENT_SYSTEM", "SystemMonitoring", "READ");
+  res.json(getDatabase().getMonitoringSettings());
 });
 
 app.put("/api/monitoring/settings", authenticateToken, (req: AuthRequest, res) => {
-  db.logDatabaseOperation("SMEI_MANAGEMENT_SYSTEM", "SystemMonitoring", "UPDATE");
-  db.saveMonitoringSettings(req.body);
-  res.json({ success: true, settings: db.getMonitoringSettings() });
+  getDatabase().logDatabaseOperation("SMEI_MANAGEMENT_SYSTEM", "SystemMonitoring", "UPDATE");
+  getDatabase().saveMonitoringSettings(req.body);
+  res.json({ success: true, settings: getDatabase().getMonitoringSettings() });
 });
 
 // ---------------- GEMINI AI SERVER-SIDE ROUTES ----------------

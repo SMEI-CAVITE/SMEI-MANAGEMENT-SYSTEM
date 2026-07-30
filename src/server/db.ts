@@ -218,7 +218,12 @@ export interface DBStructure {
   monitoring_settings?: any;
 }
 
-const DATA_DIR = path.join(process.cwd(), "data");
+// TEMPORARY COMPATIBILITY SUPPORT FOR VERCEL
+// Vercel serverless functions have a read-only filesystem except for /tmp.
+// This is a temporary patch to prevent crashes while migrating modules to Firebase.
+// Data stored in /tmp will be lost between invocations.
+const isVercel = process.env.VERCEL === "1";
+const DATA_DIR = isVercel ? path.join("/tmp", "data") : path.join(process.cwd(), "data");
 const DB_FILE = path.join(DATA_DIR, "db.json");
 
 class Database {
@@ -997,4 +1002,11 @@ class Database {
   }
 }
 
-export const db = new Database();
+let dbInstance: Database | null = null;
+
+export function getDatabase(): Database {
+  if (!dbInstance) {
+    dbInstance = new Database();
+  }
+  return dbInstance;
+}
