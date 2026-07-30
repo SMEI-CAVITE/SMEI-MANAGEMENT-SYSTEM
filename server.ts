@@ -25,7 +25,13 @@ import fs from "fs";
 
 const app = express();
 const PORT = 3000;
-const JWT_SECRET = process.env.JWT_SECRET || "smei-enterprise-secret-key-2026-secure-token";
+const JWT_SECRET = process.env.JWT_SECRET || "";
+if (!JWT_SECRET) {
+  console.error("==================================================================");
+  console.error("STARTUP ERROR: JWT_SECRET environment variable is not configured!");
+  console.error("Please configure JWT_SECRET in your environment or Vercel settings.");
+  console.error("==================================================================");
+}
 
 app.use(express.json({ limit: "50mb" }));
 app.use(express.static(path.join(process.cwd(), "public")));
@@ -248,6 +254,9 @@ interface AuthRequest extends express.Request {
 }
 
 const authenticateToken = (req: AuthRequest, res: express.Response, next: express.NextFunction) => {
+  if (!JWT_SECRET) {
+    return res.status(500).json({ error: "Server Configuration Error: JWT_SECRET environment variable is not configured." });
+  }
   const authHeader = req.headers["authorization"];
   const token = authHeader && authHeader.split(" ")[1];
 
@@ -351,6 +360,10 @@ app.post("/api/auth/login", (req, res) => {
     department: user.department,
     position: user.position
   };
+
+  if (!JWT_SECRET) {
+    return res.status(500).json({ error: "Server Configuration Error: JWT_SECRET environment variable is missing on server." });
+  }
 
   const token = jwt.sign(payload, JWT_SECRET, { expiresIn: "1h" });
   
@@ -3036,10 +3049,46 @@ app.put("/api/monitoring/settings", authenticateToken, (req: AuthRequest, res) =
   res.json({ success: true, settings: db.getMonitoringSettings() });
 });
 
+// ---------------- GEMINI AI SERVER-SIDE ROUTES ----------------
+app.get("/api/ai/status", (req, res) => {
+  const apiKey = process.env.GEMINI_API_KEY;
+  res.json({
+    configured: Boolean(apiKey && apiKey.trim() !== ""),
+    message: apiKey ? "Gemini API key is configured on server." : "GEMINI_API_KEY environment variable is missing."
+  });
+});
+
+app.post("/api/ai/generate", authenticateToken, async (req: AuthRequest, res) => {
+  try {
+    const apiKey = process.env.GEMINI_API_KEY;
+    if (!apiKey) {
+      return res.status(500).json({ error: "GEMINI_API_KEY environment variable is not configured on server." });
+    }
+    const { prompt } = req.body;
+    if (!prompt) {
+      return res.status(400).json({ error: "Prompt is required." });
+    }
+    const { GoogleGenAI } = await import("@google/genai");
+    const ai = new GoogleGenAI({ apiKey });
+    const response = await ai.models.generateContent({
+      model: "gemini-2.5-flash",
+      contents: prompt,
+    });
+    res.json({ text: response.text });
+  } catch (err: any) {
+    res.status(500).json({ error: err.message || "Failed to generate AI response." });
+  }
+});
 
 // ---------------- VITE MIDDLEWARE SETUP & BOOTSTRAP ----------------
 
 async function bootstrap() {
+  const isVercel = process.env.VERCEL === "1" || Boolean(process.env.VERCEL_ENV);
+  if (isVercel) {
+    // On Vercel, serverless functions handle API routing and Vercel CDN serves static assets
+    return;
+  }
+
   const isProd = process.env.NODE_ENV === "production" || 
                  (process.argv[1] && (process.argv[1].endsWith(".cjs") || process.argv[1].includes("dist")));
 
@@ -3076,3 +3125,6 @@ async function bootstrap() {
 bootstrap().catch((err) => {
   console.error("Critical server boot error:", err);
 });
+
+export default app;
+export { app };

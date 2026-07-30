@@ -6,6 +6,7 @@
 import React, { useState, useEffect } from "react";
 import { User, UserRole } from "../types";
 import { api } from "../lib/api";
+import { getAppUrl } from "../config/env";
 import { motion } from "motion/react";
 import { 
   UserPlus, 
@@ -374,7 +375,7 @@ export default function UserManagement({ currentUser }: UserManagementProps = {}
         expiresIn: linkConfig.expiresIn,
         isOneTime: linkConfig.isOneTime
       });
-      const origin = window.location.origin;
+      const origin = getAppUrl();
       const link = `${origin}/register?token=${data.token}`;
       setGeneratedLink(link);
       setSuccess("Employee secure registration link generated successfully!");

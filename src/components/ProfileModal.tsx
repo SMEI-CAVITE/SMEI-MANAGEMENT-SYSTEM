@@ -4,6 +4,7 @@
  */
 
 import React, { useState, useRef, useEffect } from "react";
+import { getAppUrl } from "../config/env";
 import { motion, AnimatePresence } from "motion/react";
 import { 
   X, 
@@ -775,13 +776,13 @@ export default function ProfileModal({
                           <input 
                             type="text"
                             readOnly
-                            value={window.location.origin}
+                            value={getAppUrl()}
                             className="flex-1 bg-white border border-gray-200 rounded-lg text-xs p-2 focus:outline-none font-mono text-gray-600"
                           />
                           <button
                             type="button"
                             onClick={() => {
-                              navigator.clipboard.writeText(window.location.origin);
+                              navigator.clipboard.writeText(getAppUrl());
                               setToast({ message: "Portal URL copied to clipboard.", type: "success" });
                               setTimeout(() => setToast(null), 3000);
                             }}
