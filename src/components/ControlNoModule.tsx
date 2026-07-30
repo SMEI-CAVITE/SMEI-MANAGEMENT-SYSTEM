@@ -22,6 +22,7 @@ import { saveManifestRecord, deleteManifestRecordByDocId, getAllManifestRecords,
 import { attachRecordToWorkflow, setActiveWorkflow, getActiveWorkflow, getAllWorkflows, propagateControlNoToWorkflowDocs, saveWorkflows } from "../utils/workflowManager";
 import { notificationRepository } from "../services/notificationRepository";
 import { uploadDocumentFile, deleteDocumentFile, getDocumentUrl } from "../services/storageService";
+import { WorkflowRepository } from "../services/workflowRepository";
 
 interface UploadedDocument {
   id: string;
@@ -159,12 +160,12 @@ export default function ControlNoModule() {
   /**
    * Safely append a single document to localStorage reading fresh data to prevent stale closure data loss
    */
-  const appendDocToStorage = (newDoc: UploadedDocument) => {
+  const appendDocToStorage = async (newDoc: UploadedDocument) => {
     try {
       attachRecordToWorkflow("control-no", newDoc, newDoc.caNumber);
     } catch (err: any) {
       alert(err.message || "No active workflow is selected. Please select or create a workflow before saving this document.");
-      return;
+      throw err;
     }
     if (newDoc.caNumber) {
       localStorage.setItem("tsd_active_control_no", normalizeControlNo(newDoc.caNumber));
@@ -188,6 +189,17 @@ export default function ControlNoModule() {
       if (existingConflict) {
         throw new Error(`A Control Number with identifier "${newDoc.caNumber}" already exists.`);
       }
+    }
+
+    // Save metadata to Firestore
+    try {
+      const safeDocToSave = { ...newDoc };
+      delete safeDocToSave.fileData;
+      await WorkflowRepository.saveComplianceDoc(safeDocToSave);
+    } catch (fsErr: any) {
+      console.error("[ControlNoModule] Failed to save compliance doc to Firestore:", fsErr);
+      alert(`Firestore Persistence Error: Unable to save document ${newDoc.fileName} to database. ${fsErr?.message || ''}`);
+      throw fsErr;
     }
 
     const updated = [newDoc, ...existingDocs.filter(d => d.id !== newDoc.id)];
@@ -386,6 +398,7 @@ export default function ControlNoModule() {
         console.log(`[FORENSIC STAGE 5] Creating ManifestRecord object: id=${newRecord.id}, docId=${docId}, deliveryDate=${newRecord.deliveryDate}`);
 
         saveManifestRecord(newRecord);
+        await WorkflowRepository.saveModuleRecord("tsd_manifests", newRecord);
 
         // 4. Upload PDF binary to Firebase Storage for cloud persistence
         const uploadMeta = await uploadDocumentFile(
@@ -407,7 +420,7 @@ export default function ControlNoModule() {
           uploadedBy: uploadMeta.uploadedBy
         };
 
-        appendDocToStorage(newDoc);
+        await appendDocToStorage(newDoc);
         successCount++;
         console.log(`[FORENSIC STAGE 5 Success] File ${i + 1}/${totalFiles}: ${file.name} -> docId=${docId}`);
 
@@ -462,7 +475,17 @@ export default function ControlNoModule() {
     if (confirm("Are you sure you want to delete this document?")) {
       const targetDoc = uploadedDocs.find(d => d.id === id);
       if (targetDoc && targetDoc.storagePath) {
-        await deleteDocumentFile(targetDoc.storagePath);
+        try {
+          await deleteDocumentFile(targetDoc.storagePath);
+        } catch (e) {
+          console.warn("[ControlNoModule] Storage file deletion warning:", e);
+        }
+      }
+      try {
+        await WorkflowRepository.deleteComplianceDoc(id);
+        await WorkflowRepository.deleteModuleRecord("tsd_manifests", `manifest-${id}`);
+      } catch (fsErr) {
+        console.error("[ControlNoModule] Firestore delete document error:", fsErr);
       }
       const updated = uploadedDocs.filter(d => d.id !== id);
       saveDocsToStorage(updated);
@@ -620,6 +643,17 @@ export default function ControlNoModule() {
 
     saveDocsToStorage(updatedDocs);
     localStorage.setItem("tsd_active_control_no", normalizeControlNo(trimmedInput));
+
+    const editedDocTarget = updatedDocs.find(d => d.id === editingDoc.id);
+    if (editedDocTarget) {
+      try {
+        const safeDocToSave = { ...editedDocTarget };
+        delete safeDocToSave.fileData;
+        await WorkflowRepository.saveComplianceDoc(safeDocToSave);
+      } catch (fsErr) {
+        console.error("[ControlNoModule] Failed to update edited compliance doc in Firestore:", fsErr);
+      }
+    }
 
     // 3. Update associated manifest records in localStorage
     try {

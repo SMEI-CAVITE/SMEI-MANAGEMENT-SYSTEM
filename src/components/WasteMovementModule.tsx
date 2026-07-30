@@ -23,6 +23,7 @@ import { attachRecordToWorkflow, setActiveWorkflow, getActiveWorkflow, getAllWor
 import { notificationRepository } from "../services/notificationRepository";
 import { safeSetLocalStorage } from "../utils/heavyStorage";
 import { uploadDocumentFile, deleteDocumentFile, getDocumentUrl } from "../services/storageService";
+import { WorkflowRepository } from "../services/workflowRepository";
 
 export function formatQuantityDisplay(qty: any): string {
   if (qty === null || qty === undefined || String(qty).trim() === "") return "-";
@@ -756,6 +757,16 @@ export default function WasteMovementModule() {
         alert(err.message || "No active workflow is selected. Please select or create a workflow before saving this document.");
         return;
       }
+
+      // Save to Firestore FIRST
+      try {
+        await WorkflowRepository.saveWasteMovementRecord(targetRecord);
+      } catch (fsErr: any) {
+        console.error("[WasteMovementModule] Failed to save record to Firestore:", fsErr);
+        alert("Firestore Persistence Error: Unable to save waste movement record to database. Please check your network connection and try again.");
+        return;
+      }
+
       const updated = movements.map(m => m.id === editingRecordId ? targetRecord : m);
       saveToStorage(updated);
       showNotification("Waste movement summary document updated successfully.", "success");
@@ -792,6 +803,16 @@ export default function WasteMovementModule() {
         alert(err.message || "No active workflow is selected. Please select or create a workflow before saving this document.");
         return;
       }
+
+      // Save to Firestore FIRST
+      try {
+        await WorkflowRepository.saveWasteMovementRecord(targetRecord);
+      } catch (fsErr: any) {
+        console.error("[WasteMovementModule] Failed to save record to Firestore:", fsErr);
+        alert("Firestore Persistence Error: Unable to save waste movement record to database. Please check your network connection and try again.");
+        return;
+      }
+
       saveToStorage([targetRecord, ...movements]);
       setSelectedMovementId(targetId);
       showNotification("Waste movement summary document created successfully.", "success");
@@ -817,7 +838,16 @@ export default function WasteMovementModule() {
     if (confirm("Are you sure you want to permanently delete this waste movement summary document?")) {
       const targetDoc = movements.find(m => m.id === id);
       if (targetDoc?.storagePath) {
-        await deleteDocumentFile(targetDoc.storagePath);
+        try {
+          await deleteDocumentFile(targetDoc.storagePath);
+        } catch (storageErr) {
+          console.warn("[WasteMovementModule] Storage file deletion warning:", storageErr);
+        }
+      }
+      try {
+        await WorkflowRepository.deleteWasteMovementRecord(id);
+      } catch (fsErr) {
+        console.error("[WasteMovementModule] Failed to delete record from Firestore:", fsErr);
       }
       const updated = movements.filter(m => m.id !== id);
       saveToStorage(updated);

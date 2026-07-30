@@ -20,6 +20,7 @@ import { attachRecordToWorkflow, setActiveWorkflow, getActiveWorkflow, getAllWor
 import { getHeavyPayload, saveHeavyPayload, deleteHeavyPayload, safeSetLocalStorage } from "../utils/heavyStorage";
 import { notificationRepository } from "../services/notificationRepository";
 import { uploadDocumentFile, deleteDocumentFile, getDocumentUrl } from "../services/storageService";
+import { WorkflowRepository } from "../services/workflowRepository";
 
 interface ComplianceRecord {
   id: string;
@@ -366,6 +367,16 @@ export default function UnloadingLoadingModule() {
         alert(err.message || "No active workflow is selected. Please select or create a workflow before saving this document.");
         return;
       }
+
+      // Save to Firestore FIRST
+      try {
+        await WorkflowRepository.saveUnloadingRecord(targetRecord);
+      } catch (fsErr: any) {
+        console.error("[UnloadingLoadingModule] Failed to save record to Firestore:", fsErr);
+        alert("Firestore Persistence Error: Unable to save record to database. Please check your network connection and try again.");
+        return;
+      }
+
       updatedDocs = compRecords.map(r => r.id === editingRecord.id ? targetRecord : r);
       saveCompToStorage(updatedDocs);
       setSelectedRecordId(editingRecord.id);
@@ -392,6 +403,16 @@ export default function UnloadingLoadingModule() {
         alert(err.message || "No active workflow is selected. Please select or create a workflow before saving this document.");
         return;
       }
+
+      // Save to Firestore FIRST
+      try {
+        await WorkflowRepository.saveUnloadingRecord(targetRecord);
+      } catch (fsErr: any) {
+        console.error("[UnloadingLoadingModule] Failed to save record to Firestore:", fsErr);
+        alert("Firestore Persistence Error: Unable to save record to database. Please check your network connection and try again.");
+        return;
+      }
+
       updatedDocs = [targetRecord, ...compRecords];
       saveCompToStorage(updatedDocs);
       setSelectedRecordId(targetRecord.id);
@@ -426,9 +447,14 @@ export default function UnloadingLoadingModule() {
     setIsModalOpen(true);
   };
 
-  const handleDeleteComp = (id: string, e?: React.MouseEvent) => {
+  const handleDeleteComp = async (id: string, e?: React.MouseEvent) => {
     if (e) e.stopPropagation();
     if (confirm("Are you sure you want to permanently delete this unloading/loading compliance record?")) {
+      try {
+        await WorkflowRepository.deleteUnloadingRecord(id);
+      } catch (fsErr) {
+        console.error("[UnloadingLoadingModule] Failed to delete record from Firestore:", fsErr);
+      }
       const updated = compRecords.filter(r => r.id !== id);
       saveCompToStorage(updated);
       deleteHeavyPayload(`tsd_unloading_data_${id}`);

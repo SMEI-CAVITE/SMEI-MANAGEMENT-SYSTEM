@@ -19,6 +19,7 @@ import { attachRecordToWorkflow, setActiveWorkflow, getActiveWorkflow, getAllWor
 import { getHeavyPayload, saveHeavyPayload, deleteHeavyPayload, safeSetLocalStorage } from "../utils/heavyStorage";
 import { notificationRepository } from "../services/notificationRepository";
 import { uploadDocumentFile, deleteDocumentFile, getDocumentUrl } from "../services/storageService";
+import { WorkflowRepository } from "../services/workflowRepository";
 
 interface TimestampRecord {
   id: string;
@@ -329,6 +330,15 @@ export default function TimestampModule() {
       return;
     }
 
+    // Save to Firestore FIRST
+    try {
+      await WorkflowRepository.saveTimestampRecord(newRecord);
+    } catch (fsErr: any) {
+      console.error("[TimestampModule] Failed to save record to Firestore:", fsErr);
+      alert("Firestore Persistence Error: Unable to save timestamp record to database. Please check your network connection and try again.");
+      return;
+    }
+
     const updated = [newRecord, ...records];
     saveToStorage(updated);
     setSelectedRecordId(newRecord.id);
@@ -353,7 +363,16 @@ export default function TimestampModule() {
     if (confirm("Are you sure you want to permanently delete this timestamp record from the compliance registry?")) {
       const targetRecord = records.find(r => r.id === id);
       if (targetRecord?.storagePath) {
-        await deleteDocumentFile(targetRecord.storagePath);
+        try {
+          await deleteDocumentFile(targetRecord.storagePath);
+        } catch (storageErr) {
+          console.warn("[TimestampModule] Storage file deletion warning:", storageErr);
+        }
+      }
+      try {
+        await WorkflowRepository.deleteTimestampRecord(id);
+      } catch (fsErr) {
+        console.error("[TimestampModule] Failed to delete record from Firestore:", fsErr);
       }
       const updated = records.filter(r => r.id !== id);
       saveToStorage(updated);

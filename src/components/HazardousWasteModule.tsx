@@ -39,6 +39,7 @@ import { attachRecordToWorkflow, setActiveWorkflow, getActiveWorkflow, getAllWor
 import { notificationRepository } from "../services/notificationRepository";
 import { safeSetLocalStorage } from "../utils/heavyStorage";
 import { uploadDocumentFile, deleteDocumentFile, getDocumentUrl } from "../services/storageService";
+import { WorkflowRepository } from "../services/workflowRepository";
 import { 
   WasteRecoveryRule, 
   WASTE_RECOVERY_RULES, 
@@ -504,7 +505,7 @@ export default function HazardousWasteModule() {
   };
 
   // Main Form Submission
-  const handleSaveManifest = (e: React.FormEvent) => {
+  const handleSaveManifest = async (e: React.FormEvent) => {
     e.preventDefault();
 
     const currentTotals = calculateTotals(items);
@@ -629,6 +630,16 @@ export default function HazardousWasteModule() {
         alert(err.message || "No active workflow is selected. Please select or create a workflow before saving this document.");
         return;
       }
+
+      // Save to Firestore FIRST
+      try {
+        await WorkflowRepository.saveHazWasteRecord(targetRecord);
+      } catch (fsErr: any) {
+        console.error("[HazardousWasteModule] Failed to save record to Firestore:", fsErr);
+        alert("Firestore Persistence Error: Unable to save record to database. Please check your network connection and try again.");
+        return;
+      }
+
       updatedDocs = records.map(rec => rec.id === editingRecordId ? targetRecord : rec);
       saveRecordsToStorage(updatedDocs);
       setSelectedRecordId(editingRecordId);
@@ -660,6 +671,16 @@ export default function HazardousWasteModule() {
         alert(err.message || "No active workflow is selected. Please select or create a workflow before saving this document.");
         return;
       }
+
+      // Save to Firestore FIRST
+      try {
+        await WorkflowRepository.saveHazWasteRecord(targetRecord);
+      } catch (fsErr: any) {
+        console.error("[HazardousWasteModule] Failed to save record to Firestore:", fsErr);
+        alert("Firestore Persistence Error: Unable to save record to database. Please check your network connection and try again.");
+        return;
+      }
+
       updatedDocs = [targetRecord, ...records];
       saveRecordsToStorage(updatedDocs);
       setSelectedRecordId(newId);
@@ -753,7 +774,12 @@ export default function HazardousWasteModule() {
     setManifestToDelete(record);
   };
 
-  const confirmDeleteRecord = (id: string) => {
+  const confirmDeleteRecord = async (id: string) => {
+    try {
+      await WorkflowRepository.deleteHazWasteRecord(id);
+    } catch (fsErr) {
+      console.error("[HazardousWasteModule] Failed to delete record from Firestore:", fsErr);
+    }
     const deletedIndex = records.findIndex(r => r.id === id);
     const updated = records.filter(r => r.id !== id);
     saveRecordsToStorage(updated);

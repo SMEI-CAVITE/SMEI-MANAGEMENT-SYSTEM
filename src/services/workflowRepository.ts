@@ -2,6 +2,7 @@ import {
   collection, 
   doc, 
   setDoc, 
+  deleteDoc,
   getDoc, 
   getDocs, 
   onSnapshot, 
@@ -17,7 +18,7 @@ import { safeSetLocalStorage } from "../utils/heavyStorage";
 import { sanitizeFirestorePayload } from "../utils/sanitize";
 
 export const WORKFLOWS_COLLECTION = "coa_workflows";
-export const COMPLIANCE_DOCS_COLLECTION = "tsd_compliance_docs";
+export const COMPLIANCE_DOCS_COLLECTION = "tsd_uploaded_compliance_docs";
 export const MANIFESTS_COLLECTION = "tsd_manifests";
 export const UNLOADING_COLLECTION = "tsd_compliance_records";
 export const HAZWASTE_COLLECTION = "tsd_hazwaste_records";
@@ -321,6 +322,97 @@ export class WorkflowRepositoryService {
     } catch (err) {
       console.warn("[WorkflowRepository] Failed atomic batch attach to Firestore:", err);
     }
+  }
+
+  /**
+   * Delete a record from any Firestore collection by docId
+   */
+  public async deleteModuleRecord(collectionName: string, docId: string): Promise<void> {
+    if (!collectionName || !docId) return;
+    try {
+      const docRef = doc(db, collectionName, docId);
+      await deleteDoc(docRef);
+    } catch (err) {
+      console.warn(`[WorkflowRepository] Failed to delete record ${docId} from ${collectionName}:`, err);
+      throw err;
+    }
+  }
+
+  // --- Explicit Module Save / Delete Methods ---
+
+  public async saveComplianceDoc(record: any): Promise<void> {
+    if (!record) return;
+    const recordId = record.id || record.docId || `doc_${Date.now()}`;
+    record.id = recordId;
+    const docRef = doc(db, COMPLIANCE_DOCS_COLLECTION, recordId);
+    const cleanRecord = sanitizeFirestorePayload({ ...record, updatedAt: new Date().toISOString() });
+    await setDoc(docRef, cleanRecord, { merge: true });
+  }
+
+  public async deleteComplianceDoc(recordId: string): Promise<void> {
+    if (!recordId) return;
+    const docRef = doc(db, COMPLIANCE_DOCS_COLLECTION, recordId);
+    await deleteDoc(docRef);
+  }
+
+  public async saveUnloadingRecord(record: any): Promise<void> {
+    if (!record) return;
+    const recordId = record.id || `comp-${Date.now()}`;
+    record.id = recordId;
+    const docRef = doc(db, UNLOADING_COLLECTION, recordId);
+    const cleanRecord = sanitizeFirestorePayload({ ...record, updatedAt: new Date().toISOString() });
+    await setDoc(docRef, cleanRecord, { merge: true });
+  }
+
+  public async deleteUnloadingRecord(recordId: string): Promise<void> {
+    if (!recordId) return;
+    const docRef = doc(db, UNLOADING_COLLECTION, recordId);
+    await deleteDoc(docRef);
+  }
+
+  public async saveHazWasteRecord(record: any): Promise<void> {
+    if (!record) return;
+    const recordId = record.id || `MAN-${Date.now()}`;
+    record.id = recordId;
+    const docRef = doc(db, HAZWASTE_COLLECTION, recordId);
+    const cleanRecord = sanitizeFirestorePayload({ ...record, updatedAt: new Date().toISOString() });
+    await setDoc(docRef, cleanRecord, { merge: true });
+  }
+
+  public async deleteHazWasteRecord(recordId: string): Promise<void> {
+    if (!recordId) return;
+    const docRef = doc(db, HAZWASTE_COLLECTION, recordId);
+    await deleteDoc(docRef);
+  }
+
+  public async saveWasteMovementRecord(record: any): Promise<void> {
+    if (!record) return;
+    const recordId = record.id || `WM-${Date.now()}`;
+    record.id = recordId;
+    const docRef = doc(db, WASTE_MOVEMENT_COLLECTION, recordId);
+    const cleanRecord = sanitizeFirestorePayload({ ...record, updatedAt: new Date().toISOString() });
+    await setDoc(docRef, cleanRecord, { merge: true });
+  }
+
+  public async deleteWasteMovementRecord(recordId: string): Promise<void> {
+    if (!recordId) return;
+    const docRef = doc(db, WASTE_MOVEMENT_COLLECTION, recordId);
+    await deleteDoc(docRef);
+  }
+
+  public async saveTimestampRecord(record: any): Promise<void> {
+    if (!record) return;
+    const recordId = record.id || `TR-${Date.now()}`;
+    record.id = recordId;
+    const docRef = doc(db, TIMESTAMP_COLLECTION, recordId);
+    const cleanRecord = sanitizeFirestorePayload({ ...record, updatedAt: new Date().toISOString() });
+    await setDoc(docRef, cleanRecord, { merge: true });
+  }
+
+  public async deleteTimestampRecord(recordId: string): Promise<void> {
+    if (!recordId) return;
+    const docRef = doc(db, TIMESTAMP_COLLECTION, recordId);
+    await deleteDoc(docRef);
   }
 }
 
