@@ -38,6 +38,7 @@ import { applyBusinessRounding, computeRecoveryValue } from "../utils/wasteRound
 import { attachRecordToWorkflow, setActiveWorkflow, getActiveWorkflow, getAllWorkflows, WorkflowRecord } from "../utils/workflowManager";
 import { notificationRepository } from "../services/notificationRepository";
 import { safeSetLocalStorage } from "../utils/heavyStorage";
+import { uploadDocumentFile, deleteDocumentFile, getDocumentUrl } from "../services/storageService";
 import { 
   WasteRecoveryRule, 
   WASTE_RECOVERY_RULES, 
@@ -85,6 +86,10 @@ export interface ManifestRecord {
   items: WasteItem[];
   createdAt: string;
   workflowId?: string;
+  storagePath?: string;
+  downloadUrl?: string;
+  uploadedBy?: string;
+  attachedFileName?: string;
 }
 
 // Extract authoritative Document Company from record or legacy item list

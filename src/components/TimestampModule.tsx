@@ -18,6 +18,7 @@ import { normalizeControlNo } from "../utils/controlNumber";
 import { attachRecordToWorkflow, setActiveWorkflow, getActiveWorkflow, getAllWorkflows, WorkflowRecord } from "../utils/workflowManager";
 import { getHeavyPayload, saveHeavyPayload, deleteHeavyPayload, safeSetLocalStorage } from "../utils/heavyStorage";
 import { notificationRepository } from "../services/notificationRepository";
+import { uploadDocumentFile, deleteDocumentFile, getDocumentUrl } from "../services/storageService";
 
 interface TimestampRecord {
   id: string;
@@ -29,6 +30,9 @@ interface TimestampRecord {
   createdAt: string; // YYYY-MM-DD HH:MM:SS
   notes?: string; // Related timestamp information
   fileSize: string;
+  storagePath?: string;
+  downloadUrl?: string;
+  uploadedBy?: string;
 }
 
 const PLACEHOLDER_GIF = "data:image/gif;base64,R0lGODlhAQABAIAAAP///wAAACH5BAEAAAAALAAAAAABAAEAAAICRAEAOw==";
@@ -280,15 +284,29 @@ export default function TimestampModule() {
     if (replaceFileInputRef.current) replaceFileInputRef.current.value = "";
   };
 
-  const handleSaveRecord = () => {
+  const handleSaveRecord = async () => {
     if (!tempPhoto) return;
 
     const newRecordId = `TR-${Date.now().toString().substring(7)}`;
+    const activeCa = localStorage.getItem("tsd_active_control_no") || "";
     
     // Save photo separately in heavy storage
     saveHeavyPayload(`tsd_photo_${newRecordId}`, tempPhoto);
 
-    const activeCa = localStorage.getItem("tsd_active_control_no") || "";
+    let storagePath = "";
+    let downloadUrl = "";
+    try {
+      const uploadRes = await uploadDocumentFile(
+        tempPhoto,
+        `timestamp/${activeCa || "general"}`,
+        tempFileName || `photo_${newRecordId}.png`,
+        "system"
+      );
+      storagePath = uploadRes.storagePath;
+      downloadUrl = uploadRes.downloadUrl;
+    } catch (e) {
+      console.warn("[TimestampStorage] Upload to Firebase storage fallback:", e);
+    }
 
     const newRecord: TimestampRecord = {
       id: newRecordId,
@@ -298,7 +316,9 @@ export default function TimestampModule() {
       fileName: tempFileName,
       createdAt: customDate || new Date().toISOString().replace("T", " ").substring(0, 19),
       notes: "Compliance validation photo",
-      fileSize: tempFileSize
+      fileSize: tempFileSize,
+      storagePath,
+      downloadUrl
     };
 
     let targetWf: WorkflowRecord;
@@ -328,9 +348,13 @@ export default function TimestampModule() {
     setTempPhoto(null);
   };
 
-  const handleDeleteRecord = (id: string, e?: React.MouseEvent) => {
+  const handleDeleteRecord = async (id: string, e?: React.MouseEvent) => {
     if (e) e.stopPropagation();
     if (confirm("Are you sure you want to permanently delete this timestamp record from the compliance registry?")) {
+      const targetRecord = records.find(r => r.id === id);
+      if (targetRecord?.storagePath) {
+        await deleteDocumentFile(targetRecord.storagePath);
+      }
       const updated = records.filter(r => r.id !== id);
       saveToStorage(updated);
       deleteHeavyPayload(`tsd_photo_${id}`);

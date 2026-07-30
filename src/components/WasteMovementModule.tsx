@@ -22,6 +22,7 @@ import { RcNumberInput } from "./RcNumberInput";
 import { attachRecordToWorkflow, setActiveWorkflow, getActiveWorkflow, getAllWorkflows, WorkflowRecord } from "../utils/workflowManager";
 import { notificationRepository } from "../services/notificationRepository";
 import { safeSetLocalStorage } from "../utils/heavyStorage";
+import { uploadDocumentFile, deleteDocumentFile, getDocumentUrl } from "../services/storageService";
 
 export function formatQuantityDisplay(qty: any): string {
   if (qty === null || qty === undefined || String(qty).trim() === "") return "-";
@@ -111,6 +112,10 @@ export interface WasteMovementRecord {
   notedBy: string;
   sourceFileName: string; // COA Document
   sourceFileData: string; // Base64
+  storagePath?: string;
+  downloadUrl?: string;
+  uploadedBy?: string;
+  uploadedAt?: string;
   quantity1: number; // Export for recovery (MT)
   quantity2: number; // Disposal (MT)
   quantity3: number; // Recycling/Recovery (MT)
@@ -699,6 +704,23 @@ export default function WasteMovementModule() {
       { method: "Recycling/Recovery", quantity: formQuantity3, destination: "Local/Offshore", remarks: "" }
     ].filter(m => m.quantity > 0);
 
+    let storagePath = "";
+    let downloadUrl = "";
+    if (formSourceFileData) {
+      try {
+        const uRes = await uploadDocumentFile(
+          formSourceFileData,
+          `waste-movement/${resolvedControlNo}`,
+          formSourceFileName || "COA_Document.pdf",
+          "system"
+        );
+        storagePath = uRes.storagePath;
+        downloadUrl = uRes.downloadUrl;
+      } catch (uErr) {
+        console.warn("[WasteMovementStorage] Firebase Storage upload fallback:", uErr);
+      }
+    }
+
     let targetRecord: WasteMovementRecord;
     let targetWf: WorkflowRecord;
 
@@ -723,6 +745,9 @@ export default function WasteMovementModule() {
         quantity3: formQuantity3,
         totalQty: formTotalQty,
         sourceFileName: formSourceFileName,
+        storagePath: storagePath || existing?.storagePath,
+        downloadUrl: downloadUrl || existing?.downloadUrl,
+        uploadedAt: new Date().toISOString(),
         methods: methodsList
       };
       try {
@@ -750,6 +775,9 @@ export default function WasteMovementModule() {
         notedBy: finalNotedBy,
         sourceFileName: formSourceFileName,
         sourceFileData: "",
+        storagePath,
+        downloadUrl,
+        uploadedAt: new Date().toISOString(),
         quantity1: formQuantity1,
         quantity2: formQuantity2,
         quantity3: formQuantity3,
@@ -787,6 +815,10 @@ export default function WasteMovementModule() {
   const handleDeleteRecord = async (id: string, e: React.MouseEvent) => {
     e.stopPropagation();
     if (confirm("Are you sure you want to permanently delete this waste movement summary document?")) {
+      const targetDoc = movements.find(m => m.id === id);
+      if (targetDoc?.storagePath) {
+        await deleteDocumentFile(targetDoc.storagePath);
+      }
       const updated = movements.filter(m => m.id !== id);
       saveToStorage(updated);
       try {

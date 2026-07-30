@@ -61,7 +61,7 @@ export class AuthService {
     return { user, status: 200 };
   }
 
-  static generateToken(user: UserDB, JWT_SECRET: string, expiresIn = "12h"): string {
+  static generateToken(user: UserDB, JWT_SECRET: string, expiresIn: string | number = "12h"): string {
     const payload = {
       id: user.id,
       username: user.username,
@@ -71,7 +71,7 @@ export class AuthService {
       department: user.department,
       position: user.position
     };
-    return jwt.sign(payload, JWT_SECRET, { expiresIn });
+    return jwt.sign(payload, JWT_SECRET, { expiresIn: expiresIn as any });
   }
 
   static verifyToken(token: string, JWT_SECRET: string): Promise<any> {

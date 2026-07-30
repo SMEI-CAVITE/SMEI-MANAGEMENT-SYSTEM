@@ -5,11 +5,13 @@ import {
   enableIndexedDbPersistence,
   Firestore 
 } from "firebase/firestore";
+import { getStorage, FirebaseStorage } from "firebase/storage";
 import firebaseConfigJson from "../../firebase-applet-config.json";
 import { getFirebaseConfig } from "../config/env";
 
 let app: FirebaseApp | undefined;
 let db: Firestore | undefined;
+let storage: FirebaseStorage | undefined;
 
 const getActiveConfig = () => {
   const envConfig = getFirebaseConfig();
@@ -34,6 +36,18 @@ if (activeConfig) {
       db = getFirestore(app);
     }
 
+    try {
+      const bucket = (activeConfig as any).storageBucket;
+      if (bucket) {
+        storage = getStorage(app, `gs://${bucket.replace(/^gs:\/\//, '')}`);
+      } else {
+        storage = getStorage(app);
+      }
+    } catch (sErr) {
+      console.warn("[Firebase Storage Init Warning]:", sErr);
+      storage = getStorage(app);
+    }
+
     if (typeof window !== "undefined" && db) {
       if (enableMultiTabIndexedDbPersistence) {
         enableMultiTabIndexedDbPersistence(db).catch((err) => {
@@ -56,4 +70,4 @@ if (activeConfig) {
   console.info("[Firebase] Firebase is not currently configured. To enable, populate VITE_FIREBASE_* environment variables.");
 }
 
-export { app, db };
+export { app, db, storage };

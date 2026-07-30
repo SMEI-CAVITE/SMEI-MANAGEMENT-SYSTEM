@@ -19,6 +19,7 @@ import { formatControlNumber, normalizeControlNo } from "../utils/controlNumber"
 import { attachRecordToWorkflow, setActiveWorkflow, getActiveWorkflow, getAllWorkflows, WorkflowRecord } from "../utils/workflowManager";
 import { getHeavyPayload, saveHeavyPayload, deleteHeavyPayload, safeSetLocalStorage } from "../utils/heavyStorage";
 import { notificationRepository } from "../services/notificationRepository";
+import { uploadDocumentFile, deleteDocumentFile, getDocumentUrl } from "../services/storageService";
 
 interface ComplianceRecord {
   id: string;
@@ -28,9 +29,14 @@ interface ComplianceRecord {
   date: string;
   unloadingFileName?: string;
   unloadingFileData?: string; // base64 placeholder or data
+  unloadingStoragePath?: string;
+  unloadingDownloadUrl?: string;
   loadingFileName?: string;
   loadingFileData?: string; // base64 placeholder or data
+  loadingStoragePath?: string;
+  loadingDownloadUrl?: string;
   createdAt: string;
+  uploadedBy?: string;
 }
 
 const PLACEHOLDER_GIF = "data:image/gif;base64,R0lGODlhAQABAIAAAP///wAAACH5BAEAAAAALAAAAAABAAEAAAICRAEAOw==";
@@ -298,7 +304,7 @@ export default function UnloadingLoadingModule() {
     setIsModalOpen(true);
   };
 
-  const handleSaveCompliance = (e: React.FormEvent) => {
+  const handleSaveCompliance = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!compCA.trim()) {
       alert("Manifest Number is a required field.");
@@ -307,13 +313,34 @@ export default function UnloadingLoadingModule() {
 
     let updatedDocs = [...compRecords];
     const recordId = editingRecord ? editingRecord.id : `comp-${Date.now()}`;
+    const cleanCA = compCA.toUpperCase();
 
-    // Store binary payloads separately in heavy storage (IndexedDB + memory cache)
+    // Upload unloading file to Firebase Storage if provided
+    let unloadingStoragePath = editingRecord?.unloadingStoragePath;
+    let unloadingDownloadUrl = editingRecord?.unloadingDownloadUrl;
     if (compUnloadingData && compUnloadingData !== PLACEHOLDER_GIF) {
       saveHeavyPayload(`tsd_unloading_data_${recordId}`, compUnloadingData);
+      try {
+        const uRes = await uploadDocumentFile(compUnloadingData, `unloading-loading/${cleanCA}`, compUnloadingFileName || "unloading.png");
+        unloadingStoragePath = uRes.storagePath;
+        unloadingDownloadUrl = uRes.downloadUrl;
+      } catch (e) {
+        console.warn("[UnloadingStorage] Firebase storage upload fallback:", e);
+      }
     }
+
+    // Upload loading file to Firebase Storage if provided
+    let loadingStoragePath = editingRecord?.loadingStoragePath;
+    let loadingDownloadUrl = editingRecord?.loadingDownloadUrl;
     if (compLoadingData && compLoadingData !== PLACEHOLDER_GIF) {
       saveHeavyPayload(`tsd_loading_data_${recordId}`, compLoadingData);
+      try {
+        const lRes = await uploadDocumentFile(compLoadingData, `unloading-loading/${cleanCA}`, compLoadingFileName || "loading.png");
+        loadingStoragePath = lRes.storagePath;
+        loadingDownloadUrl = lRes.downloadUrl;
+      } catch (e) {
+        console.warn("[LoadingStorage] Firebase storage upload fallback:", e);
+      }
     }
 
     let targetRecord: ComplianceRecord;
@@ -323,11 +350,15 @@ export default function UnloadingLoadingModule() {
       // Edit mode
       targetRecord = {
         ...editingRecord,
-        caNumber: compCA.toUpperCase(),
+        caNumber: cleanCA,
         unloadingFileName: compUnloadingFileName || editingRecord.unloadingFileName,
         unloadingFileData: compUnloadingFileName ? PLACEHOLDER_GIF : undefined,
+        unloadingStoragePath,
+        unloadingDownloadUrl,
         loadingFileName: compLoadingFileName || editingRecord.loadingFileName,
-        loadingFileData: compLoadingFileName ? PLACEHOLDER_GIF : undefined
+        loadingFileData: compLoadingFileName ? PLACEHOLDER_GIF : undefined,
+        loadingStoragePath,
+        loadingDownloadUrl
       };
       try {
         targetWf = attachRecordToWorkflow("unloading-loading", targetRecord, targetRecord.caNumber);
@@ -342,13 +373,17 @@ export default function UnloadingLoadingModule() {
       // New record
       targetRecord = {
         id: recordId,
-        caNumber: compCA.toUpperCase(),
+        caNumber: cleanCA,
         title: "Geotagged Loading and Unloading Photograph Record",
         date: new Date().toISOString().split("T")[0],
         unloadingFileName: compUnloadingFileName || undefined,
         unloadingFileData: compUnloadingFileName ? PLACEHOLDER_GIF : undefined,
+        unloadingStoragePath,
+        unloadingDownloadUrl,
         loadingFileName: compLoadingFileName || undefined,
         loadingFileData: compLoadingFileName ? PLACEHOLDER_GIF : undefined,
+        loadingStoragePath,
+        loadingDownloadUrl,
         createdAt: new Date().toLocaleDateString() + " " + new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
       };
       try {

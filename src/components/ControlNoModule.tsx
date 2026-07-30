@@ -21,6 +21,7 @@ import { processManifestDocument } from "../utils/manifestParser";
 import { saveManifestRecord, deleteManifestRecordByDocId, getAllManifestRecords, saveAllManifestRecords } from "../utils/manifestStorage";
 import { attachRecordToWorkflow, setActiveWorkflow, getActiveWorkflow, getAllWorkflows, propagateControlNoToWorkflowDocs, saveWorkflows } from "../utils/workflowManager";
 import { notificationRepository } from "../services/notificationRepository";
+import { uploadDocumentFile, deleteDocumentFile, getDocumentUrl } from "../services/storageService";
 
 interface UploadedDocument {
   id: string;
@@ -31,6 +32,9 @@ interface UploadedDocument {
   caNumber: string;
   fileData?: string; // Base64 data URL
   workflowId?: string;
+  storagePath?: string;
+  downloadUrl?: string;
+  uploadedBy?: string;
 }
 
 /**
@@ -383,18 +387,24 @@ export default function ControlNoModule() {
 
         saveManifestRecord(newRecord);
 
-        // 4. Save metadata in Control No. list
-        const sizeStr = file.size > 1024 * 1024 
-          ? (file.size / (1024 * 1024)).toFixed(1) + " MB" 
-          : (file.size / 1024).toFixed(0) + " KB";
+        // 4. Upload PDF binary to Firebase Storage for cloud persistence
+        const uploadMeta = await uploadDocumentFile(
+          arrayBuffer,
+          `control-number/${currentCaNo}`,
+          downloadFileName,
+          "system"
+        );
 
         const newDoc: UploadedDocument = {
           id: docId,
           fileName: downloadFileName,
-          fileSize: sizeStr,
+          fileSize: uploadMeta.fileSize,
           fileType: "PDF",
           uploadedAt: new Date().toLocaleDateString() + " " + new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
           caNumber: currentCaNo,
+          storagePath: uploadMeta.storagePath,
+          downloadUrl: uploadMeta.downloadUrl,
+          uploadedBy: uploadMeta.uploadedBy
         };
 
         appendDocToStorage(newDoc);
@@ -450,6 +460,10 @@ export default function ControlNoModule() {
 
   const handleDeleteDoc = async (id: string) => {
     if (confirm("Are you sure you want to delete this document?")) {
+      const targetDoc = uploadedDocs.find(d => d.id === id);
+      if (targetDoc && targetDoc.storagePath) {
+        await deleteDocumentFile(targetDoc.storagePath);
+      }
       const updated = uploadedDocs.filter(d => d.id !== id);
       saveDocsToStorage(updated);
       localStorage.removeItem(`tsd_doc_data_${id}`);
@@ -460,18 +474,23 @@ export default function ControlNoModule() {
 
   const handleDownloadDoc = async (doc: UploadedDocument) => {
     try {
-      let dataUrl = doc.fileData || localStorage.getItem(`tsd_doc_data_${doc.id}`);
+      let finalUrl = doc.downloadUrl;
+      if (!finalUrl && doc.storagePath) {
+        finalUrl = await getDocumentUrl(doc.storagePath);
+      }
+      if (!finalUrl) {
+        finalUrl = doc.fileData || localStorage.getItem(`tsd_doc_data_${doc.id}`);
+      }
       let blobUrl = "";
 
-      if (!dataUrl) {
+      if (!finalUrl) {
         const arrayBuffer = await getDocumentBinary(doc.id);
         if (arrayBuffer) {
           const blob = new Blob([arrayBuffer], { type: "application/pdf" });
           blobUrl = URL.createObjectURL(blob);
+          finalUrl = blobUrl;
         }
       }
-
-      const finalUrl = blobUrl || dataUrl;
 
       if (!finalUrl) {
         alert("Source PDF file data not available.");
