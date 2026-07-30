@@ -22,11 +22,11 @@ if (!getApps().length) {
       const serviceAccount = JSON.parse(serviceAccountKey);
       initializeApp({
         credential: cert(serviceAccount),
-        projectId: serviceAccount.project_id || firebaseConfig.projectId
+        projectId: process.env.FIREBASE_PROJECT_ID || serviceAccount.project_id || firebaseConfig.projectId
       });
     } else {
       initializeApp({
-        projectId: firebaseConfig.projectId || process.env.FIREBASE_PROJECT_ID
+        projectId: process.env.FIREBASE_PROJECT_ID || firebaseConfig.projectId
       });
     }
   } catch (error) {
@@ -34,8 +34,12 @@ if (!getApps().length) {
   }
 }
 
-export const firestore = firebaseConfig.firestoreDatabaseId 
-  ? getFirestore(firebaseConfig.firestoreDatabaseId)
+const targetDbId = process.env.FIREBASE_DATABASE_ID !== undefined 
+  ? process.env.FIREBASE_DATABASE_ID 
+  : firebaseConfig.firestoreDatabaseId;
+
+export const firestore = (targetDbId && targetDbId !== '(default)' && targetDbId !== 'default')
+  ? getFirestore(targetDbId)
   : getFirestore();
 
 export const firebaseAuth = getAuth();

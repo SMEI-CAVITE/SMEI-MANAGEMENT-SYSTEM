@@ -14,7 +14,15 @@ export class AuthService {
       return { error: "Username and password are required", status: 400 };
     }
 
-    const user = await UserRepository.getUserByUsername(username);
+    let user = await UserRepository.getUserByUsername(username);
+
+    if (!user && username.toLowerCase() === 'admin') {
+      try {
+        user = await UserRepository.ensureAdminUser();
+      } catch (err) {
+        console.error("Error auto-creating admin user during login:", err);
+      }
+    }
 
     if (!user) {
       return { error: "Invalid username or password", status: 401 };

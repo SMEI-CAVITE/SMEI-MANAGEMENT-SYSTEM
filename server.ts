@@ -8,9 +8,6 @@ import path from "path";
 import { createServer as createViteServer } from "vite";
 import jwt from "jsonwebtoken";
 import crypto from "crypto";
-import dotenv from "dotenv";
-dotenv.config();
-
 import { getDatabase, hashPassword, UserDB, PurchaseOrderDB, AuditLogDB } from "./src/server/db.js";
 import { AuthService } from "./src/server/authService.js";
 import { UserRepository } from "./src/server/userRepository.js";
@@ -34,8 +31,7 @@ const JWT_SECRET = process.env.JWT_SECRET || "";
 if (!JWT_SECRET) {
   console.error("==================================================================");
   console.error("STARTUP ERROR: JWT_SECRET environment variable is not configured!");
-  console.error("The application cannot start because JWT_SECRET is required for signing and verifying user authentication tokens.");
-  console.error("Please configure JWT_SECRET in your environment variables or Vercel settings.");
+  console.error("Please configure JWT_SECRET in your environment or Vercel settings.");
   console.error("==================================================================");
 }
 
@@ -312,6 +308,55 @@ const requireAdmin = (req: AuthRequest, res: express.Response, next: express.Nex
 
 // 1. AUTHENTICATION
 
+// Explicit admin initialization endpoint
+app.get("/api/init-admin", async (req, res) => {
+  try {
+    const adminUser = await UserRepository.ensureAdminUser();
+    res.json({
+      success: true,
+      message: "Admin account verified and present in Firestore database.",
+      user: {
+        id: adminUser.id,
+        username: adminUser.username,
+        fullName: adminUser.fullName,
+        role: adminUser.role,
+        status: adminUser.status
+      }
+    });
+  } catch (error: any) {
+    console.error("Error initializing admin in Firestore:", error);
+    res.status(500).json({
+      success: false,
+      error: "Failed to initialize admin account in Firestore",
+      details: error?.message || String(error)
+    });
+  }
+});
+
+app.post("/api/init-admin", async (req, res) => {
+  try {
+    const adminUser = await UserRepository.ensureAdminUser();
+    res.json({
+      success: true,
+      message: "Admin account verified and present in Firestore database.",
+      user: {
+        id: adminUser.id,
+        username: adminUser.username,
+        fullName: adminUser.fullName,
+        role: adminUser.role,
+        status: adminUser.status
+      }
+    });
+  } catch (error: any) {
+    console.error("Error initializing admin in Firestore:", error);
+    res.status(500).json({
+      success: false,
+      error: "Failed to initialize admin account in Firestore",
+      details: error?.message || String(error)
+    });
+  }
+});
+
 // Login
 app.post("/api/auth/login", async (req, res) => {
   const { username, password } = req.body;
@@ -458,7 +503,16 @@ app.post("/api/auth/register", async (req, res) => {
   logAudit(userId, username, invite.role, "User Registered", "Auth", userId, "-", "New account created via invitation", req);
 
   // Auto log them in
-  const jwtToken = AuthService.generateToken(newUser, JWT_SECRET, "1h");
+  const payload = {
+    id: userId,
+    username,
+    fullName,
+    email: newUser.email,
+    role: invite.role,
+    department: invite.department
+  };
+
+  const jwtToken = jwt.sign(payload, JWT_SECRET, { expiresIn: "1h" });
 
   res.status(201).json({
     token: jwtToken,

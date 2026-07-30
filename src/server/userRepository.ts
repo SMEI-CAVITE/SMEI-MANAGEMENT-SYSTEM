@@ -1,9 +1,53 @@
 import { firestore } from './firebaseAdmin.js';
-import { UserDB } from './db.js';
+import { UserDB, hashPassword } from './db.js';
 
 const USERS_COLLECTION = 'users';
 
 export class UserRepository {
+  /**
+   * Ensures default admin user exists in Firestore.
+   */
+  static async ensureAdminUser(): Promise<UserDB> {
+    const adminUsername = "admin";
+    const hashedPassword = hashPassword("Admin@12345");
+    const existing = await UserRepository.getUserByUsername(adminUsername);
+
+    if (existing) {
+      if (existing.passwordHash !== hashedPassword || existing.role !== "Administrator" || existing.status !== "Active") {
+        const updated: UserDB = {
+          ...existing,
+          passwordHash: hashedPassword,
+          role: "Administrator",
+          status: "Active",
+          loginAttempts: 0
+        };
+        await UserRepository.saveUser(updated);
+        return updated;
+      }
+      return existing;
+    }
+
+    const newAdmin: UserDB = {
+      id: "usr-admin-initial",
+      username: adminUsername,
+      passwordHash: hashedPassword,
+      fullName: "System Administrator",
+      email: "admin@smei.com",
+      role: "Administrator",
+      department: "Management",
+      status: "Active",
+      loginAttempts: 0,
+      position: "System Administrator",
+      notificationPreferences: {
+        email: true,
+        system: true
+      }
+    };
+
+    await UserRepository.saveUser(newAdmin);
+    return newAdmin;
+  }
+
   /**
    * Retrieves a user by their exact username.
    */
