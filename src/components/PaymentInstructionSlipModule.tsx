@@ -4,12 +4,13 @@
  */
 
 import React, { useState, useEffect, useMemo } from "react";
-import { PaymentInstructionSlip, PaymentEntry, User, UserRole } from "../types";
+import { PaymentInstructionSlip, PaymentEntry, User, UserRole, PurchaseOrder } from "../types";
 import { api } from "../lib/api";
 import { Search, Plus, Filter, Calendar, FileText, ArrowUpDown, Trash2, Edit3, Eye, FileSpreadsheet, X, Download } from "lucide-react";
 import { exportWordWithTemplate, exportExcelWithTemplate } from "../utils/templateExport";
 import { wrapRemarks, mapPISData } from "../utils/templateMapping";
-import { ExportExcelButton, CreateButton, ExportPdfButton } from "./SharedButtons";
+import { WysiwygPurposeEditor } from "./WysiwygPurposeEditor";
+import { ExportExcelButton, CreateButton } from "./SharedButtons";
 import { formatControlNumber } from "../utils/controlNumber";
 import { TableSkeleton } from "./ui/Skeleton";
 
@@ -19,6 +20,7 @@ interface PISModuleProps {
 
 export default function PaymentInstructionSlipModule({ currentUser }: PISModuleProps) {
   const [slips, setSlips] = useState<PaymentInstructionSlip[]>([]);
+  const [purchaseOrders, setPurchaseOrders] = useState<PurchaseOrder[]>([]);
   const [loading, setLoading] = useState(true);
   const [search, setSearch] = useState("");
   const [statusFilter, setStatusFilter] = useState("All");
@@ -62,7 +64,7 @@ export default function PaymentInstructionSlipModule({ currentUser }: PISModuleP
   const [acceptedByDate, setAcceptedByDate] = useState("");
   const [status, setStatus] = useState<"Draft" | "Pending" | "Approved" | "Released" | "Cancelled">("Draft");
   const [payments, setPayments] = useState<PaymentEntry[]>([
-    { id: "1", paymentPurpose: "", gross: 0, ewt: 0, total: 0 }
+    { id: "1", completedPOId: "", completedPONumber: "", paymentPurpose: "", gross: 0, ewt: 1, total: 0 }
   ]);
 
   // Error States
@@ -75,11 +77,15 @@ export default function PaymentInstructionSlipModule({ currentUser }: PISModuleP
   const fetchSlips = async () => {
     setLoading(true);
     try {
-      const data = await api.getPIS();
-      setSlips(data);
-      if (data && data.length > 0) {
-        setActiveSlipId(data[data.length - 1].id);
-        setSelectedSlip(data[data.length - 1]);
+      const [pisData, posData] = await Promise.all([
+        api.getPIS().catch(() => []),
+        api.getPOs().catch(() => [])
+      ]);
+      setSlips(pisData);
+      setPurchaseOrders(posData);
+      if (pisData && pisData.length > 0) {
+        setActiveSlipId(pisData[pisData.length - 1].id);
+        setSelectedSlip(pisData[pisData.length - 1]);
       }
     } catch (err: any) {
       const errMsg = err?.message || String(err);
@@ -96,6 +102,20 @@ export default function PaymentInstructionSlipModule({ currentUser }: PISModuleP
   useEffect(() => {
     fetchSlips();
   }, []);
+
+  // Filter completed/eligible Purchase Orders for selection
+  const eligiblePOs = useMemo(() => {
+    if (!purchaseOrders || purchaseOrders.length === 0) return [];
+    const approvedList = purchaseOrders.filter((po) => {
+      return (
+        po.status === "Approved" ||
+        po.status === "Closed" ||
+        po.approvalStatus === "Approved"
+      );
+    });
+    if (approvedList.length > 0) return approvedList;
+    return purchaseOrders;
+  }, [purchaseOrders]);
 
   // Auto-calculate total and set amount whenever payments changes
   useEffect(() => {
@@ -224,12 +244,21 @@ export default function PaymentInstructionSlipModule({ currentUser }: PISModuleP
       setAcceptedByDate(slip.acceptedByDate || "");
       setStatus(slip.status);
       if (slip.payments && slip.payments.length > 0) {
-        setPayments(slip.payments);
+        setPayments(slip.payments.map(p => ({
+          ...p,
+          completedPOId: p.completedPOId || "",
+          completedPONumber: p.completedPONumber || p.poNumber || "",
+          poNumber: p.completedPONumber || p.poNumber || "",
+          paymentPurpose: (p.paymentPurpose || "").toUpperCase()
+        })));
       } else {
         setPayments([
           {
             id: "1",
-            paymentPurpose: slip.remarks || "Payment Entry",
+            completedPOId: slip.completedPOId || "",
+            completedPONumber: slip.completedPONumber || slip.poNumber || "",
+            poNumber: slip.completedPONumber || slip.poNumber || "",
+            paymentPurpose: (slip.remarks || "PAYMENT ENTRY").toUpperCase(),
             gross: slip.gross !== undefined ? slip.gross : slip.amount,
             ewt: slip.ewt !== undefined ? slip.ewt : 0,
             total: slip.total !== undefined ? slip.total : slip.amount
@@ -253,7 +282,7 @@ export default function PaymentInstructionSlipModule({ currentUser }: PISModuleP
       setPaymentModeOthers("");
       setRemarks("");
       setPayments([
-        { id: "1", paymentPurpose: "", gross: 0, ewt: 0, total: 0 }
+        { id: "1", completedPOId: "", completedPONumber: "", poNumber: "", paymentPurpose: "", gross: 0, ewt: 1, total: 0 }
       ]);
       setRequestedBy(currentUser.fullName);
       setRequestedDate(new Date().toISOString().split("T")[0]);
@@ -265,7 +294,7 @@ export default function PaymentInstructionSlipModule({ currentUser }: PISModuleP
       setAcceptedBy("");
       setAcceptedByPosition("");
       setAcceptedByDate("");
-      setStatus("Draft");
+      setStatus("Pending");
 
       // Fetch next auto-generated number
       try {
@@ -303,49 +332,100 @@ export default function PaymentInstructionSlipModule({ currentUser }: PISModuleP
     }
 
     // Validate payment entries
+    let missingPO = false;
+    let missingGross = false;
+    let duplicatePO = false;
+    let completedPOSelected = false;
+
+    const seenPOIds = new Set<string>();
+
     payments.forEach((p) => {
+      const isPOFilled = (p.completedPONumber || p.completedPOId || "").trim() !== "";
       const isPurposeFilled = (p.paymentPurpose || "").trim() !== "";
       const isGrossFilled = (p.gross || 0) > 0;
       const isEwtFilled = (p.ewt || 0) > 0;
 
-      // If any part of the payment entry is filled, validate the rest
-      if (isPurposeFilled || isGrossFilled || isEwtFilled) {
-        if (!isPurposeFilled) {
-          newErrors[`paymentPurpose_${p.id}`] = "Payment Purpose is required.";
+      if (!isPOFilled) {
+        missingPO = true;
+        newErrors[`completedPO_${p.id}`] = "Please select a PO Number.";
+      } else {
+        const selectedId = p.completedPOId || p.completedPONumber;
+        if (seenPOIds.has(selectedId)) {
+          duplicatePO = true;
+          newErrors[`completedPO_${p.id}`] = "This Purchase Order is selected multiple times.";
+        } else {
+          seenPOIds.add(selectedId);
         }
-        if (p.gross === undefined || p.gross < 0) {
-          newErrors[`gross_${p.id}`] = "Gross must be zero or positive.";
+
+        const matchedPO = purchaseOrders.find(po => po.id === p.completedPOId || po.poNumber === p.completedPONumber);
+        if (matchedPO) {
+          const isStatusCompleted = ["COMPLETED", "FULLY PAID", "PAYMENT FINISHED", "CLOSED"].includes((matchedPO.status || "").toUpperCase()) || ["COMPLETED", "FULLY PAID", "PAYMENT FINISHED", "CLOSED"].includes((matchedPO.approvalStatus || "").toUpperCase());
+          const usedInOtherPIS = slips.some((slip) =>
+            slip.id !== selectedSlip?.id &&
+            slip.status !== "Cancelled" &&
+            (slip.completedPOId === matchedPO.id || slip.completedPONumber === matchedPO.poNumber || (slip.payments && slip.payments.some(pay => pay.completedPOId === matchedPO.id || pay.completedPONumber === matchedPO.poNumber)))
+          );
+
+          if (isStatusCompleted || usedInOtherPIS) {
+            completedPOSelected = true;
+            newErrors[`completedPO_${p.id}`] = `Purchase Order ${matchedPO.poNumber} is already completed or paid.`;
+          }
         }
-        if (p.ewt === undefined || p.ewt < 0) {
-          newErrors[`ewt_${p.id}`] = "EWT must be zero or positive.";
-        }
-        if (p.gross < p.ewt) {
-          newErrors[`ewt_${p.id}`] = "EWT cannot exceed Gross.";
-        }
+      }
+
+      if (!p.gross || p.gross <= 0) {
+        missingGross = true;
+        newErrors[`gross_${p.id}`] = "Please enter the Gross amount.";
+      }
+      if (p.ewt === undefined || p.ewt < 0 || p.ewt > 100) {
+        newErrors[`ewt_${p.id}`] = "EWT must be a valid percentage.";
       }
     });
 
     if (Object.keys(newErrors).length > 0) {
       setErrors(newErrors);
+      if (duplicatePO) {
+        alert("⚠ Cannot save: Duplicate Purchase Order selected in Payment Breakdown.");
+      } else if (completedPOSelected) {
+        alert("⚠ Cannot save: One or more selected Purchase Orders are already completed or fully paid.");
+      } else if (missingPO && missingGross) {
+        alert("⚠ Please select a PO Number and enter the Gross amount before saving.");
+      } else if (missingPO) {
+        alert("⚠ Please select a PO Number before saving.");
+      } else if (missingGross) {
+        alert("⚠ Please enter the Gross amount before saving.");
+      }
       return;
     }
 
+    const primaryPOEntry = payments.find(p => (p.completedPONumber || p.poNumber || "").trim() !== "");
+    const cleanedPayments = payments.map(p => ({
+      ...p,
+      completedPOId: p.completedPOId || "",
+      completedPONumber: (p.completedPONumber || p.poNumber || "").toUpperCase(),
+      poNumber: (p.completedPONumber || p.poNumber || "").toUpperCase(),
+      paymentPurpose: (p.paymentPurpose || "").toUpperCase()
+    }));
+
     const payload: Partial<PaymentInstructionSlip> = {
-      pisNumber,
+      pisNumber: pisNumber.toUpperCase(),
+      completedPOId: primaryPOEntry?.completedPOId || "",
+      completedPONumber: (primaryPOEntry?.completedPONumber || primaryPOEntry?.poNumber || "").toUpperCase(),
+      poNumber: (primaryPOEntry?.completedPONumber || primaryPOEntry?.poNumber || "").toUpperCase(),
       scheduleDate,
       scheduleTime,
       ampm,
-      payee,
+      payee: payee.toUpperCase(),
       amount,
       gross,
       ewt,
       total,
       currency,
-      currencyOthers: currency === "Others" ? currencyOthers : "",
+      currencyOthers: currency === "Others" ? currencyOthers.toUpperCase() : "",
       paymentMode,
-      paymentModeOthers: paymentMode === "Others" ? paymentModeOthers : "",
-      remarks,
-      payments,
+      paymentModeOthers: paymentMode === "Others" ? paymentModeOthers.toUpperCase() : "",
+      remarks: remarks.toUpperCase(),
+      payments: cleanedPayments,
       requestedBy,
       requestedDate,
       checkedAndVerifiedBy,
@@ -414,7 +494,8 @@ export default function PaymentInstructionSlipModule({ currentUser }: PISModuleP
     Pending: "bg-amber-50 text-amber-700 border-amber-300 animate-pulse",
     Approved: "bg-green-50 text-green-700 border-green-300",
     Released: "bg-blue-50 text-blue-700 border-blue-300",
-    Cancelled: "bg-rose-50 text-rose-700 border-rose-300"
+    Cancelled: "bg-rose-50 text-rose-700 border-rose-300",
+    Rejected: "bg-red-50 text-red-700 border-red-300"
   };
 
   const handleExportExcel = async () => {
@@ -439,20 +520,6 @@ export default function PaymentInstructionSlipModule({ currentUser }: PISModuleP
     console.log("handleExport finished");
   };
 
-  const handleTriggerPDFExport = async () => {
-    const slipToExport = slips.find((s) => s.id === activeSlipId);
-    if (slipToExport) {
-      try {
-        const { printDocument } = await import("../utils/printDocument");
-        await printDocument("pis", slipToExport);
-      } catch (err: any) {
-        alert("Failed to print: " + (err.message || err));
-      }
-    } else {
-      alert("Please select a PIS first.");
-    }
-  };
-
 
 
   return (
@@ -475,14 +542,6 @@ export default function PaymentInstructionSlipModule({ currentUser }: PISModuleP
           )}
 
           <div className="flex flex-wrap items-center gap-2 w-full sm:w-auto justify-end">
-            <ExportExcelButton
-              onClick={handleExportExcel}
-              disabled={!activeSlipId}
-            />
-            <ExportPdfButton
-              onClick={handleTriggerPDFExport}
-              disabled={!activeSlipId}
-            />
             {isAuthorized && (
               <CreateButton onClick={() => handleOpenModal(null)} label="Create PIS" />
             )}
@@ -710,7 +769,7 @@ export default function PaymentInstructionSlipModule({ currentUser }: PISModuleP
 
                   <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
                     {/* PIS Number */}
-                    <div>
+                    <div className="md:col-span-2">
                       <label className="block text-xs font-bold text-gray-700 mb-1">PIS Document Number: *</label>
                       <input
                         type="text"
@@ -724,23 +783,6 @@ export default function PaymentInstructionSlipModule({ currentUser }: PISModuleP
                         placeholder="PURC-PIS-YY-###"
                       />
                       {errors.pisNumber && <p className="text-[10px] text-rose-500 mt-0.5 font-semibold">{errors.pisNumber}</p>}
-                    </div>
-
-                    {/* Status */}
-                    <div>
-                      <label className="block text-xs font-bold text-gray-700 mb-1">Slip Status:</label>
-                      <select
-                        disabled={!isEditMode}
-                        className="w-full text-sm p-2 border border-gray-200 rounded-lg focus:ring-1 focus:ring-smei-crimson focus:border-smei-crimson bg-white outline-none"
-                        value={status}
-                        onChange={(e: any) => setStatus(e.target.value)}
-                      >
-                        <option value="Draft">Draft</option>
-                        <option value="Pending">Pending Approval</option>
-                        <option value="Approved">Approved</option>
-                        <option value="Released">Released</option>
-                        <option value="Cancelled">Cancelled</option>
-                      </select>
                     </div>
 
                     {/* Payee */}
@@ -762,36 +804,15 @@ export default function PaymentInstructionSlipModule({ currentUser }: PISModuleP
 
                     {/* Dynamic Payments Breakdown List */}
                     <div className="md:col-span-2 bg-gray-50/50 p-4 rounded-xl border border-gray-100 space-y-4">
-                      <div className="flex justify-between items-center pb-2 border-b border-gray-100">
+                      <div className="pb-2 border-b border-gray-100">
                         <h4 className="text-sm font-bold text-gray-800">Payment Breakdown</h4>
-                        {payments.length < 3 && isEditMode && (
-                          <button
-                            type="button"
-                            onClick={() => {
-                              if (payments.length >= 3) return;
-                              setPayments([
-                                ...payments,
-                                { id: String(Date.now()), paymentPurpose: "", gross: 0, ewt: 0, total: 0 }
-                              ]);
-                            }}
-                            className="text-xs font-semibold px-2.5 py-1.5 bg-smei-crimson text-white rounded-lg hover:bg-smei-crimson/90 active:scale-95 transition-all flex items-center gap-1 shadow-sm"
-                          >
-                            <Plus className="w-3.5 h-3.5" />
-                            Add Payment
-                          </button>
-                        )}
-                        {payments.length >= 3 && isEditMode && (
-                          <span className="text-[10px] font-semibold px-2 py-1 bg-amber-50 text-amber-600 border border-amber-200 rounded-lg">
-                            Template limit (3 payments) reached
-                          </span>
-                        )}
                       </div>
 
                       <div className="space-y-3">
                         {payments.map((p, idx) => (
                           <div key={p.id} className="relative grid grid-cols-1 md:grid-cols-12 gap-3 bg-white p-3.5 rounded-lg border border-gray-100 shadow-sm">
                             {/* Header / Delete row */}
-                            <div className="md:col-span-12 flex justify-between items-center">
+                            <div className="md:col-span-12 flex justify-between items-center pb-1 border-b border-gray-100/60">
                               <span className="text-[11px] font-bold text-gray-400 font-mono">Entry #{idx + 1}</span>
                               {payments.length > 1 && isEditMode && (
                                 <button
@@ -806,28 +827,84 @@ export default function PaymentInstructionSlipModule({ currentUser }: PISModuleP
                               )}
                             </div>
 
-                            {/* Payment Purpose */}
+                            {/* 1. Completed Purchase Order Selection */}
                             <div className="md:col-span-6">
-                              <label className="block text-[10px] font-bold text-gray-500 mb-0.5 uppercase tracking-wider">Payment Purpose:</label>
-                              <input
-                                type="text"
+                              <label className="block text-[10px] font-bold text-gray-500 mb-0.5 uppercase tracking-wider">
+                                Completed Purchase Order: {errors[`completedPO_${p.id}`] && <span className="text-rose-500 font-bold ml-1">⚠</span>}
+                              </label>
+                              <select
                                 disabled={!isEditMode}
-                                placeholder="e.g., PPE MAINTAINING STOCKS"
                                 className={`w-full text-xs p-2 border rounded-lg focus:ring-1 focus:ring-smei-crimson focus:border-smei-crimson outline-none ${
-                                  errors[`paymentPurpose_${p.id}`] ? "border-rose-500 bg-rose-50/20" : "border-gray-200 bg-white"
+                                  errors[`completedPO_${p.id}`] ? "border-rose-500 bg-rose-50/20" : "border-gray-200 bg-white"
                                 }`}
-                                value={p.paymentPurpose}
+                                value={p.completedPOId || ""}
                                 onChange={(e) => {
+                                  const selectedId = e.target.value;
+                                  const matchedPO = eligiblePOs.find(po => po.id === selectedId);
+                                  const poNum = matchedPO ? matchedPO.poNumber : "";
+                                  const nextPurpose = matchedPO ? (matchedPO.purpose || "").toUpperCase() : "";
+
                                   const updated = payments.map(item => {
                                     if (item.id === p.id) {
-                                      return { ...item, paymentPurpose: e.target.value };
+                                      const nextGross = (item.gross === 0 && matchedPO?.totalAmount)
+                                        ? matchedPO.totalAmount
+                                        : item.gross;
+                                      const nextTotal = Number((nextGross - (nextGross * (item.ewt || 0) / 100)).toFixed(2));
+                                      return {
+                                        ...item,
+                                        completedPOId: selectedId,
+                                        completedPONumber: poNum,
+                                        poNumber: poNum,
+                                        paymentPurpose: nextPurpose,
+                                        gross: nextGross,
+                                        total: nextTotal
+                                      };
                                     }
                                     return item;
                                   });
                                   setPayments(updated);
+                                  if (!payee && matchedPO?.supplierName) {
+                                    setPayee(matchedPO.supplierName.toUpperCase());
+                                  }
                                 }}
-                              />
-                              {errors[`paymentPurpose_${p.id}`] && <p className="text-[9px] text-rose-500 mt-0.5 font-semibold">{errors[`paymentPurpose_${p.id}`]}</p>}
+                              >
+                                <option value="">-- Select Completed Purchase Order --</option>
+                                {eligiblePOs.map((po) => {
+                                  const isStatusCompleted = ["COMPLETED", "FULLY PAID", "PAYMENT FINISHED", "CLOSED"].includes((po.status || "").toUpperCase()) || ["COMPLETED", "FULLY PAID", "PAYMENT FINISHED", "CLOSED"].includes((po.approvalStatus || "").toUpperCase());
+                                  const usedInOtherPIS = slips.some((slip) =>
+                                    slip.id !== selectedSlip?.id &&
+                                    slip.status !== "Cancelled" &&
+                                    (slip.completedPOId === po.id || slip.completedPONumber === po.poNumber || (slip.payments && slip.payments.some(pay => pay.completedPOId === po.id || pay.completedPONumber === po.poNumber)))
+                                  );
+                                  const usedInAnotherEntryInCurrentForm = payments.some(other => other.id !== p.id && (other.completedPOId === po.id || (other.completedPONumber && other.completedPONumber === po.poNumber)));
+
+                                  const isUnavailable = isStatusCompleted || usedInOtherPIS || usedInAnotherEntryInCurrentForm;
+                                  const statusLabel = isStatusCompleted
+                                    ? " (COMPLETED)"
+                                    : usedInOtherPIS
+                                    ? " (ALREADY PAID)"
+                                    : usedInAnotherEntryInCurrentForm
+                                    ? " (SELECTED IN FORM)"
+                                    : "";
+
+                                  return (
+                                    <option
+                                      key={po.id}
+                                      value={po.id}
+                                      disabled={isUnavailable && p.completedPOId !== po.id}
+                                      className={isUnavailable && p.completedPOId !== po.id ? "text-gray-400 bg-gray-100" : ""}
+                                    >
+                                      {po.poNumber} {po.supplierName ? ` - ${po.supplierName}` : ""}{statusLabel}
+                                    </option>
+                                  );
+                                })}
+                              </select>
+                              {errors[`completedPO_${p.id}`] && <p className="text-[9px] text-rose-500 mt-0.5 font-semibold">⚠ {errors[`completedPO_${p.id}`]}</p>}
+                              {p.completedPONumber && (
+                                <span className="text-[10px] text-emerald-600 font-medium mt-0.5 block">
+                                  Selected PO: <strong className="font-mono">{p.completedPONumber}</strong>
+                                </span>
+                              )}
                             </div>
 
                             {/* Gross */}
@@ -848,7 +925,8 @@ export default function PaymentInstructionSlipModule({ currentUser }: PISModuleP
                                     const val = e.target.value === "" ? 0 : Number(e.target.value);
                                     const updated = payments.map(item => {
                                       if (item.id === p.id) {
-                                        return { ...item, gross: val, total: Number((val - item.ewt).toFixed(2)) };
+                                        const total = Number((val - (val * (item.ewt || 0) / 100)).toFixed(2));
+                                        return { ...item, gross: val, total };
                                       }
                                       return item;
                                     });
@@ -856,20 +934,20 @@ export default function PaymentInstructionSlipModule({ currentUser }: PISModuleP
                                   }}
                                 />
                               </div>
-                              {errors[`gross_${p.id}`] && <p className="text-[9px] text-rose-500 mt-0.5 font-semibold">{errors[`gross_${p.id}`]}</p>}
+                              {errors[`gross_${p.id}`] && <p className="text-[9px] text-rose-500 mt-0.5 font-semibold">⚠ {errors[`gross_${p.id}`]}</p>}
                             </div>
 
                             {/* EWT */}
                             <div className="md:col-span-2">
-                              <label className="block text-[10px] font-bold text-gray-500 mb-0.5 uppercase tracking-wider">EWT:</label>
+                              <label className="block text-[10px] font-bold text-gray-500 mb-0.5 uppercase tracking-wider">EWT (%):</label>
                               <div className="relative">
-                                <span className="absolute left-2.5 top-2 text-xs font-bold text-gray-400">₱</span>
+                                <span className="absolute right-2.5 top-2 text-xs font-bold text-gray-400">%</span>
                                 <input
                                   type="number"
                                   step="any"
                                   disabled={!isEditMode}
-                                  placeholder="0.00"
-                                  className={`w-full text-xs pl-5 pr-1.5 p-2 border rounded-lg focus:ring-1 focus:ring-smei-crimson focus:border-smei-crimson outline-none ${
+                                  placeholder="1"
+                                  className={`w-full text-xs pl-2 pr-6 p-2 border rounded-lg focus:ring-1 focus:ring-smei-crimson focus:border-smei-crimson outline-none ${
                                     errors[`ewt_${p.id}`] ? "border-rose-500 bg-rose-50/20" : "border-gray-200 bg-white"
                                   }`}
                                   value={p.ewt === 0 ? "" : p.ewt}
@@ -877,7 +955,8 @@ export default function PaymentInstructionSlipModule({ currentUser }: PISModuleP
                                     const val = e.target.value === "" ? 0 : Number(e.target.value);
                                     const updated = payments.map(item => {
                                       if (item.id === p.id) {
-                                        return { ...item, ewt: val, total: Number((item.gross - val).toFixed(2)) };
+                                        const total = Number((item.gross - (item.gross * val / 100)).toFixed(2));
+                                        return { ...item, ewt: val, total };
                                       }
                                       return item;
                                     });
@@ -885,7 +964,7 @@ export default function PaymentInstructionSlipModule({ currentUser }: PISModuleP
                                   }}
                                 />
                               </div>
-                              {errors[`ewt_${p.id}`] && <p className="text-[9px] text-rose-500 mt-0.5 font-semibold">{errors[`ewt_${p.id}`]}</p>}
+                              {errors[`ewt_${p.id}`] && <p className="text-[9px] text-rose-500 mt-0.5 font-semibold">⚠ {errors[`ewt_${p.id}`]}</p>}
                             </div>
 
                             {/* Total (derived) */}
@@ -902,9 +981,47 @@ export default function PaymentInstructionSlipModule({ currentUser }: PISModuleP
                                 />
                               </div>
                             </div>
+
+                            {/* 2. Payment Purpose Input (WYSIWYG Auto-Fit Editor) */}
+                            <div className="md:col-span-12 mt-1">
+                              <WysiwygPurposeEditor
+                                id={p.id}
+                                value={p.paymentPurpose || ""}
+                                disabled={!isEditMode}
+                                onChange={(newPurpose) => {
+                                  const updated = payments.map(item => {
+                                    if (item.id === p.id) {
+                                      return { ...item, paymentPurpose: newPurpose };
+                                    }
+                                    return item;
+                                  });
+                                  setPayments(updated);
+                                }}
+                                error={errors[`paymentPurpose_${p.id}`]}
+                              />
+                            </div>
                           </div>
                         ))}
                       </div>
+
+                      {/* Relocated Add Payment Button at the bottom of the Entry Container */}
+                      {isEditMode && (
+                        <div className="pt-1 pb-1">
+                          <button
+                            type="button"
+                            onClick={() => {
+                              setPayments([
+                                ...payments,
+                                { id: String(Date.now()), completedPOId: "", completedPONumber: "", paymentPurpose: "", gross: 0, ewt: 1, total: 0 }
+                              ]);
+                            }}
+                            className="text-xs font-semibold px-3 py-1.5 bg-smei-crimson text-white rounded-lg hover:bg-smei-crimson/90 active:scale-95 transition-all flex items-center gap-1.5 shadow-sm"
+                          >
+                            <Plus className="w-3.5 h-3.5" />
+                            Add Payment
+                          </button>
+                        </div>
+                      )}
 
                       {/* Cumulative summary display */}
                       <div className="grid grid-cols-1 md:grid-cols-4 gap-3 bg-white p-3 rounded-lg border border-gray-100 shadow-sm text-xs font-semibold text-gray-600">
@@ -922,7 +1039,7 @@ export default function PaymentInstructionSlipModule({ currentUser }: PISModuleP
                         </div>
                         <div>
                           <span className="block text-[9px] font-bold text-gray-400 uppercase tracking-wider">Count:</span>
-                          <span className="font-mono text-gray-800 text-sm">{payments.length} of 3</span>
+                          <span className="font-mono text-gray-800 text-sm">{payments.length}</span>
                         </div>
                       </div>
                     </div>

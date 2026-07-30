@@ -87,7 +87,7 @@ return (
         className="w-full max-w-4xl bg-white rounded-2xl shadow-2xl overflow-hidden border border-gray-100 flex flex-col md:flex-row"
       >
         {/* Left Panel: Brand / Corporate Info */}
-        <div className="bg-gradient-to-br from-smei-darkred via-smei-crimson to-red-950 p-8 md:p-12 text-white flex flex-col justify-between md:w-5/12">
+        <div className="bg-gradient-to-br from-smei-darkred via-smei-crimson to-red-950 p-8 md:p-12 text-white flex flex-col justify-center md:w-5/12">
           <div className="space-y-4">
             <div className="smei-logo-container inline-flex bg-white p-3 rounded-2xl shadow-lg border border-red-800">
               {!logoError ? (
@@ -112,6 +112,10 @@ return (
               <p className="text-sm font-semibold tracking-wider uppercase text-red-200 mt-1">
                 Southcoast Metal Enterprise, Inc.
               </p>
+              <div className="mt-2 text-xs text-red-200/90 font-medium leading-snug">
+                <p>© 2026 SMEI Management System</p>
+                <p>Developed by <span className="animate-pulse font-bold text-white/90">Paul Joseph Salgado</span></p>
+              </div>
               <div className="flex items-center gap-2 mt-4 bg-black/20 backdrop-blur-sm py-1.5 px-3 rounded-lg w-fit border border-emerald-500/20">
                 <span className="relative flex h-2 w-2">
                   <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-emerald-400 opacity-75"></span>
@@ -124,7 +128,7 @@ return (
             </div>
           </div>
 
-          <div className="text-[10px] text-red-300 font-mono border-t border-red-800/60 pt-4 mt-auto">
+          <div className="text-[10px] text-red-300 font-mono border-t border-red-800/60 pt-4 mt-8">
             Authorized Personnel Only • POMS v3.2.0 (Durable DB)
           </div>
         </div>

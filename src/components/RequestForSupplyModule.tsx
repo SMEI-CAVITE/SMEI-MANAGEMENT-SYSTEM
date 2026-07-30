@@ -4,11 +4,11 @@
  */
 
 import React, { useState, useEffect, useMemo } from "react";
-import { RequestForSupply, RFSItem, User, UserRole, PurchaseOrder } from "../types";
+import { RequestForSupply, RFSItem, User, UserRole } from "../types";
 import { api } from "../lib/api";
 import { Search, Plus, Filter, Calendar, FileText, ArrowUpDown, Trash2, Edit3, Eye, FileSpreadsheet, X, Download, Trash } from "lucide-react";
 import { exportWordWithTemplate, exportExcelWithTemplate } from "../utils/templateExport";
-import { ExportExcelButton, CreateButton, ExportPdfButton } from "./SharedButtons";
+import { ExportExcelButton, CreateButton } from "./SharedButtons";
 import { TableSkeleton } from "./ui/Skeleton";
 import { formatRFSNo } from "../utils/templateMapping";
 import { formatControlNumber } from "../utils/controlNumber";
@@ -44,18 +44,9 @@ export default function RequestForSupplyModule({ currentUser }: RFSModuleProps) 
   const [departmentOthers, setDepartmentOthers] = useState("");
   const [controlNumber, setControlNumber] = useState("");
   const [purchaseOrderNumber, setPurchaseOrderNumber] = useState("");
-  const [addNothingFollows, setAddNothingFollows] = useState(false);
-  const [purchaseOrders, setPurchaseOrders] = useState<PurchaseOrder[]>([]);
+  const [availablePOs, setAvailablePOs] = useState<any[]>([]);
+  const [addNothingFollows, setAddNothingFollows] = useState<boolean>(false);
   const [status, setStatus] = useState<"Complete" | "Incomplete" | "On Time" | "Late">("Incomplete");
-
-  const loadPurchaseOrders = async () => {
-    try {
-      const pos = await api.getPOs();
-      setPurchaseOrders(pos || []);
-    } catch (err) {
-      console.warn("Could not load POs for RFS dropdown:", err);
-    }
-  };
   const [modeOfRequest, setModeOfRequest] = useState<"Emergency" | "Urgent" | "Regular" | "Irregular">("Regular");
   const [purpose, setPurpose] = useState("");
   const [requestedBy, setRequestedBy] = useState(currentUser.fullName);
@@ -95,6 +86,7 @@ export default function RequestForSupplyModule({ currentUser }: RFSModuleProps) 
 
   useEffect(() => {
     fetchRequests();
+    api.getPOs().then((pos) => setAvailablePOs(pos || [])).catch((err) => console.error("Error fetching POs for dropdown:", err));
   }, []);
 
   // Filter & Search Logic
@@ -167,7 +159,6 @@ export default function RequestForSupplyModule({ currentUser }: RFSModuleProps) 
   // Open modal for Create/View/Edit
   const handleOpenModal = async (req: RequestForSupply | null = null, edit = false) => {
     setErrors({});
-    loadPurchaseOrders();
     if (req) {
       setSelectedRequest(req);
       setIsEditMode(edit);
@@ -178,7 +169,7 @@ export default function RequestForSupplyModule({ currentUser }: RFSModuleProps) 
       setDepartmentOthers(req.departmentOthers || "");
       setControlNumber(req.controlNumber);
       setPurchaseOrderNumber(req.purchaseOrderNumber || "");
-      setAddNothingFollows(req.addNothingFollows || false);
+      setAddNothingFollows(req.addNothingFollows ?? false);
       setStatus(req.status);
       setModeOfRequest(req.modeOfRequest);
       setPurpose(req.purpose);
@@ -193,6 +184,7 @@ export default function RequestForSupplyModule({ currentUser }: RFSModuleProps) 
       setDueDate("");
       setDepartment("Admin");
       setDepartmentOthers("");
+      setAddNothingFollows(false);
       
       // Auto-generate sequential 5-digit control number
       let nextControlNo = "00001";
@@ -212,7 +204,6 @@ export default function RequestForSupplyModule({ currentUser }: RFSModuleProps) 
       setControlNumber(nextControlNo);
       
       setPurchaseOrderNumber("");
-      setAddNothingFollows(false);
       setStatus("Incomplete");
       setModeOfRequest("Regular");
       setPurpose("");
@@ -384,7 +375,8 @@ export default function RequestForSupplyModule({ currentUser }: RFSModuleProps) 
   };
 
   const validateRFSExport = (req: RequestForSupply): boolean => {
-    const isComplete = req.status === "Complete";
+    const isApproved = req.approvalStatus === "Approved";
+    const isComplete = req.status === "Complete" || req.status === "On Time" || req.status === "Late" || isApproved;
     const hasDueDate = Boolean(req.dueDate && req.dueDate.trim() !== "");
 
     if (!isComplete && !hasDueDate) {
@@ -396,7 +388,7 @@ export default function RequestForSupplyModule({ currentUser }: RFSModuleProps) 
       return false;
     }
     if (!hasDueDate) {
-      alert("Cannot export RFS. Due Date is missing. Please set the Due Date in RFS Approval before exporting.");
+      alert("Cannot export RFS. Due Date is missing. Please set the Due Date in Procurement Approval before exporting.");
       return false;
     }
     return true;
@@ -422,12 +414,16 @@ export default function RequestForSupplyModule({ currentUser }: RFSModuleProps) 
       APPROVED_BY: req.approvedBy || "N/A",
     };
 
-    const exportItems = (req.items || []).map((it, index) => ({
+    const reqToExport = {
+      ...req,
+      addNothingFollows: req.addNothingFollows ?? addNothingFollows
+    };
+
+    const exportItems = (reqToExport.items || []).map((it, index) => ({
       index: index + 1,
       quantity: it.quantity,
       unit: it.unit,
       description: it.description,
-      item: it.description,
       lastPurchaseDate: it.lastPurchaseDate || "N/A",
       lastPurchaseQuantity: it.lastPurchaseQuantity || 0,
       lastPurchaseUnitPrice: it.lastPurchaseUnitPrice || 0,
@@ -435,16 +431,14 @@ export default function RequestForSupplyModule({ currentUser }: RFSModuleProps) 
       currentPurchaseQuantity: it.currentPurchaseQuantity || 0,
       currentPurchaseUnitPrice: it.currentPurchaseUnitPrice || 0,
       remarks: it.remarks || "N/A",
-      isItalic: false,
     }));
 
-    if (req.addNothingFollows) {
+    if (reqToExport.addNothingFollows) {
       exportItems.push({
         index: exportItems.length + 1,
-        quantity: "",
+        quantity: "" as any,
         unit: "",
         description: "*****NOTHING FOLLOWS*****",
-        item: "*****NOTHING FOLLOWS*****",
         lastPurchaseDate: "N/A",
         lastPurchaseQuantity: 0,
         lastPurchaseUnitPrice: 0,
@@ -452,8 +446,7 @@ export default function RequestForSupplyModule({ currentUser }: RFSModuleProps) 
         currentPurchaseQuantity: 0,
         currentPurchaseUnitPrice: 0,
         remarks: "N/A",
-        isItalic: true,
-      } as any);
+      });
     }
 
     if (format === "word") {
@@ -485,20 +478,6 @@ const handleExportExcel = async () => {
     }
     await handleExport(selectedRFS, "excel");
 };
-
-  const handleTriggerPDFExport = async () => {
-    if (selectedRFS) {
-      if (!validateRFSExport(selectedRFS)) return;
-      try {
-        const { printDocument } = await import("../utils/printDocument");
-        await printDocument("rfs", selectedRFS);
-      } catch (err: any) {
-        alert("Failed to print: " + (err.message || err));
-      }
-    } else {
-      alert("Please select an RFS first.");
-    }
-  };
 
   return (
     <div id="smei-rfs-list" className="p-4 md:p-6 space-y-4 max-w-[130rem] mx-auto w-full">
@@ -577,22 +556,14 @@ const handleExportExcel = async () => {
                     {/* Purchase Order Number */}
                     <div>
                       <label className="block text-xs font-bold text-gray-700 mb-1">Associated PO Number (Optional):</label>
-                      <select
+                      <input
+                        type="text"
                         disabled={!isEditMode}
-                        className="w-full text-sm p-2 border border-gray-200 rounded-lg outline-none focus:ring-1 focus:ring-smei-crimson focus:border-smei-crimson font-mono bg-white"
+                        className="w-full text-sm font-mono p-2 border border-gray-200 rounded-lg focus:ring-1 focus:ring-smei-crimson focus:border-smei-crimson outline-none bg-white"
                         value={purchaseOrderNumber}
                         onChange={(e) => setPurchaseOrderNumber(e.target.value)}
-                      >
-                        <option value="">No Associated Purchase Order</option>
-                        {purchaseOrders.map((po) => (
-                          <option key={po.id || po.poNumber} value={po.poNumber}>
-                            {po.poNumber}{po.supplierName ? ` (${po.supplierName})` : ""}
-                          </option>
-                        ))}
-                        {purchaseOrderNumber && !purchaseOrders.some((p) => p.poNumber === purchaseOrderNumber) && (
-                          <option value={purchaseOrderNumber}>{purchaseOrderNumber}</option>
-                        )}
-                      </select>
+                        placeholder="Enter PO Number (Optional)"
+                      />
                     </div>
 
                     {/* Department Selection */}
@@ -680,16 +651,16 @@ const handleExportExcel = async () => {
                   <div className="border-t border-gray-100 pt-4 mt-2">
                     <div className="flex flex-wrap items-center justify-between gap-2 mb-3">
                       <h4 className="text-xs font-bold text-smei-darkred uppercase tracking-wide">Supply Items List Grid</h4>
-                      <div className="flex items-center gap-4">
-                        <label className="flex items-center gap-1.5 text-xs text-gray-700 font-medium cursor-pointer select-none">
+                      <div className="flex items-center gap-3">
+                        <label className="flex items-center gap-1.5 text-xs font-semibold text-gray-700 cursor-pointer select-none">
                           <input
                             type="checkbox"
                             disabled={!isEditMode}
                             checked={addNothingFollows}
                             onChange={(e) => setAddNothingFollows(e.target.checked)}
-                            className="w-4 h-4 text-smei-crimson rounded border-gray-300 focus:ring-smei-crimson"
+                            className="w-4 h-4 text-smei-crimson rounded border-gray-300 focus:ring-smei-crimson accent-smei-crimson"
                           />
-                          <span>Add &quot;*****NOTHING FOLLOWS*****&quot; to the last item</span>
+                          <span>Add "*****NOTHING FOLLOWS*****" to the last item</span>
                         </label>
                         {isEditMode && (
                           <button
@@ -847,20 +818,22 @@ const handleExportExcel = async () => {
                             </tr>
                           ))}
                           {addNothingFollows && (
-                            <tr className="border-b border-gray-100 bg-gray-50/70 italic text-gray-500 font-medium select-none">
-                              <td className="p-2 text-center font-mono text-[11px] text-gray-400">-</td>
-                              <td className="p-2 text-center text-[11px] text-gray-400">-</td>
-                              <td className="p-2 font-semibold text-gray-600 tracking-wide font-mono text-xs italic">
-                                *****NOTHING FOLLOWS*****
+                            <tr className="border-b border-gray-100 bg-gray-50/50 italic">
+                              <td className="p-1 text-center font-mono text-gray-400 text-xs">-</td>
+                              <td className="p-1 text-center text-gray-400 text-xs">-</td>
+                              <td className="p-1">
+                                <div className="p-1 font-semibold text-gray-500 italic text-xs">
+                                  *****NOTHING FOLLOWS*****
+                                </div>
                               </td>
-                              <td className="p-2 text-center text-[11px] text-gray-400 font-mono">-</td>
-                              <td className="p-2 text-center text-[11px] text-gray-400 font-mono">-</td>
-                              <td className="p-2 text-center text-[11px] text-gray-400 font-mono">-</td>
-                              <td className="p-2 text-center text-[11px] text-gray-400 font-mono">-</td>
-                              <td className="p-2 text-center text-[11px] text-gray-400 font-mono">-</td>
-                              <td className="p-2 text-center text-[11px] text-gray-400 font-mono">-</td>
-                              <td className="p-2 text-center text-[11px] text-gray-400 font-mono">-</td>
-                              {isEditMode && <td className="p-2 text-center text-gray-300 text-[10px]">Auto</td>}
+                              <td className="p-1 text-center font-mono text-gray-400 text-xs">-</td>
+                              <td className="p-1 text-center font-mono text-gray-400 text-xs">-</td>
+                              <td className="p-1 text-center font-mono text-gray-400 text-xs">-</td>
+                              <td className="p-1 text-center font-mono text-gray-400 text-xs">-</td>
+                              <td className="p-1 text-center font-mono text-gray-400 text-xs">-</td>
+                              <td className="p-1 text-center font-mono text-gray-400 text-xs">-</td>
+                              <td className="p-1 text-center text-gray-400 text-xs">-</td>
+                              {isEditMode && <td className="p-1 text-center"></td>}
                             </tr>
                           )}
                         </tbody>

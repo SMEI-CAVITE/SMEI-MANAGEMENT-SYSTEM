@@ -23,10 +23,20 @@ import {
   Link,
   Copy,
   Mail,
-  QrCode
+  QrCode,
+  Trash2,
+  Eye,
+  EyeOff,
+  ShieldCheck
 } from "lucide-react";
+import SecurityPINModal from "./SecurityPINModal";
+import { SecurityService } from "../services/securityService";
 
-export default function UserManagement() {
+interface UserManagementProps {
+  currentUser?: User | null;
+}
+
+export default function UserManagement({ currentUser }: UserManagementProps = {}) {
   const [users, setUsers] = useState<User[]>([]);
   const [departments, setDepartments] = useState<Array<{ id: string; name: string }>>([]);
   const [rolesList, setRolesList] = useState<any[]>([]);
@@ -34,6 +44,18 @@ export default function UserManagement() {
   const [error, setError] = useState("");
   const [success, setSuccess] = useState("");
   const [searchQuery, setSearchQuery] = useState("");
+
+  const [activeUser, setActiveUser] = useState<User | null>(currentUser || null);
+
+  useEffect(() => {
+    if (currentUser) {
+      setActiveUser(currentUser);
+    } else {
+      api.getCurrentUser().then((res) => setActiveUser(res.user)).catch(() => {});
+    }
+  }, [currentUser]);
+
+  const isAdmin = activeUser?.role === UserRole.Administrator || activeUser?.role === "Administrator";
 
   const defaultRolesList = ["Purchasing Staff", "Department Head", "Accounting Staff", "Director", "Viewer", "Administrator"];
   const getDisplayRoles = () => {
@@ -81,6 +103,50 @@ export default function UserManagement() {
   });
   const [newPassword, setNewPassword] = useState("");
 
+  // Password Reveal & PIN Verification States
+  const [isPinModalOpen, setIsPinModalOpen] = useState(false);
+  const [userForReveal, setUserForReveal] = useState<User | null>(null);
+  const [isPasswordModalOpen, setIsPasswordModalOpen] = useState(false);
+  const [revealedPasswordData, setRevealedPasswordData] = useState<{
+    username: string;
+    fullName: string;
+    employeeId?: string;
+    password?: string;
+    isFirebase?: boolean;
+  } | null>(null);
+  const [isMasked, setIsMasked] = useState(true);
+  const [isCopied, setIsCopied] = useState(false);
+
+  const handleInitiateReveal = (user: User) => {
+    if (!isAdmin) return;
+    setUserForReveal(user);
+    const pinStatus = SecurityService.isPINRequired("User Accounts", activeUser);
+    if (pinStatus.required) {
+      setIsPinModalOpen(true);
+    } else {
+      executeRevealPassword(user);
+    }
+  };
+
+  const executeRevealPassword = async (targetUser: User) => {
+    setError("");
+    try {
+      const res = await api.revealPassword(targetUser.id);
+      setRevealedPasswordData({
+        username: targetUser.username,
+        fullName: targetUser.fullName,
+        employeeId: targetUser.employeeId,
+        password: res.password || "Password unavailable",
+        isFirebase: res.isFirebase
+      });
+      setIsMasked(true);
+      setIsCopied(false);
+      setIsPasswordModalOpen(true);
+    } catch (err: any) {
+      setError(err.message || "Failed to reveal user password");
+    }
+  };
+
   const fetchUsers = async () => {
     setIsLoading(true);
     setError("");
@@ -119,8 +185,14 @@ export default function UserManagement() {
     if (!formData.fullName) newErrors.fullName = "Full Name is required.";
     if (!formData.email) newErrors.email = "Email Address is required.";
 
-    if (users.some(u => u.employeeId === formData.employeeId)) {
-      newErrors.employeeId = `Employee ID ${formData.employeeId} already exists.`;
+    let formattedEmpId = formData.employeeId.trim();
+    if (formattedEmpId && !formattedEmpId.startsWith("SMEI-EMPLOYEE-")) {
+      const digits = formattedEmpId.replace(/\D/g, '');
+      formattedEmpId = `SMEI-EMPLOYEE-${digits.padStart(3, '0')}`;
+    }
+
+    if (users.some(u => u.employeeId && u.employeeId.toLowerCase() === formattedEmpId.toLowerCase())) {
+      newErrors.employeeId = `Employee ID ${formattedEmpId} already exists.`;
     }
 
     if (Object.keys(newErrors).length > 0) {
@@ -130,7 +202,7 @@ export default function UserManagement() {
 
     try {
       await api.createUser({
-        employeeId: formData.employeeId,
+        employeeId: formattedEmpId,
         username: formData.username,
         password: formData.password,
         fullName: formData.fullName,
@@ -138,7 +210,7 @@ export default function UserManagement() {
         role: formData.role as UserRole,
         department: formData.department
       });
-      setSuccess(`User ${formData.username} created successfully!`);
+      setSuccess(`User ${formData.username} created successfully with ID ${formattedEmpId}!`);
       setIsCreateOpen(false);
       setFormData({
         username: "",
@@ -236,20 +308,39 @@ export default function UserManagement() {
     }
   };
 
-  const openCreateModal = () => {
-    // Determine next sequential ID
-    let maxId = 0;
-    users.forEach(u => {
-      if (u.employeeId) {
-        const idNum = parseInt(u.employeeId.replace(/\D/g, ''), 10);
-        if (!isNaN(idNum) && idNum > maxId) {
-          maxId = idNum;
+  const openCreateModal = async () => {
+    try {
+      const res = await api.getNextEmployeeId();
+      setFormData(prev => ({ ...prev, employeeId: res.nextEmployeeId }));
+    } catch (err) {
+      let maxId = 0;
+      users.forEach(u => {
+        if (u.employeeId) {
+          const match = u.employeeId.match(/\d+/);
+          if (match) {
+            const idNum = parseInt(match[0], 10);
+            if (!isNaN(idNum) && idNum > maxId) maxId = idNum;
+          }
         }
-      }
-    });
-    const nextId = String(maxId + 1).padStart(3, '0');
-    setFormData(prev => ({ ...prev, employeeId: nextId }));
+      });
+      setFormData(prev => ({ ...prev, employeeId: `SMEI-EMPLOYEE-${String(maxId + 1).padStart(3, '0')}` }));
+    }
     setIsCreateOpen(true);
+  };
+
+  const handleDeleteUser = async (user: User) => {
+    if (!window.confirm(`Are you sure you want to permanently delete user account "${user.username}" (${user.employeeId || user.id})?\n\nNote: The employee ID "${user.employeeId}" will NOT be reused for future accounts.`)) {
+      return;
+    }
+    setError("");
+    setSuccess("");
+    try {
+      await api.deleteUser(user.id);
+      setSuccess(`Account ${user.username} deleted successfully.`);
+      fetchUsers();
+    } catch (err: any) {
+      setError(err.message || "Failed to delete user account.");
+    }
   };
 
   const openEditModal = (user: User) => {
@@ -411,7 +502,7 @@ export default function UserManagement() {
                     return (
                       <tr key={user.id} className="hover:bg-gray-50/50 transition-all">
                         <td className="p-4 font-mono font-bold text-gray-500">
-                          {user.employeeId || user.id.toUpperCase().replace("U_", "EMP-")}
+                          {user.employeeId || "SMEI-EMPLOYEE-001"}
                         </td>
                         <td className="p-4">
                           <div className="flex items-center gap-3">
@@ -487,6 +578,15 @@ export default function UserManagement() {
                                     <Unlock className="w-4 h-4" />
                                   </button>
                                 )}
+                                {isAdmin && (
+                                  <button
+                                    onClick={() => handleInitiateReveal(user)}
+                                    className="p-1.5 text-gray-600 hover:bg-gray-100 rounded-lg transition-all"
+                                    title="Reveal Password (Administrator Only)"
+                                  >
+                                    <Eye className="w-4 h-4 text-slate-600 hover:text-slate-900" />
+                                  </button>
+                                )}
                                 <button
                                   onClick={() => openEditModal(user)}
                                   className="p-1.5 text-gray-600 hover:bg-gray-100 rounded-lg transition-all"
@@ -505,12 +605,19 @@ export default function UserManagement() {
                                   onClick={() => toggleUserStatus(user, statusVal)}
                                   className={`p-1.5 rounded-lg transition-all ${
                                     statusVal === "Active"
-                                      ? "text-red-600 hover:bg-red-50"
+                                      ? "text-orange-600 hover:bg-orange-50"
                                       : "text-green-600 hover:bg-green-50"
                                   }`}
                                   title={statusVal === "Active" ? "Disable Account" : "Activate Account"}
                                 >
                                   {statusVal === "Active" ? <UserX className="w-4 h-4" /> : <UserCheck className="w-4 h-4" />}
+                                </button>
+                                <button
+                                  onClick={() => handleDeleteUser(user)}
+                                  className="p-1.5 text-red-600 hover:bg-red-50 rounded-lg transition-all"
+                                  title="Delete Account Permanently"
+                                >
+                                  <Trash2 className="w-4 h-4" />
                                 </button>
                               </>
                             )}
@@ -1038,6 +1145,142 @@ export default function UserManagement() {
                   <span>Generate Link</span>
                 </button>
               )}
+            </div>
+          </motion.div>
+        </div>
+      )}
+
+      {/* SECURITY PIN VERIFICATION MODAL FOR PASSWORD REVEAL */}
+      {isPinModalOpen && (
+        <SecurityPINModal
+          moduleName="User Accounts"
+          currentUser={activeUser || undefined}
+          onSuccess={() => {
+            setIsPinModalOpen(false);
+            if (userForReveal) {
+              executeRevealPassword(userForReveal);
+            }
+          }}
+          onClose={() => {
+            setIsPinModalOpen(false);
+            setUserForReveal(null);
+          }}
+        />
+      )}
+
+      {/* PASSWORD REVEAL VISIBILITY MODAL */}
+      {isPasswordModalOpen && revealedPasswordData && (
+        <div className="fixed inset-0 z-[9999] flex items-center justify-center p-4 backdrop-blur-md bg-slate-900/50">
+          <motion.div
+            initial={{ opacity: 0, scale: 0.95 }}
+            animate={{ opacity: 1, scale: 1 }}
+            className="bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-2xl shadow-2xl max-w-md w-full p-6 space-y-5"
+          >
+            <div className="flex items-center justify-between border-b border-gray-100 dark:border-slate-800 pb-4">
+              <div className="flex items-center gap-2">
+                <div className="p-2 bg-red-50 dark:bg-red-950/40 rounded-xl text-smei-crimson dark:text-red-500">
+                  <Lock className="w-5 h-5" />
+                </div>
+                <div>
+                  <h3 className="text-sm font-bold uppercase tracking-wider text-slate-800 dark:text-white">
+                    Password Visibility
+                  </h3>
+                  <p className="text-xs text-slate-500 dark:text-slate-400">
+                    Administrator Credentials Access
+                  </p>
+                </div>
+              </div>
+              <button
+                onClick={() => {
+                  setIsPasswordModalOpen(false);
+                  setRevealedPasswordData(null);
+                }}
+                className="text-slate-400 hover:text-slate-600 dark:hover:text-slate-200 p-1 rounded-lg"
+              >
+                <X className="w-5 h-5" />
+              </button>
+            </div>
+
+            <div className="bg-slate-50 dark:bg-slate-800/60 p-4 rounded-xl space-y-2 border border-slate-100 dark:border-slate-800">
+              <div className="flex items-center justify-between text-xs">
+                <span className="text-slate-500 dark:text-slate-400 font-semibold uppercase">User Account</span>
+                <span className="font-mono font-bold text-slate-700 dark:text-slate-300">
+                  {revealedPasswordData.employeeId || "N/A"}
+                </span>
+              </div>
+              <div className="text-sm font-bold text-slate-800 dark:text-white">
+                {revealedPasswordData.fullName}
+              </div>
+              <div className="text-xs font-mono text-slate-500 dark:text-slate-400">
+                @{revealedPasswordData.username}
+              </div>
+            </div>
+
+            {revealedPasswordData.isFirebase ? (
+              <div className="p-4 bg-amber-50 dark:bg-amber-950/30 border border-amber-200 dark:border-amber-800/50 rounded-xl text-amber-800 dark:text-amber-300 space-y-1.5">
+                <div className="flex items-center gap-1.5 font-bold text-xs uppercase tracking-wide">
+                  <AlertCircle className="w-4 h-4 text-amber-600 dark:text-amber-400" />
+                  <span>Password Unavailable</span>
+                </div>
+                <p className="text-xs leading-relaxed">
+                  This user account is authenticated via Firebase Authentication. Passwords managed through Firebase Auth are non-retrievable and encrypted server-side.
+                </p>
+              </div>
+            ) : (
+              <div className="space-y-2">
+                <label className="block text-xs font-bold text-slate-600 dark:text-slate-400 uppercase tracking-wider">
+                  Account Password
+                </label>
+                <div className="flex items-center gap-2">
+                  <div className="relative flex-1">
+                    <input
+                      type={isMasked ? "password" : "text"}
+                      readOnly
+                      value={revealedPasswordData.password || "Password unavailable"}
+                      className="w-full px-4 py-3 font-mono font-bold text-sm bg-slate-100 dark:bg-slate-800 border border-slate-200 dark:border-slate-700 rounded-xl text-slate-800 dark:text-white focus:outline-none"
+                    />
+                    <button
+                      type="button"
+                      onClick={() => setIsMasked(!isMasked)}
+                      className="absolute right-3 top-1/2 -translate-y-1/2 text-slate-400 hover:text-slate-600 dark:hover:text-slate-200 p-1"
+                      title={isMasked ? "Show Password" : "Hide Password"}
+                    >
+                      {isMasked ? <Eye className="w-4 h-4" /> : <EyeOff className="w-4 h-4" />}
+                    </button>
+                  </div>
+                  {revealedPasswordData.password && revealedPasswordData.password !== "Password unavailable" && (
+                    <button
+                      type="button"
+                      onClick={() => {
+                        navigator.clipboard.writeText(revealedPasswordData.password || "");
+                        setIsCopied(true);
+                        setTimeout(() => setIsCopied(false), 2000);
+                      }}
+                      className="p-3 bg-slate-100 hover:bg-slate-200 dark:bg-slate-800 dark:hover:bg-slate-700 border border-slate-200 dark:border-slate-700 rounded-xl text-slate-700 dark:text-slate-300 transition-colors flex items-center justify-center shrink-0"
+                      title="Copy Password"
+                    >
+                      {isCopied ? <CheckCircle2 className="w-4 h-4 text-green-600" /> : <Copy className="w-4 h-4" />}
+                    </button>
+                  )}
+                </div>
+              </div>
+            )}
+
+            <div className="pt-2 border-t border-slate-100 dark:border-slate-800 flex items-center justify-between">
+              <div className="flex items-center gap-1 text-[10px] text-slate-400 dark:text-slate-500 font-mono">
+                <ShieldCheck className="w-3.5 h-3.5 text-green-600" />
+                <span>Audited Event Logged</span>
+              </div>
+              <button
+                type="button"
+                onClick={() => {
+                  setIsPasswordModalOpen(false);
+                  setRevealedPasswordData(null);
+                }}
+                className="px-4 py-2 bg-slate-800 dark:bg-slate-700 hover:bg-slate-900 text-white rounded-xl text-xs font-bold uppercase tracking-wider"
+              >
+                Close
+              </button>
             </div>
           </motion.div>
         </div>

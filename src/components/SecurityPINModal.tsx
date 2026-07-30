@@ -1,47 +1,19 @@
 import React, { useState, useEffect, useRef } from "react";
 import { Lock, ShieldAlert, ArrowRight, X } from "lucide-react";
+import { User } from "../types";
+import { SecurityService } from "../services/securityService";
 
 interface SecurityPINModalProps {
-  moduleName: "Purchase Order" | "Request For Supply" | "Payment Instruction Slip" | "Canvass Sheet" | "Request For Supply (RFS) Approval";
+  moduleName: string;
+  currentUser?: User;
   onSuccess: () => void;
   onClose: () => void;
 }
 
-export default function SecurityPINModal({ moduleName, onSuccess, onClose }: SecurityPINModalProps) {
+export default function SecurityPINModal({ moduleName, currentUser, onSuccess, onClose }: SecurityPINModalProps) {
   const [pinInput, setPinInput] = useState("");
   const [error, setError] = useState("");
-  const [requiredPin, setRequiredPin] = useState("");
   const inputRef = useRef<HTMLInputElement>(null);
-
-  useEffect(() => {
-    // Determine the active PIN from storage
-    const getActivePin = () => {
-      try {
-        const saved = localStorage.getItem("smei_module_pins");
-        if (saved) {
-          const rules = JSON.parse(saved);
-          const rule = rules.find(
-            (r: any) => r.moduleName === moduleName && r.isEnabled === true
-          );
-          if (rule) {
-            return rule.pinCode;
-          }
-        }
-      } catch (err) {
-        console.error("Failed to parse module pins in modal", err);
-      }
-      
-      // Defaults
-      if (moduleName === "Purchase Order") return "1234";
-      if (moduleName === "Request For Supply") return "5678";
-      if (moduleName === "Request For Supply (RFS) Approval") return "7777";
-      if (moduleName === "Payment Instruction Slip") return "4321";
-      if (moduleName === "Canvass Sheet") return "9999";
-      return "1234"; // Default fallback
-    };
-
-    setRequiredPin(getActivePin());
-  }, [moduleName]);
 
   useEffect(() => {
     if (inputRef.current) {
@@ -53,19 +25,19 @@ export default function SecurityPINModal({ moduleName, onSuccess, onClose }: Sec
     e.preventDefault();
     if (!pinInput) return;
 
-    if (pinInput === requiredPin) {
-      // Mark as unlocked in session storage so other views of the module benefit too
-      sessionStorage.setItem("smei_session_unlocked", "true");
-      sessionStorage.setItem(`smei_unlocked_${moduleName}`, "true");
+    const res = SecurityService.verifyAndUnlock(moduleName, pinInput, currentUser);
+    if (res.success) {
       onSuccess();
     } else {
-      setError("Invalid Administrative PIN code. Please try again.");
+      setError(res.error || "Invalid Administrative PIN code. Please try again.");
       setPinInput("");
       if (inputRef.current) {
         inputRef.current.focus();
       }
     }
   };
+
+  const resolvedName = SecurityService.resolveModuleName(moduleName);
 
   return (
     <div className="fixed inset-0 z-[9999] flex items-center justify-center p-4 backdrop-blur-xl bg-slate-900/40 dark:bg-black/60 transition-all duration-300">
@@ -95,7 +67,7 @@ export default function SecurityPINModal({ moduleName, onSuccess, onClose }: Sec
             Security Verification
           </h3>
           <p className="text-xs text-slate-500 dark:text-slate-400 max-w-xs mx-auto leading-relaxed">
-            Administrative credentials required. Enter the PIN to authorize access to the <span className="font-bold text-slate-700 dark:text-slate-300">{moduleName}</span> module.
+            Administrative credentials required. Enter the PIN to authorize access to the <span className="font-bold text-slate-700 dark:text-slate-300">{resolvedName}</span> module.
           </p>
         </div>
 

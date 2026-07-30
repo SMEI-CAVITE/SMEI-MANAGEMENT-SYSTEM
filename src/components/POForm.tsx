@@ -3,15 +3,16 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-import React, { useState, useEffect, useRef, useMemo } from "react";
-import { PurchaseOrder, POItem, Supplier, User, UserRole, POStatus, Signatory } from "../types";
+import React, { useState, useEffect, useRef, useMemo, useCallback } from "react";
+import { PurchaseOrder, POItem, Supplier, User, UserRole, POStatus, Signatory, RequestForSupply } from "../types";
 import { calculatePOFinancials } from "../store";
 import { api } from "../lib/api";
 import { motion } from "motion/react";
-import { ArrowLeft, Save, Send, CheckCircle2, AlertTriangle, Printer, Trash2, Plus, RefreshCw, PenTool, Check, FileCheck, CircleSlash, XCircle, FileText, FileSpreadsheet } from "lucide-react";
+import { ArrowLeft, Save, Send, CheckCircle2, AlertTriangle, Trash2, Plus, RefreshCw, PenTool, Check, FileCheck, CircleSlash, XCircle, FileText, FileSpreadsheet, Search, ChevronDown, Building, Clock } from "lucide-react";
 import { exportPOToWord, exportPOToXLSM } from "../utils/wordExport";
 import { formatRFSNo } from "../utils/templateMapping";
 import { formatControlNumber } from "../utils/controlNumber";
+import { isRFSPending } from "../utils/pendingDocumentUtils";
 import smeiLogo from "../assets/images/smei_logo_1782431389924.jpg";
 
 interface POFormProps {
@@ -36,12 +37,21 @@ export default function POForm({
   // 1. Supplier / Header Section State
   const [poNumber, setPoNumber] = useState("");
   const [rfsNumber, setRfsNumber] = useState("");
+  const [rfsId, setRfsId] = useState("");
+  const [rfsList, setRfsList] = useState<RequestForSupply[]>([]);
+  const [isLoadingRFS, setIsLoadingRFS] = useState(false);
+  const [rfsSearchQuery, setRfsSearchQuery] = useState("");
+  const [isRfsDropdownOpen, setIsRfsDropdownOpen] = useState(false);
+  const [activeRfsOptionIndex, setActiveRfsOptionIndex] = useState(-1);
+  const rfsDropdownRef = useRef<HTMLDivElement>(null);
   const [poDate, setPoDate] = useState("");
   const [deliveryDate, setDeliveryDate] = useState("");
   const [supplierId, setSupplierId] = useState("");
   const [supplierName, setSupplierName] = useState("");
   const [showSuggestions, setShowSuggestions] = useState(false);
   const [activeSuggestionIndex, setActiveSuggestionIndex] = useState(-1);
+  const [allSuppliersList, setAllSuppliersList] = useState<Supplier[]>(suppliers || []);
+  const supplierDropdownRef = useRef<HTMLDivElement>(null);
   const [recentlyUsedSuppliers, setRecentlyUsedSuppliers] = useState<Supplier[]>([]);
   const [attention, setAttention] = useState("");
   const [telNo, setTelNo] = useState("");
@@ -63,7 +73,20 @@ export default function POForm({
   const handleDescriptionChange = (id: string, value: string) => {
     // Update local state immediately
     setItems((prev) =>
-      prev.map((item) => (item.id === id ? { ...item, description: value } : item))
+      prev.map((item) => {
+        if (item.id === id) {
+          const updated = { ...item, description: value };
+          if (updated.unitPrice === 0 && value.trim()) {
+            const autoPrice = getSupplierLastPriceForItem(supplierId, supplierName, value, 0);
+            if (autoPrice > 0) {
+              updated.unitPrice = autoPrice;
+              updated.amount = (Number(updated.quantity) || 0) * autoPrice;
+            }
+          }
+          return updated;
+        }
+        return item;
+      })
     );
 
     // Debounce the heavy calculation/sync
@@ -211,23 +234,382 @@ export default function POForm({
     };
   }, []);
 
-  // Compute recently used suppliers from POs list
+  // Synchronize supplier registry dynamically with API and prop updates
   useEffect(() => {
-    if (pos && pos.length > 0) {
-      const uniqueIds = Array.from(new Set(pos.map(p => p.supplierId))).filter(Boolean);
-      const activeRecentlyUsed = uniqueIds
-        .map(id => suppliers.find(s => s.id === id))
-        .filter((s): s is Supplier => !!s && s.status !== "Disabled")
-        .slice(0, 3);
-      setRecentlyUsedSuppliers(activeRecentlyUsed);
+    let isMounted = true;
+    const syncSuppliers = async () => {
+      try {
+        const fresh = await api.getSuppliers();
+        if (isMounted && Array.isArray(fresh) && fresh.length > 0) {
+          setAllSuppliersList(fresh);
+        }
+      } catch (err) {
+        console.error("Failed to sync supplier registry in POForm:", err);
+      }
+    };
+
+    if (suppliers && suppliers.length > 0) {
+      setAllSuppliersList(suppliers);
     }
-  }, [pos, suppliers]);
+    syncSuppliers();
+
+    const handleSuppliersUpdated = () => {
+      syncSuppliers();
+    };
+
+    window.addEventListener("smei_suppliers_updated", handleSuppliersUpdated);
+    return () => {
+      isMounted = false;
+      window.removeEventListener("smei_suppliers_updated", handleSuppliersUpdated);
+    };
+  }, [suppliers]);
+
+  // Single source of truth active suppliers list (alphabetically sorted by name)
+  const validSuppliers = useMemo(() => {
+    const list = [...allSuppliersList];
+    const active = list.filter((s) => s.status !== "Disabled");
+
+    // Preserve linked supplier for historical PO edit view if currently disabled
+    if (po && po.supplierId) {
+      const linked = list.find((s) => s.id === po.supplierId);
+      if (linked && !active.some((s) => s.id === linked.id)) {
+        active.push(linked);
+      }
+    }
+
+    // Sort suppliers alphabetically by Supplier Name
+    return active.sort((a, b) =>
+      (a.name || "").localeCompare(b.name || "", undefined, { sensitivity: "base" })
+    );
+  }, [allSuppliersList, po]);
+
+  // Compute recently used suppliers from PO history
+  const activeRecentlyUsed = useMemo(() => {
+    if (!pos || pos.length === 0) return [];
+    const uniqueIds = Array.from(new Set(pos.map((p) => p.supplierId))).filter(Boolean);
+    return uniqueIds
+      .map((id) => validSuppliers.find((s) => s.id === id))
+      .filter((s): s is Supplier => !!s)
+      .slice(0, 3);
+  }, [pos, validSuppliers]);
+
+  // Filter suppliers based on search query (by name, ID, category, attention)
+  const filteredSupplierOptions = useMemo(() => {
+    if (!supplierName.trim()) return validSuppliers;
+    const query = supplierName.trim().toLowerCase();
+    return validSuppliers.filter((s) => {
+      const nameMatch = (s.name || "").toLowerCase().includes(query);
+      const idMatch = (s.id || "").toLowerCase().includes(query);
+      const catMatch = (s.category || "").toLowerCase().includes(query);
+      const attnMatch = (s.attention || "").toLowerCase().includes(query);
+      return nameMatch || idMatch || catMatch || attnMatch;
+    });
+  }, [validSuppliers, supplierName]);
+
+  const handleSelectSupplierItem = (sup: Supplier) => {
+    setSupplierId(sup.id);
+    setSupplierName(sup.name);
+    setAttention(sup.attention || "");
+    setTelNo(sup.phone || "");
+    setFaxNo(sup.fax || "");
+    setCategory(
+      sup.category?.toLowerCase().includes("gas") || sup.category?.toLowerCase().includes("exempt")
+        ? "VAT Exempt"
+        : "Vatable"
+    );
+    setShowSuggestions(false);
+    setActiveSuggestionIndex(-1);
+    if (errors.supplier) {
+      setErrors((prev) => ({ ...prev, supplier: "" }));
+    }
+
+    // Refresh PO line item unit prices using selected supplier's Last Price
+    refreshPricesForSupplier(sup.id, sup.name);
+  };
+
+  // Close RFS and Supplier dropdowns when clicking outside
+  useEffect(() => {
+    const handleClickOutside = (e: MouseEvent) => {
+      if (rfsDropdownRef.current && !rfsDropdownRef.current.contains(e.target as Node)) {
+        setIsRfsDropdownOpen(false);
+      }
+      if (supplierDropdownRef.current && !supplierDropdownRef.current.contains(e.target as Node)) {
+        setShowSuggestions(false);
+      }
+    };
+    document.addEventListener("mousedown", handleClickOutside);
+    return () => document.removeEventListener("mousedown", handleClickOutside);
+  }, []);
+
+  // Fetch completed RFS records
+  useEffect(() => {
+    setIsLoadingRFS(true);
+    api.getRFS()
+      .then((data) => {
+        setRfsList(data || []);
+      })
+      .catch((err) => {
+        console.error("Failed to load RFS records:", err);
+      })
+      .finally(() => {
+        setIsLoadingRFS(false);
+      });
+  }, []);
+
+  const isRFSCompleted = (rfs: RequestForSupply): boolean => {
+    if (!rfs) return false;
+    if (!rfs.rfsNumber || !String(rfs.rfsNumber).trim()) return false;
+    if ((rfs as any).isDeleted || (rfs as any).archived || rfs.status === ("Deleted" as any) || rfs.status === ("Archived" as any)) return false;
+    if (rfs.rejectedBy || rfs.approvalStatus === "Rejected" || rfs.status === ("Rejected" as any) || rfs.status === ("Cancelled" as any) || rfs.status === ("Draft" as any) || rfs.status === ("Incomplete" as any)) {
+      return false;
+    }
+
+    const isApproved = Boolean(rfs.approvedBy || rfs.approvedAt || rfs.approvalStatus === "Approved" || rfs.status === ("Approved" as any));
+    const isComplete = rfs.status === "Complete" || rfs.status === "On Time" || rfs.status === "Late" || (rfs.status as any) === "Closed" || isApproved;
+
+    return isComplete && !isRFSPending(rfs);
+  };
+
+  const completedRFSList = useMemo(() => {
+    const list = rfsList.filter(isRFSCompleted);
+
+    // If editing an existing PO that links to an RFS, ensure that linked RFS is included even if historical
+    if (po && (po.rfsId || po.rfsNumber)) {
+      const linked = rfsList.find(
+        (r) =>
+          (po.rfsId && r.id === po.rfsId) ||
+          (po.rfsNumber && (r.rfsNumber === po.rfsNumber || formatRFSNo(r.rfsNumber) === formatRFSNo(po.rfsNumber)))
+      );
+      if (linked && !list.some((item) => item.id === linked.id)) {
+        list.unshift(linked);
+      }
+    }
+
+    return list;
+  }, [rfsList, po]);
+
+  const filteredRFSOptions = useMemo(() => {
+    if (!rfsSearchQuery.trim()) return completedRFSList;
+    const q = rfsSearchQuery.toLowerCase().trim();
+    return completedRFSList.filter((r) => {
+      const rfsNoFormatted = formatRFSNo(r.rfsNumber, r.dateRequested).toLowerCase();
+      const rfsNoRaw = (r.rfsNumber || "").toLowerCase();
+      const dept = (r.department || "").toLowerCase();
+      const purposeStr = (r.purpose || "").toLowerCase();
+      const reqBy = (r.requestedBy || "").toLowerCase();
+      const createdBy = (r.created_by || "").toLowerCase();
+
+      return (
+        rfsNoFormatted.includes(q) ||
+        rfsNoRaw.includes(q) ||
+        dept.includes(q) ||
+        purposeStr.includes(q) ||
+        reqBy.includes(q) ||
+        createdBy.includes(q)
+      );
+    });
+  }, [completedRFSList, rfsSearchQuery]);
+
+  const selectedRFS = useMemo(() => {
+    if (!rfsList || rfsList.length === 0) return null;
+    if (rfsId) {
+      const match = rfsList.find((r) => r.id === rfsId);
+      if (match) return match;
+    }
+    if (rfsNumber) {
+      const match = rfsList.find(
+        (r) => r.id === rfsId || r.rfsNumber === rfsNumber || formatRFSNo(r.rfsNumber) === formatRFSNo(rfsNumber)
+      );
+      if (match) return match;
+    }
+    return null;
+  }, [rfsList, rfsId, rfsNumber]);
+
+  // Helper to resolve Last Price for an item given a supplier and item description
+  const getSupplierLastPriceForItem = useCallback(
+    (
+      supId: string,
+      supName: string,
+      itemDesc: string,
+      fallbackPrice: number = 0
+    ): number => {
+      if (!itemDesc || !itemDesc.trim()) return fallbackPrice;
+      const cleanDesc = itemDesc.trim().toLowerCase();
+      const cleanSupName = (supName || "").trim().toLowerCase();
+
+      // 1. Search past POs for this specific supplier
+      if (pos && pos.length > 0) {
+        const supplierPOs = pos
+          .filter((p) => {
+            const matchId = supId && p.supplierId === supId;
+            const matchName = cleanSupName && (p.supplierName || "").trim().toLowerCase() === cleanSupName;
+            return matchId || matchName;
+          })
+          .sort((a, b) => {
+            const dateA = new Date(a.poDate || a.createdAt || 0).getTime();
+            const dateB = new Date(b.poDate || b.createdAt || 0).getTime();
+            return dateB - dateA;
+          });
+
+        for (const p of supplierPOs) {
+          if (p.items && p.items.length > 0) {
+            const matchedItem = p.items.find(
+              (it) => (it.description || "").trim().toLowerCase() === cleanDesc
+            );
+            if (matchedItem && typeof matchedItem.unitPrice === "number" && matchedItem.unitPrice > 0) {
+              return matchedItem.unitPrice;
+            }
+          }
+        }
+      }
+
+      // 2. Search past POs globally if supplier matches none
+      if (pos && pos.length > 0) {
+        const allPOsSorted = [...pos].sort((a, b) => {
+          const dateA = new Date(a.poDate || a.createdAt || 0).getTime();
+          const dateB = new Date(b.poDate || b.createdAt || 0).getTime();
+          return dateB - dateA;
+        });
+        for (const p of allPOsSorted) {
+          if (p.items && p.items.length > 0) {
+            const matchedItem = p.items.find(
+              (it) => (it.description || "").trim().toLowerCase() === cleanDesc
+            );
+            if (matchedItem && typeof matchedItem.unitPrice === "number" && matchedItem.unitPrice > 0) {
+              return matchedItem.unitPrice;
+            }
+          }
+        }
+      }
+
+      // 3. Check selected RFS item lastPurchaseUnitPrice
+      if (selectedRFS && selectedRFS.items) {
+        const rfsItem = selectedRFS.items.find(
+          (it) => (it.description || "").trim().toLowerCase() === cleanDesc
+        );
+        if (rfsItem) {
+          const lastPrice = Number(rfsItem.lastPurchaseUnitPrice);
+          if (!isNaN(lastPrice) && lastPrice > 0) {
+            return lastPrice;
+          }
+          const currentPrice = Number(rfsItem.currentPurchaseUnitPrice);
+          if (!isNaN(currentPrice) && currentPrice > 0) {
+            return currentPrice;
+          }
+        }
+      }
+
+      return fallbackPrice;
+    },
+    [pos, selectedRFS]
+  );
+
+  const refreshPricesForSupplier = useCallback(
+    (supId: string, supName: string) => {
+      setItems((prevItems) =>
+        prevItems.map((item) => {
+          if (!item.description || !item.description.trim()) return item;
+
+          const lastPrice = getSupplierLastPriceForItem(supId, supName, item.description, item.unitPrice);
+          const qty = Number(item.quantity) || 0;
+
+          return {
+            ...item,
+            unitPrice: lastPrice,
+            amount: qty * lastPrice,
+          };
+        })
+      );
+    },
+    [getSupplierLastPriceForItem]
+  );
+
+  const handleRfsSelect = (selected: RequestForSupply) => {
+    setRfsId(selected.id);
+    setRfsNumber(selected.rfsNumber);
+    setIsRfsDropdownOpen(false);
+    setRfsSearchQuery(formatRFSNo(selected.rfsNumber, selected.dateRequested));
+
+    if (errors.rfsNumber) {
+      setErrors((prev) => ({ ...prev, rfsNumber: "" }));
+    }
+
+    // Auto-populate purpose
+    if (selected.purpose) {
+      if (isNew || !purpose) {
+        setPurpose(selected.purpose.toUpperCase());
+      }
+    }
+
+    // Auto-populate PO Category if matching department
+    if (selected.department) {
+      const categoryList = [
+        "Accounting Consumables Supplies", "Admin Consumables Supplies", "Building Repairs & Maintenance", "DA 75723", "DAU 3581", 
+        "DB 1738 (Honda Wave-Red)", "EHS", "Forklift", "Forklift #1 (AMETCO)", "Forklift #2", "Forklift #3", "Forklift #4", 
+        "Furniture and Equipment Maintenance", "713 DWC (Honda New Wave)", "OM Sales Consumables Supplies", "OM Sales Office Equipment", 
+        "MGF 138", "NCO 9970", "NOW 6702", "NDW 3277", "NGF 8580", "TRAVIZ CBB6056", "New Honda Wave", "OM Sales", "Permit & Licenses", 
+        "Production Consumables Supplies", "Production Equipment and Maintenance", "PWB Recycling Machine and Equipment", "Light Vehicles", 
+        "Sales Representation", "Admin Representation", "RER 699", "RST 125", "Sales Consumables Supplies", "TMI 441"
+      ];
+      const matchedCat = categoryList.find(c => c.toLowerCase() === selected.department.toLowerCase());
+      if (matchedCat) {
+        setPoCategory(matchedCat);
+      }
+    }
+
+    // Validate that line items exist in selected RFS
+    if (!selected.items || selected.items.length === 0) {
+      setErrors((prev) => ({
+        ...prev,
+        rfsNumber: `Selected Request for Supply (${formatRFSNo(selected.rfsNumber, selected.dateRequested)}) has no line items.`
+      }));
+      alert(`The selected Request for Supply (${formatRFSNo(selected.rfsNumber, selected.dateRequested)}) contains no line items.`);
+      return;
+    }
+
+    // Synchronize ALL Line Items from selected RFS into Purchase Order
+    const newItems: POItem[] = selected.items.map((it, idx) => {
+      const qty = typeof it.quantity === "number" && !isNaN(it.quantity) && it.quantity > 0
+        ? it.quantity
+        : (Number(it.currentPurchaseQuantity) || 1);
+
+      // Enterprise Procurement Rule: PO Unit Price must inherit Last Price (lastPurchaseUnitPrice)
+      const lastPrice = typeof it.lastPurchaseUnitPrice === "number" ? it.lastPurchaseUnitPrice : Number(it.lastPurchaseUnitPrice);
+      const currentPrice = typeof it.currentPurchaseUnitPrice === "number" ? it.currentPurchaseUnitPrice : Number(it.currentPurchaseUnitPrice);
+
+      let price = (!isNaN(lastPrice) && lastPrice > 0)
+        ? lastPrice
+        : (!isNaN(currentPrice) && currentPrice > 0 ? currentPrice : 0);
+
+      if (supplierId || supplierName) {
+        price = getSupplierLastPriceForItem(supplierId, supplierName, it.description || "", price);
+      }
+
+      return {
+        id: `row-${Date.now()}-${idx}`,
+        quantity: qty,
+        unit: it.unit || "pcs",
+        description: it.description || "",
+        unitPrice: price,
+        amount: qty * price
+      };
+    });
+
+    // Replace all existing PO line items with synchronized RFS items
+    setItems(newItems);
+  };
 
   // 6. Pre-fill State on Load
   useEffect(() => {
     if (po) {
       setPoNumber((po.poNumber || "").toUpperCase());
       setRfsNumber(po.rfsNumber || "");
+      setRfsId(po.rfsId || "");
+      if (po.rfsNumber) {
+        setRfsSearchQuery(formatRFSNo(po.rfsNumber, po.poDate));
+      } else {
+        setRfsSearchQuery("");
+      }
       setPoDate(po.poDate);
       setDeliveryDate(po.deliveryDate);
       setSupplierId(po.supplierId);
@@ -252,6 +634,7 @@ export default function POForm({
       setCategory(po.category);
       setItems(po.items);
       setDiscountVatAmount(po.discountVatAmount);
+      setOverrideVat(!!po.overrideVat);
       
       setVatableAmount(po.vatableAmount);
       setVat12(po.vat12);
@@ -261,19 +644,8 @@ export default function POForm({
       setLaborEwt2(po.laborEwt2);
       
       // Load Parts and Labor EWT Percentages
-      let loadedPartsPct = 1.0;
-      let loadedLaborPct = 2.0;
-      
-      if (po.partsEwt1 > 0 || po.ewtType === "Parts EWT") {
-        loadedPartsPct = po.ewtPercentage !== undefined ? po.ewtPercentage : 1.0;
-        loadedLaborPct = po.laborEwt2 > 0 ? 2.0 : 0.0;
-      } else if (po.laborEwt2 > 0 || po.ewtType === "Labor EWT") {
-        loadedLaborPct = po.ewtPercentage !== undefined ? po.ewtPercentage : 2.0;
-        loadedPartsPct = po.partsEwt1 > 0 ? 1.0 : 0.0;
-      } else {
-        loadedPartsPct = 0.0;
-        loadedLaborPct = 0.0;
-      }
+      const loadedPartsPct = po.partsEwtPercentage !== undefined ? po.partsEwtPercentage : (po.ewtPercentage !== undefined && po.ewtType === "Parts EWT" ? po.ewtPercentage : 1.0);
+      const loadedLaborPct = po.laborEwtPercentage !== undefined ? po.laborEwtPercentage : (po.ewtPercentage !== undefined && po.ewtType === "Labor EWT" ? po.ewtPercentage : 2.0);
       
       setPartsEwtPercentage(loadedPartsPct);
       setLaborEwtPercentage(loadedLaborPct);
@@ -384,14 +756,8 @@ export default function POForm({
       setExcludeApprovedBy(false);
       setExcludeConforme(false);
       
-      setRfsNumber("2026-07-001");
-      api.getNextRFSNumber()
-        .then(({ nextNumber }) => {
-          setRfsNumber(nextNumber);
-        })
-        .catch((err) => {
-          console.error("Failed to load next RFS number for PO form:", err);
-        });
+      setRfsNumber("");
+      setRfsId("");
     }
   }, [po, currentUser]);
 
@@ -443,7 +809,7 @@ export default function POForm({
   };
 
   const currentGrossAmount = overrideVat
-    ? (vatableAmount + vat12 + vatExemptAmount + zeroRatedAmount + partsEwt1 + laborEwt2)
+    ? (vatableAmount + vat12 + vatExemptAmount + zeroRatedAmount)
     : computed.grossAmount;
 
   const currentTotalAmount = overrideVat
@@ -460,11 +826,13 @@ export default function POForm({
       setTelNo(vendor.phone);
       setFaxNo(vendor.fax);
       setCategory(vendor.category.toLowerCase().includes("gas") || vendor.category.toLowerCase().includes("exempt") ? "VAT Exempt" : "Vatable");
+      refreshPricesForSupplier(vendor.id, vendor.name);
     } else {
       setSupplierName("");
       setAttention("");
       setTelNo("");
       setFaxNo("");
+      refreshPricesForSupplier("", "");
     }
   };
 
@@ -547,6 +915,9 @@ export default function POForm({
     }
 
     if (!poNumber) newErrors.poNumber = "PO Number is required.";
+    if (!rfsNumber || !rfsNumber.trim()) {
+      newErrors.rfsNumber = "Please select a completed Request for Supply (RFS) before saving the Purchase Order.";
+    }
 
     if (Object.keys(newErrors).length > 0) {
       setErrors(newErrors);
@@ -563,14 +934,15 @@ export default function POForm({
       id: po?.id || `po-${Date.now()}`,
       poNumber,
       rfsNumber,
+      rfsId,
       poDate,
       deliveryDate,
       supplierId,
-      supplierName,
-      attention,
+      supplierName: supplierName.toUpperCase(),
+      attention: attention.toUpperCase(),
       telNo,
       faxNo,
-      purpose,
+      purpose: purpose.toUpperCase(),
       category,
       poCategory: poCategory === "Others" ? otherPoCategory : poCategory,
       items: items.map(item => ({
@@ -580,6 +952,7 @@ export default function POForm({
         amount: typeof item.amount === "number" ? item.amount : (parseFloat(item.amount) || 0),
       })),
       
+      overrideVat,
       vatableAmount,
       vat12,
       vatExemptAmount,
@@ -742,10 +1115,6 @@ export default function POForm({
     setShowSignaturePad(false);
   };
 
-  const handlePrint = () => {
-    window.print();
-  };
-
   const formatPHP = (val: number) => {
     return `${currencySymbol} ${val.toLocaleString("en-US", {
       minimumFractionDigits: 2,
@@ -758,6 +1127,7 @@ export default function POForm({
       id: po?.id || "temp-po-id",
       poNumber,
       rfsNumber,
+      rfsId,
       poDate,
       deliveryDate,
       supplierId,
@@ -794,6 +1164,7 @@ export default function POForm({
       laborEwt2,
       partsEwtPercentage,
       laborEwtPercentage,
+      overrideVat,
       ewtType: "Parts & Labor EWT",
       ewtPercentage: partsEwtPercentage,
       excludePreparedBy,
@@ -814,7 +1185,7 @@ export default function POForm({
     warrantyOthers, remarks, preparedBy, checkedBy, verifiedBy, verifiedBy2,
     approvedBy, conforme, totalAmount, status, discountVatAmount, vatableAmount,
     vat12, vatExemptAmount, zeroRatedAmount, partsEwt1, laborEwt2,
-    partsEwtPercentage, laborEwtPercentage,
+    partsEwtPercentage, laborEwtPercentage, overrideVat,
     excludePreparedBy, excludeCheckedBy, excludeVerifiedBy, excludeVerifiedBy2,
     excludeApprovedBy, excludeConforme, additionalSignatories, signatureUrl,
     currentUser
@@ -834,38 +1205,6 @@ export default function POForm({
         </button>
 
         <div className="flex flex-wrap items-center gap-2">
-          {!isNew && (
-            <div className="flex flex-col gap-1.5">
-              {po && (
-                <div className="flex flex-col sm:flex-row gap-1.5">
-                  <button
-                    type="button"
-                    onClick={() => exportPOToXLSM(po)}
-                    className="inline-flex items-center gap-1.5 bg-emerald-600 hover:bg-emerald-700 text-white font-semibold text-xs py-2 px-3.5 rounded-xl shadow-sm transition-all"
-                  >
-                    <FileSpreadsheet className="w-4 h-4" />
-                    <span>Export Excel (.XLSM)</span>
-                  </button>
-                  <button
-                    type="button"
-                    onClick={() => exportPOToWord(po)}
-                    className="inline-flex items-center gap-1.5 bg-[#2B579A] hover:bg-[#1C3A6A] text-white font-semibold text-xs py-2 px-3.5 rounded-xl shadow-sm transition-all"
-                  >
-                    <FileText className="w-4 h-4" />
-                    <span>Export Word (.DOCX)</span>
-                  </button>
-                </div>
-              )}
-              <button
-                onClick={handlePrint}
-                className="inline-flex items-center gap-1.5 bg-red-600 hover:bg-red-700 text-white font-semibold text-xs py-2 px-3.5 rounded-xl shadow-sm transition-all justify-center"
-              >
-                <Printer className="w-4 h-4" />
-                <span>Print</span>
-              </button>
-            </div>
-          )}
-
           {/* Workflow approval buttons */}
           {po && po.status !== "Approved" && po.status !== "Cancelled" && (
             <div className="flex flex-wrap items-center gap-2 bg-gray-50 p-1.5 rounded-xl border border-gray-200">
@@ -977,54 +1316,7 @@ export default function POForm({
             </div>
             <div className="text-[10px] text-gray-500 font-semibold font-mono flex items-center justify-center md:justify-end gap-2">
               <span>Status:</span>
-              <select
-                value={status}
-                onChange={(e) => {
-                  const newStatus = e.target.value as POStatus;
-                  if (status === "Approved" && !isAdmin) {
-                    let requiredPin = "1234";
-                    let isPinRequired = false;
-                    try {
-                      const savedSetting = localStorage.getItem("smei_security_config");
-                      const globalEnabled = savedSetting === null ? false : JSON.parse(savedSetting).enabled;
-
-                      if (globalEnabled) {
-                        const saved = localStorage.getItem("smei_module_pins");
-                        if (saved) {
-                          const rules = JSON.parse(saved);
-                          const rule = rules.find((r: any) => r.id === "po_status_change");
-                          if (rule) {
-                            requiredPin = rule.pinCode;
-                            isPinRequired = rule.isEnabled;
-                          }
-                        } else {
-                          isPinRequired = true;
-                        }
-                      }
-                    } catch (e) {
-                      console.error("Failed to parse module pin configuration", e);
-                    }
-
-                    if (isPinRequired) {
-                      const pin = prompt("Admin PIN code required to change an Approved PO status:");
-                      if (pin !== requiredPin) {
-                        alert("Invalid PIN. Status not changed.");
-                        return;
-                      }
-                    }
-                  }
-                  setStatus(newStatus);
-                }}
-                disabled={isViewer || (!isAdmin && status === "Approved")}
-                className="uppercase text-smei-crimson font-extrabold bg-transparent border-b border-dashed border-red-200 hover:border-red-400 focus:outline-none cursor-pointer py-0.5 print:appearance-none print:border-none print:text-right"
-              >
-                <option value="Draft">DRAFT</option>
-                <option value="Pending Review">PENDING REVIEW</option>
-                <option value="Pending Approval">PENDING APPROVAL</option>
-                <option value="Approved">APPROVED</option>
-                <option value="Rejected">REJECTED</option>
-                <option value="Cancelled">CANCELLED</option>
-              </select>
+              <span className="uppercase text-smei-crimson font-extrabold">{status}</span>
             </div>
           </div>
         </div>
@@ -1038,84 +1330,96 @@ export default function POForm({
           <div className="grid grid-cols-1 md:grid-cols-2 gap-8 text-xs font-sans">
             {/* LEFT SIDE */}
             <div className="space-y-4">
-              {/* Supplier Searchable Text Input with Auto-Suggest */}
-              <div className="space-y-1 relative" id="supplier-autosuggest-container">
-                <label className="block font-bold text-gray-600 uppercase tracking-wide">
-                  Supplier: <span className="text-smei-crimson font-bold">*</span>
-                </label>
-                <div className="relative">
+              {/* Supplier Searchable Text Input with Synchronized Dropdown */}
+              <div className="space-y-1 relative" id="supplier-autosuggest-container" ref={supplierDropdownRef}>
+                <div className="flex items-center justify-between">
+                  <label className="block font-bold text-gray-600 uppercase tracking-wide">
+                    Supplier: <span className="text-smei-crimson font-bold">*</span>
+                  </label>
+                  <span className="text-[10px] text-gray-400 font-mono font-normal">
+                    {validSuppliers.length} Active in Registry
+                  </span>
+                </div>
+                <div className="relative flex items-center">
+                  <Building className="w-4 h-4 text-gray-400 absolute left-3 pointer-events-none z-10" />
                   <input
                     type="text"
                     disabled={status !== "Draft" && !isAdmin}
                     value={supplierName}
                     onChange={(e) => {
-                      const value = e.target.value;
+                      const value = e.target.value.toUpperCase();
                       setSupplierName(value);
-                      setSupplierId(""); // Clear supplier ID since it's a typed search/new name
+                      setSupplierId(""); // Clear supplier ID since user typed search/custom name
                       setShowSuggestions(true);
                       setActiveSuggestionIndex(-1);
                       
-                      // If the typed name matches an existing supplier exactly (case-insensitive and not disabled), pre-populate
-                      const activeSuppliers = suppliers.filter(s => s.status !== "Disabled");
-                      const match = activeSuppliers.find(s => s.name.toLowerCase() === value.trim().toLowerCase());
+                      // Auto-link if exact match exists in registered suppliers
+                      const match = validSuppliers.find(
+                        (s) => s.name.toLowerCase() === value.trim().toLowerCase()
+                      );
                       if (match) {
                         setSupplierId(match.id);
                         setAttention(match.attention || "");
                         setTelNo(match.phone || "");
                         setFaxNo(match.fax || "");
-                        setCategory(match.category?.toLowerCase().includes("gas") || match.category?.toLowerCase().includes("exempt") ? "VAT Exempt" : "Vatable");
+                        setCategory(
+                          match.category?.toLowerCase().includes("gas") || match.category?.toLowerCase().includes("exempt")
+                            ? "VAT Exempt"
+                            : "Vatable"
+                        );
+                        refreshPricesForSupplier(match.id, match.name);
                       }
                     }}
                     onFocus={() => {
                       setShowSuggestions(true);
                       setActiveSuggestionIndex(-1);
                     }}
-                    onBlur={() => {
-                      // Small timeout to allow clicking suggestion item before dropdown disappears
-                      setTimeout(() => {
-                        setShowSuggestions(false);
-                        setActiveSuggestionIndex(-1);
-                      }, 250);
-                    }}
                     onKeyDown={(e) => {
-                      const activeSuppliers = suppliers.filter(s => s.status !== "Disabled");
-                      const matches = activeSuppliers.filter(s => 
-                        s.name.toLowerCase().includes(supplierName.toLowerCase())
-                      );
-                      const itemsToUse = supplierName.trim() === "" ? recentlyUsedSuppliers : matches;
+                      const itemsToUse = filteredSupplierOptions;
 
                       if (e.key === "ArrowDown") {
                         e.preventDefault();
-                        setActiveSuggestionIndex(prev => 
+                        setActiveSuggestionIndex((prev) =>
                           prev < itemsToUse.length - 1 ? prev + 1 : prev
                         );
                       } else if (e.key === "ArrowUp") {
                         e.preventDefault();
-                        setActiveSuggestionIndex(prev => (prev > 0 ? prev - 1 : -1));
+                        setActiveSuggestionIndex((prev) => (prev > 0 ? prev - 1 : -1));
                       } else if (e.key === "Enter" && activeSuggestionIndex >= 0) {
                         e.preventDefault();
                         const selected = itemsToUse[activeSuggestionIndex];
                         if (selected) {
-                          setSupplierId(selected.id);
-                          setSupplierName(selected.name);
-                          setAttention(selected.attention || "");
-                          setTelNo(selected.phone || "");
-                          setFaxNo(selected.fax || "");
-                          setCategory(selected.category?.toLowerCase().includes("gas") || selected.category?.toLowerCase().includes("exempt") ? "VAT Exempt" : "Vatable");
-                          setShowSuggestions(false);
-                          setActiveSuggestionIndex(-1);
+                          handleSelectSupplierItem(selected);
                         }
+                      } else if (e.key === "Escape") {
+                        setShowSuggestions(false);
                       }
                     }}
-                    placeholder="Type supplier name manually..."
-                    className={`w-full px-3.5 py-2 ${errors.supplier ? 'bg-red-50 border-red-500' : 'bg-gray-50 border-gray-200'} border rounded-xl font-medium focus:outline-none focus:ring-1.5 focus:ring-smei-crimson disabled:bg-gray-100`}
+                    placeholder="Search or select supplier from registry..."
+                    className={`w-full pl-9 pr-24 py-2 ${
+                      errors.supplier ? 'bg-red-50 border-red-500' : 'bg-gray-50 border-gray-200'
+                    } border rounded-xl font-medium text-xs focus:outline-none focus:ring-1.5 focus:ring-smei-crimson disabled:bg-gray-100`}
                   />
-                  {supplierId && (
-                    <span className="absolute right-3.5 top-2.5 inline-flex items-center px-2 py-0.5 rounded text-[10px] font-bold bg-green-100 text-green-800 font-mono">
-                      REGISTERED
-                    </span>
-                  )}
+
+                  <div className="absolute right-2.5 flex items-center gap-1.5 z-10">
+                    {supplierId && (
+                      <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded text-[10px] font-bold bg-emerald-100 text-emerald-800 font-mono">
+                        <Check className="w-3 h-3 text-emerald-600" />
+                        REGISTERED
+                      </span>
+                    )}
+                    <button
+                      type="button"
+                      disabled={status !== "Draft" && !isAdmin}
+                      onClick={() => setShowSuggestions((prev) => !prev)}
+                      className="p-1 hover:bg-gray-200 rounded-lg text-gray-400 hover:text-gray-600 transition-colors"
+                      title="Toggle Supplier List"
+                    >
+                      <ChevronDown className={`w-4 h-4 transition-transform duration-200 ${showSuggestions ? "rotate-180" : ""}`} />
+                    </button>
+                  </div>
                 </div>
+
                 {errors.supplier && (
                   <div className="mt-1 flex items-center gap-1 text-xs text-red-600">
                     <AlertTriangle className="w-3 h-3" />
@@ -1124,63 +1428,140 @@ export default function POForm({
                 )}
 
                 {/* Suggestions Dropdown overlay */}
-                {showSuggestions && (() => {
-                  const activeSuppliers = suppliers.filter(s => s.status !== "Disabled");
-                  const matches = activeSuppliers.filter(s => 
-                    s.name.toLowerCase().includes(supplierName.toLowerCase())
-                  );
+                {showSuggestions && (
+                  <div className="absolute z-30 left-0 right-0 mt-1 bg-white border border-gray-200 rounded-xl shadow-2xl max-h-80 overflow-y-auto divide-y divide-gray-100 animate-in fade-in slide-in-from-top-1 duration-150">
+                    {/* Header Bar */}
+                    <div className="px-3.5 py-2 bg-gray-50/80 backdrop-blur-sm border-b border-gray-100 flex items-center justify-between sticky top-0 z-20">
+                      <div className="flex items-center gap-1.5 text-[11px] font-bold text-gray-600 uppercase tracking-wider font-mono">
+                        <Building className="w-3.5 h-3.5 text-smei-crimson" />
+                        <span>Supplier Registry Data</span>
+                      </div>
+                      <span className="text-[10px] font-mono text-smei-crimson bg-red-50 px-2 py-0.5 rounded-full font-bold">
+                        {filteredSupplierOptions.length} of {validSuppliers.length} Listed
+                      </span>
+                    </div>
 
-                  // Decide whether to show recently used suppliers (if input is empty) or filtered matches
-                  const isQueryEmpty = supplierName.trim() === "";
-                  const showRecent = isQueryEmpty && recentlyUsedSuppliers.length > 0;
-                  const listToRender = showRecent ? recentlyUsedSuppliers : matches;
+                    {/* Recently Used Partners Quick Section */}
+                    {supplierName.trim() === "" && activeRecentlyUsed.length > 0 && (
+                      <div className="py-1">
+                        <div className="px-3.5 py-1 text-[10px] text-amber-700 font-bold uppercase tracking-wider font-mono bg-amber-50/50 flex items-center gap-1">
+                          <Clock className="w-3 h-3 text-amber-600" />
+                          <span>Recently Used Partners</span>
+                        </div>
+                        {activeRecentlyUsed.map((sup) => (
+                          <button
+                            key={`recent-${sup.id}`}
+                            type="button"
+                            className={`w-full text-left px-4 py-2 text-xs transition-colors flex items-center justify-between cursor-pointer ${
+                              supplierId === sup.id ? "bg-red-50/80 font-bold text-smei-crimson" : "hover:bg-red-50/50 text-gray-800"
+                            }`}
+                            onMouseDown={(e) => {
+                              e.preventDefault();
+                              handleSelectSupplierItem(sup);
+                            }}
+                          >
+                            <div className="flex items-center gap-2">
+                              <span className="font-semibold text-gray-900">{sup.name}</span>
+                              <span className="px-1.5 py-0.2 rounded text-[9px] font-mono bg-gray-100 text-gray-500">
+                                {sup.id}
+                              </span>
+                            </div>
+                            <span className="text-[10px] text-gray-400 font-mono italic">
+                              {sup.category || "General"}
+                            </span>
+                          </button>
+                        ))}
+                      </div>
+                    )}
 
-                  if (listToRender.length === 0) return null;
-
-                  return (
-                    <div className="absolute z-30 left-0 right-0 mt-1 bg-white border border-gray-200 rounded-xl shadow-xl max-h-64 overflow-y-auto divide-y divide-gray-100">
-                      {showRecent && (
-                        <div className="px-3 py-1.5 bg-gray-50 text-[10px] text-gray-500 font-bold uppercase tracking-wider font-mono">
-                          Recently Used Partners
+                    {/* All / Filtered Supplier List */}
+                    <div className="py-1">
+                      {supplierName.trim() === "" && activeRecentlyUsed.length > 0 && (
+                        <div className="px-3.5 py-1 text-[10px] text-gray-500 font-bold uppercase tracking-wider font-mono bg-gray-50 flex items-center gap-1 border-t border-b border-gray-100">
+                          <Building className="w-3 h-3 text-gray-400" />
+                          <span>All Registered Suppliers (A-Z)</span>
                         </div>
                       )}
-                      {listToRender.map((sup, index) => (
+
+                      {filteredSupplierOptions.length === 0 ? (
+                        <div className="px-4 py-6 text-center text-xs text-gray-500 space-y-1">
+                          <p className="font-medium text-gray-700">No registered supplier matches "{supplierName}"</p>
+                          <p className="text-[11px] text-gray-400">
+                            Press Enter or leave input to use as custom vendor, or add it in Supplier Registry.
+                          </p>
+                        </div>
+                      ) : (
+                        filteredSupplierOptions.map((sup, index) => {
+                          const isSelected = supplierId === sup.id || (supplierName.trim().toUpperCase() === sup.name.toUpperCase());
+                          const isHighlighted = index === activeSuggestionIndex;
+
+                          return (
+                            <button
+                              key={sup.id}
+                              type="button"
+                              className={`w-full text-left px-4 py-2.5 text-xs transition-colors flex items-center justify-between cursor-pointer border-b border-gray-50 last:border-none ${
+                                isHighlighted
+                                  ? "bg-red-50 text-smei-crimson font-bold"
+                                  : isSelected
+                                  ? "bg-red-50/60 text-smei-crimson font-semibold"
+                                  : "hover:bg-red-50/40 hover:text-smei-crimson text-gray-800"
+                              }`}
+                              onMouseDown={(e) => {
+                                e.preventDefault();
+                                handleSelectSupplierItem(sup);
+                              }}
+                            >
+                              <div className="space-y-0.5">
+                                <div className="flex items-center gap-2">
+                                  <span className="font-bold">{sup.name}</span>
+                                  <span className="px-1.5 py-0.2 rounded text-[9px] font-mono bg-gray-100 text-gray-600 font-semibold">
+                                    {sup.id}
+                                  </span>
+                                  {sup.status === "Disabled" && (
+                                    <span className="px-1.5 py-0.2 rounded text-[9px] font-mono bg-red-100 text-red-700 font-bold">
+                                      INACTIVE
+                                    </span>
+                                  )}
+                                </div>
+                                {sup.attention && (
+                                  <div className="text-[10px] text-gray-400 font-sans">
+                                    Attn: {sup.attention} {sup.phone ? `• ${sup.phone}` : ''}
+                                  </div>
+                                )}
+                              </div>
+                              <div className="text-right flex items-center gap-2">
+                                <span className="text-[10px] text-gray-500 font-mono px-2 py-0.5 bg-gray-100 rounded-md">
+                                  {sup.category || "General"}
+                                </span>
+                                {isSelected && (
+                                  <Check className="w-4 h-4 text-smei-crimson shrink-0" />
+                                )}
+                              </div>
+                            </button>
+                          );
+                        })
+                      )}
+                    </div>
+
+                    {/* Custom Name Fallback option */}
+                    {supplierName.trim() !== "" && !validSuppliers.some(s => s.name.toLowerCase() === supplierName.trim().toLowerCase()) && (
+                      <div className="p-2 bg-gray-50 border-t border-gray-100">
                         <button
-                          key={sup.id}
                           type="button"
-                          className={`w-full text-left px-4 py-2.5 text-xs font-medium transition-colors flex items-center justify-between cursor-pointer ${
-                            index === activeSuggestionIndex 
-                              ? "bg-red-50 text-smei-crimson font-bold" 
-                              : "hover:bg-red-50/60 hover:text-smei-crimson text-gray-700"
-                          }`}
-                          onMouseDown={() => {
-                            setSupplierId(sup.id);
-                            setSupplierName(sup.name);
-                            setAttention(sup.attention || "");
-                            setTelNo(sup.phone || "");
-                            setFaxNo(sup.fax || "");
-                            setCategory(sup.category?.toLowerCase().includes("gas") || sup.category?.toLowerCase().includes("exempt") ? "VAT Exempt" : "Vatable");
+                          className="w-full px-3 py-1.5 text-xs text-smei-crimson bg-white border border-red-200 rounded-lg hover:bg-red-50 font-medium text-left flex items-center justify-between"
+                          onMouseDown={(e) => {
+                            e.preventDefault();
+                            setSupplierId("");
                             setShowSuggestions(false);
-                            setActiveSuggestionIndex(-1);
                           }}
                         >
-                          <span>{sup.name}</span>
-                          <span className="text-[10px] text-gray-400 font-mono italic">
-                            {sup.category || "General"}
-                          </span>
+                          <span>Use "{supplierName}" as Custom Vendor</span>
+                          <span className="text-[10px] text-gray-400 font-mono">UNREGISTERED</span>
                         </button>
-                      ))}
-                      
-                      {/* Dropdown Footer showing count metrics */}
-                      <div className="px-3.5 py-1.5 bg-gray-50/50 text-[9px] text-gray-400 font-mono flex items-center justify-between">
-                        <span>
-                          {isQueryEmpty ? "Showing recently used" : `Showing ${matches.length} matches`}
-                        </span>
-                        <span>{activeSuppliers.length} active suppliers total</span>
                       </div>
-                    </div>
-                  );
-                })()}
+                    )}
+                  </div>
+                )}
               </div>
 
               {/* Attention contact person */}
@@ -1190,8 +1571,8 @@ export default function POForm({
                   type="text"
                   disabled={status !== "Draft" && !isAdmin}
                   value={attention}
-                  onChange={(e) => setAttention(e.target.value)}
-                  placeholder="e.g. Arthur Santos"
+                  onChange={(e) => setAttention(e.target.value.toUpperCase())}
+                  placeholder="e.g. ARTHUR SANTOS"
                   className="w-full px-3.5 py-2 bg-gray-50 border border-gray-200 rounded-xl focus:outline-none focus:ring-1.5 focus:ring-smei-crimson disabled:bg-gray-100"
                 />
               </div>
@@ -1222,10 +1603,10 @@ export default function POForm({
                   disabled={status !== "Draft" && !isAdmin}
                   value={purpose}
                   onChange={(e) => {
-                    setPurpose(e.target.value);
+                    setPurpose(e.target.value.toUpperCase());
                     if (errors.purpose) setErrors(prev => ({ ...prev, purpose: "" }));
                   }}
-                  placeholder="e.g. Structural steel reinforcement support girders"
+                  placeholder="e.g. STRUCTURAL STEEL REINFORCEMENT SUPPORT GIRDERS"
                   className={`w-full px-3.5 py-2 ${errors.purpose ? 'bg-red-50 border-red-500' : 'bg-gray-50 border-gray-200'} border rounded-xl focus:outline-none focus:ring-1.5 focus:ring-smei-crimson disabled:bg-gray-100`}
                 />
                 {errors.purpose && (
@@ -1303,14 +1684,46 @@ export default function POForm({
             <div className="space-y-4">
               {/* RFS No. */}
               <div className="space-y-1">
-                <label className="block font-bold text-gray-600 uppercase tracking-wide">RFS No.:</label>
-                <input
-                  type="text"
-                  value={rfsNumber}
-                  onChange={(e) => setRfsNumber(e.target.value)}
-                  placeholder="e.g. 2026-07-001"
-                  className="w-full px-3.5 py-2 bg-gray-50 border border-gray-200 rounded-xl focus:outline-none focus:ring-1.5 focus:ring-smei-crimson disabled:bg-gray-100 font-mono font-bold"
-                />
+                <label className="block font-bold text-gray-600 uppercase tracking-wide">
+                  RFS No.: <span className="text-smei-crimson font-bold">*</span>
+                </label>
+                
+                <select
+                  disabled={status !== "Draft" && !isAdmin}
+                  value={rfsId || ""}
+                  onChange={(e) => {
+                    const selectedId = e.target.value;
+                    if (!selectedId) {
+                      setRfsId("");
+                      setRfsNumber("");
+                      setRfsSearchQuery("");
+                      if (errors.rfsNumber) setErrors(prev => ({ ...prev, rfsNumber: "" }));
+                      return;
+                    }
+                    const matchedRfs = completedRFSList.find(r => r.id === selectedId);
+                    if (matchedRfs) {
+                      handleRfsSelect(matchedRfs);
+                    }
+                  }}
+                  className={`w-full px-3.5 py-2 ${errors.rfsNumber ? 'bg-red-50 border-red-500' : 'bg-gray-50 border-gray-200'} border rounded-xl font-medium focus:outline-none focus:ring-1.5 focus:ring-smei-crimson disabled:bg-gray-100 uppercase`}
+                >
+                  <option value="">
+                    {isLoadingRFS ? "LOADING RFS..." : completedRFSList.length === 0 ? "NO COMPLETED RFS AVAILABLE" : "-- SELECT RFS NO --"}
+                  </option>
+                  {completedRFSList.map((rfsItem) => (
+                    <option key={rfsItem.id} value={rfsItem.id}>
+                      {formatRFSNo(rfsItem.rfsNumber, rfsItem.dateRequested)}
+                    </option>
+                  ))}
+                </select>
+
+                {/* Validation Error Message */}
+                {errors.rfsNumber && (
+                  <div className="mt-1 flex items-center gap-1 text-xs text-red-600">
+                    <AlertTriangle className="w-3 h-3" />
+                    <span>{errors.rfsNumber}</span>
+                  </div>
+                )}
               </div>
 
               {/* PO Number */}
@@ -1746,9 +2159,9 @@ export default function POForm({
                 />
               </div>
 
-              {/* Total Amount */}
+              {/* Items Subtotal */}
               <div className="flex items-center justify-between">
-                <span className="text-gray-500 font-medium">Total Amount</span>
+                <span className="text-gray-500 font-medium">Items Subtotal</span>
                 <span className="font-mono font-bold text-gray-800 pr-2">
                   {formatPHP(overrideVat ? (vatableAmount + vat12 + vatExemptAmount + zeroRatedAmount) : (computed.vatableAmount + computed.vat12 + computed.vatExemptAmount + computed.zeroRatedAmount))}
                 </span>

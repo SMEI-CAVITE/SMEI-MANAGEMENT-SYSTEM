@@ -4,8 +4,15 @@
  */
 
 import React, { useState, useEffect, lazy, Suspense } from "react";
-import { User, UserRole, PurchaseOrder, Supplier, AuditLog, Notification } from "./types";
+import { User, UserRole, PurchaseOrder, Supplier, AuditLog, Notification, PaymentInstructionSlip, RequestForSupply, CanvassSheet } from "./types";
 import { api, removeToken } from "./lib/api";
+import {
+  getAllowedPendingDocumentTypes,
+  isPOPending,
+  isPISPending,
+  isRFSPending,
+  isCanvassPending
+} from "./utils/pendingDocumentUtils";
 import Header, { PrintHeader } from "./components/Header";
 import Login from "./components/Login";
 import Register from "./components/Register";
@@ -15,8 +22,10 @@ import NotificationsPanel from "./components/NotificationsPanel";
 import smeiLogo from "./assets/images/smei_logo_1782431389924.jpg";
 import ModuleSecurityGate from "./components/ModuleSecurityGate";
 import SecurityPINModal from "./components/SecurityPINModal";
+import { SecurityService } from "./services/securityService";
 import SystemSelector from "./components/SystemSelector";
 import TsdDashboard from "./components/TsdDashboard";
+import { notificationRepository, NotificationRepositoryService } from "./services/notificationRepository";
 
 // Lazy-loaded heavy modules for optimized bundle size and buttery-smooth module navigation
 const SuppliersList = lazy(() => import("./components/SuppliersList"));
@@ -29,14 +38,17 @@ const POList = lazy(() => import("./components/POList"));
 const POForm = lazy(() => import("./components/POForm"));
 const PaymentInstructionSlipModule = lazy(() => import("./components/PaymentInstructionSlipModule"));
 const RequestForSupplyModule = lazy(() => import("./components/RequestForSupplyModule"));
-const RfsApprovalModule = lazy(() => import("./components/RfsApprovalModule"));
 const CanvassSheetModule = lazy(() => import("./components/CanvassSheetModule"));
+const ProcurementApprovalModule = lazy(() => import("./components/ProcurementApprovalModule").then(m => ({ default: m.ProcurementApprovalModule })));
 const ControlNoModule = lazy(() => import("./components/ControlNoModule"));
 const UnloadingLoadingModule = lazy(() => import("./components/UnloadingLoadingModule"));
 const HazardousWasteModule = lazy(() => import("./components/HazardousWasteModule"));
 const WasteMovementModule = lazy(() => import("./components/WasteMovementModule"));
 const TimestampModule = lazy(() => import("./components/TimestampModule"));
 const ManifestSummaryModule = lazy(() => import("./components/ManifestSummaryModule"));
+const SystemMonitoringModule = lazy(() => import("./components/SystemMonitoringModule"));
+const COAWorkflowTracker = lazy(() => import("./components/COAWorkflowTracker"));
+import { useCOAWorkflowTracker } from "./hooks/useCOAWorkflowTracker";
 
 // Compact high-contrast module loader matching POMS design language
 const ModuleLoader = () => (
@@ -74,6 +86,9 @@ export default function App() {
   const [currentUser, setCurrentUser] = useState<User | null>(null);
   const [greetingMessage, setGreetingMessage] = useState<string | null>(null);
   const [pos, setPOs] = useState<PurchaseOrder[]>([]);
+  const [pises, setPises] = useState<PaymentInstructionSlip[]>([]);
+  const [rfses, setRfses] = useState<RequestForSupply[]>([]);
+  const [canvasses, setCanvasses] = useState<CanvassSheet[]>([]);
   const [suppliers, setSuppliers] = useState<Supplier[]>([]);
   const [auditLogs, setAuditLogs] = useState<AuditLog[]>([]);
   const [notifications, setNotifications] = useState<Notification[]>([]);
@@ -91,62 +106,27 @@ export default function App() {
   const [isSidebarCollapsed, setIsSidebarCollapsed] = useState(false);
   const [isOperationsOpen, setIsOperationsOpen] = useState(true);
 
+  // Centralized Real-Time TSD Workflow Tracker state from useCOAWorkflowTracker
+  const { progress: tsdWorkflowProgress } = useCOAWorkflowTracker(currentTab, currentUser?.role);
+
   // Central Security Gate state
   const [securityChallenge, setSecurityChallenge] = useState<{
-    moduleName: "Purchase Order" | "Request For Supply" | "Payment Instruction Slip" | "Canvass Sheet" | "Request For Supply (RFS) Approval";
+    moduleName: "Purchase Order" | "Request For Supply" | "Payment Instruction Slip" | "Canvass Sheet" | "Procurement Approval";
     onSuccess: () => void;
   } | null>(null);
 
   const checkModuleAccess = (
-    moduleName: "Purchase Order" | "Request For Supply" | "Payment Instruction Slip" | "Canvass Sheet" | "Request For Supply (RFS) Approval",
+    moduleName: string,
     onSuccess: () => void
   ) => {
-    // 1. Admin always bypasses security
-    if (currentUser?.role === UserRole.Administrator) {
+    const status = SecurityService.isPINRequired(moduleName, currentUser);
+    if (!status.required) {
       onSuccess();
       return;
     }
 
-    // 2. Check if a security rule is active for this module
-    let isRuleEnabled = false;
-    try {
-      const savedSetting = localStorage.getItem("smei_security_config");
-      const globalEnabled = savedSetting === null ? false : JSON.parse(savedSetting).enabled;
-      
-      if (globalEnabled) {
-        const saved = localStorage.getItem("smei_module_pins");
-        if (saved) {
-          const rules = JSON.parse(saved);
-          const rule = rules.find(
-            (r: any) => r.moduleName === moduleName && r.isEnabled === true
-          );
-          if (rule) {
-            isRuleEnabled = true;
-          }
-        } else {
-          // Default initial settings
-          isRuleEnabled = true; // Enabled by default out of the box
-        }
-      }
-    } catch (err) {
-      console.error("Failed to check module pins", err);
-    }
-
-    if (!isRuleEnabled) {
-      onSuccess();
-      return;
-    }
-
-    // 3. Check if already unlocked in this session (centralized session-wide check)
-    const isUnlockedInSession = sessionStorage.getItem("smei_session_unlocked") === "true";
-    if (isUnlockedInSession) {
-      onSuccess();
-      return;
-    }
-
-    // 4. Trigger security challenge modal
     setSecurityChallenge({
-      moduleName,
+      moduleName: status.moduleName,
       onSuccess,
     });
   };
@@ -218,16 +198,31 @@ export default function App() {
     if (!currentUser) return;
     try {
       const isAdmin = currentUser.role === UserRole.Administrator;
-      const [fetchedPOs, fetchedSuppliers, fetchedNotifs, fetchedLogs] = await Promise.all([
-        api.getPOs(),
-        api.getSuppliers(),
-        api.getNotifications(),
-        isAdmin ? api.getAuditLogs() : Promise.resolve([])
+      const currentPortal = activeSystem === "tsd" ? "TSD" : "PURCHASE";
+      const [
+        fetchedPOs,
+        fetchedSuppliers,
+        fetchedNotifs,
+        fetchedLogs,
+        fetchedPIS,
+        fetchedRFS,
+        fetchedCanvass
+      ] = await Promise.all([
+        api.getPOs().catch(() => []),
+        api.getSuppliers().catch(() => []),
+        api.getNotifications(currentPortal).catch(() => []),
+        isAdmin ? api.getAuditLogs().catch(() => []) : Promise.resolve([]),
+        api.getPIS().catch(() => []),
+        api.getRFS().catch(() => []),
+        api.getCanvass().catch(() => [])
       ]);
       
       setPOs(fetchedPOs);
       setSuppliers(fetchedSuppliers);
       setNotifications(fetchedNotifs);
+      setPises(fetchedPIS);
+      setRfses(fetchedRFS);
+      setCanvasses(fetchedCanvass);
       if (isAdmin) {
         setAuditLogs(fetchedLogs);
       }
@@ -240,16 +235,30 @@ export default function App() {
     if (currentUser) {
       loadAllData();
     }
-  }, [currentUser]);
+  }, [currentUser, activeSystem]);
+
+  // Real-time Notification Subscription (Portal-Aware via repository)
+  useEffect(() => {
+    if (!currentUser) return;
+    const currentPortal = activeSystem === "tsd" ? "TSD" : "PURCHASE";
+    
+    // Clear notifications state on portal switch to ensure zero cross-portal leak
+    setNotifications([]);
+
+    const unsubscribe = notificationRepository.subscribeToNotifications(
+      currentPortal,
+      (realtimeNotifs) => {
+        setNotifications(realtimeNotifs || []);
+      }
+    );
+    return () => {
+      if (typeof unsubscribe === "function") unsubscribe();
+    };
+  }, [currentUser, activeSystem]);
 
   // Handle centralized session storage security clear on login state changes (login, logout, session expiration)
   useEffect(() => {
-    sessionStorage.removeItem("smei_session_unlocked");
-    sessionStorage.removeItem("smei_unlocked_Purchase Order");
-    sessionStorage.removeItem("smei_unlocked_Request For Supply");
-    sessionStorage.removeItem("smei_unlocked_Request For Supply (RFS) Approval");
-    sessionStorage.removeItem("smei_unlocked_Payment Instruction Slip");
-    sessionStorage.removeItem("smei_unlocked_Canvass Sheet");
+    SecurityService.clearAllSessions();
   }, [currentUser]);
 
   // Auth Expired listener (auto log out on JWT expiry)
@@ -359,6 +368,7 @@ export default function App() {
     try {
       await api.createSupplier(supData);
       await loadAllData();
+      window.dispatchEvent(new Event("smei_suppliers_updated"));
     } catch (err: any) {
       alert(`Failed to create supplier: ${err.message}`);
     }
@@ -368,6 +378,7 @@ export default function App() {
     try {
       await api.updateSupplier(sup.id, sup);
       await loadAllData();
+      window.dispatchEvent(new Event("smei_suppliers_updated"));
     } catch (err: any) {
       alert(`Failed to update supplier: ${err.message}`);
     }
@@ -377,6 +388,7 @@ export default function App() {
     try {
       await api.deleteSupplier(id);
       await loadAllData();
+      window.dispatchEvent(new Event("smei_suppliers_updated"));
       return { success: true };
     } catch (err: any) {
       console.error("Failed to delete supplier:", err);
@@ -384,11 +396,14 @@ export default function App() {
     }
   };
 
-  // Notification Operations
+  // Portal-Aware Notification Operations
   const handleMarkNotifRead = async (id: string) => {
     try {
-      await api.readNotification(id);
-      await loadAllData();
+      const readAtIso = new Date().toISOString();
+      setNotifications((prev) =>
+        prev.map((n) => (n.id === id ? { ...n, isRead: true, status: "READ", readAt: readAtIso } : n))
+      );
+      await notificationRepository.markAsRead(id);
     } catch (err) {
       console.error(err);
     }
@@ -396,10 +411,39 @@ export default function App() {
 
   const handleMarkAllNotifRead = async () => {
     try {
-      await api.readAllNotifications();
-      await loadAllData();
+      const currentPortal = activeSystem === "tsd" ? "TSD" : "PURCHASE";
+      const readAtIso = new Date().toISOString();
+      setNotifications((prev) =>
+        prev.map((n) => {
+          const nPortal = NotificationRepositoryService.normalizePortal(n.portal);
+          if (nPortal === currentPortal) {
+            return { ...n, isRead: true, status: "READ", readAt: readAtIso };
+          }
+          return n;
+        })
+      );
+      await notificationRepository.markAllAsRead(currentPortal, currentUser?.id);
     } catch (err) {
       console.error(err);
+    }
+  };
+
+  const handleClearReadNotif = async () => {
+    try {
+      const currentPortal = activeSystem === "tsd" ? "TSD" : "PURCHASE";
+      setNotifications((prev) =>
+        prev.filter((n) => {
+          const nPortal = NotificationRepositoryService.normalizePortal(n.portal);
+          if (nPortal === currentPortal && (n.isRead || n.status === "READ")) {
+            return false;
+          }
+          return true;
+        })
+      );
+      await notificationRepository.clearReadNotifications(currentPortal, currentUser?.id);
+    } catch (err) {
+      console.error(err);
+      throw err;
     }
   };
 
@@ -419,10 +463,54 @@ export default function App() {
     alert("Audit log deletion is prohibited by corporate policy to maintain compliance records.");
   };
 
-  // Unread Alerts Count
-  const unreadAlertsCount = currentUser
-    ? notifications.filter((n) => n.userId === currentUser.id && !n.isRead).length
+  // Single Source of Truth for Portal-Aware Badge Count & Role-Based Pending Approvals
+  const isTsdActive = activeSystem === "tsd";
+  const isPoActive = activeSystem === "po";
+  const currentActivePortal = isTsdActive ? "TSD" : "PURCHASE";
+
+  // Role-Based Pending Approval Documents (ONLY active in Purchase Portal)
+  const allowedDocTypes = getAllowedPendingDocumentTypes(currentUser?.role);
+
+  const pendingPOsCount = (isPoActive && allowedDocTypes.includes("PO")) ? pos.filter(isPOPending).length : 0;
+  const pendingPISCount = (isPoActive && allowedDocTypes.includes("PIS")) ? pises.filter(isPISPending).length : 0;
+  const pendingRFSCount = (isPoActive && allowedDocTypes.includes("RFS")) ? rfses.filter(isRFSPending).length : 0;
+  const pendingCanvassCount = (isPoActive && allowedDocTypes.includes("CANVASS")) ? canvasses.filter(isCanvassPending).length : 0;
+
+  const totalPendingApprovalDocsCount = isPoActive
+    ? (pendingPOsCount + pendingPISCount + pendingRFSCount + pendingCanvassCount)
     : 0;
+
+  // Unread Alerts Count strictly isolated to current active portal
+  const unreadAlertsCount = currentUser
+    ? notifications.filter((n) => {
+        const matchesUser =
+          (n.userId && n.userId === currentUser.id) ||
+          (!n.userId && n.role === currentUser.role) ||
+          currentUser.role === UserRole.Administrator;
+        if (!matchesUser || n.isRead || n.status === "READ") return false;
+
+        const nPortal = NotificationRepositoryService.normalizePortal(n.portal);
+        const hasExplicitPortal = Boolean(n.portal);
+
+        if (hasExplicitPortal) {
+          return nPortal === currentActivePortal;
+        } else {
+          const isProcurementDoc = Boolean(n.documentType || n.poId);
+          const isTsdDoc = Boolean(
+            n.workflowId ||
+            (n.module && ["control-no", "unloading-loading", "hazardous-waste", "waste-movement", "timestamp", "manifest-summary", "COA Workflow"].includes(n.module))
+          );
+
+          if (isTsdActive) {
+            return isTsdDoc || (!isProcurementDoc);
+          } else {
+            return isProcurementDoc || (!isTsdDoc);
+          }
+        }
+      }).length
+    : 0;
+
+  const totalHeaderBadgeCount = activeSystem ? (totalPendingApprovalDocsCount + unreadAlertsCount) : 0;
 
   // Dynamic Menu Items (Purged Demo switch)
   const getRoleMenuItems = (role: UserRole) => {
@@ -452,11 +540,11 @@ export default function App() {
       case UserRole.Administrator:
         return [
           { name: "Dashboard", key: "dashboard", icon: "home" },
+          { name: "Request for Supply", key: "rfs", icon: "rfs" },
           { name: "Purchase Orders", key: "po-all", icon: "file" },
           { name: "Payment Instruction Slip", key: "pis", icon: "pis" },
-          { name: "Request for Supply", key: "rfs", icon: "rfs" },
           { name: "Canvass Sheet", key: "canvass", icon: "canvass" },
-          { name: "RFS Approval", key: "rfs-approval", icon: "check" },
+          { name: "Procurement Approval", key: "procurement-approval", icon: "check" },
           { name: "Supplier Registry", key: "suppliers", icon: "users" },
           { name: "Supplier Summary", key: "supplier-report", icon: "reports" },
           { name: "Supplier Analytics", key: "supplier-analytics", icon: "reports" },
@@ -467,33 +555,33 @@ export default function App() {
       case UserRole.PurchasingStaff:
         return [
           { name: "Dashboard", key: "dashboard", icon: "home" },
+          { name: "Request for Supply", key: "rfs", icon: "rfs" },
           { name: "Purchase Orders", key: "po-all", icon: "file" },
           { name: "Payment Instruction Slip", key: "pis", icon: "pis" },
-          { name: "Request for Supply", key: "rfs", icon: "rfs" },
           { name: "Canvass Sheet", key: "canvass", icon: "canvass" },
-          { name: "RFS Approval", key: "rfs-approval", icon: "check" },
+          { name: "Procurement Approval", key: "procurement-approval", icon: "check" },
           { name: "Supplier Registry", key: "suppliers", icon: "users" },
           { name: "Supplier Summary", key: "supplier-report", icon: "reports" },
           { name: "Supplier Analytics", key: "supplier-analytics", icon: "reports" },
-          { name: "Import Excel", key: "excel-import", icon: "import" },
-          { name: "Export Excel", key: "excel-export", icon: "export" },
         ];
       case UserRole.DepartmentHead:
         return [
           { name: "Dashboard", key: "dashboard", icon: "home" },
+          { name: "Request for Supply", key: "rfs", icon: "rfs" },
           { name: "Purchase Order Review", key: "po-review", icon: "review" },
           { name: "Payment Instruction Slip", key: "pis", icon: "pis" },
-          { name: "Request for Supply", key: "rfs", icon: "rfs" },
           { name: "Canvass Sheet", key: "canvass", icon: "canvass" },
+          { name: "Procurement Approval", key: "procurement-approval", icon: "check" },
           { name: "Approval Queue", key: "approval-queue", icon: "queue" },
         ];
       case UserRole.AccountingStaff:
         return [
           { name: "Dashboard", key: "dashboard", icon: "home" },
+          { name: "Request for Supply", key: "rfs", icon: "rfs" },
           { name: "Verification Queue", key: "verification-queue", icon: "verified" },
           { name: "Payment Instruction Slip", key: "pis", icon: "pis" },
-          { name: "Request for Supply", key: "rfs", icon: "rfs" },
           { name: "Canvass Sheet", key: "canvass", icon: "canvass" },
+          { name: "Procurement Approval", key: "procurement-approval", icon: "check" },
           { name: "Supplier Registry", key: "suppliers", icon: "users" },
           { name: "Supplier Summary", key: "supplier-report", icon: "reports" },
           { name: "Supplier Analytics", key: "supplier-analytics", icon: "reports" },
@@ -501,10 +589,11 @@ export default function App() {
       case UserRole.Director:
         return [
           { name: "Dashboard", key: "dashboard", icon: "home" },
+          { name: "Request for Supply", key: "rfs", icon: "rfs" },
           { name: "Final Approval Queue", key: "final-approval-queue", icon: "queue" },
           { name: "Payment Instruction Slip", key: "pis", icon: "pis" },
-          { name: "Request for Supply", key: "rfs", icon: "rfs" },
           { name: "Canvass Sheet", key: "canvass", icon: "canvass" },
+          { name: "Procurement Approval", key: "procurement-approval", icon: "check" },
           { name: "Supplier Registry", key: "suppliers", icon: "users" },
           { name: "Supplier Summary", key: "supplier-report", icon: "reports" },
           { name: "Supplier Analytics", key: "supplier-analytics", icon: "reports" },
@@ -512,10 +601,11 @@ export default function App() {
       case UserRole.Viewer:
         return [
           { name: "Dashboard", key: "dashboard", icon: "home" },
+          { name: "Request for Supply", key: "rfs", icon: "rfs" },
           { name: "Purchase Orders", key: "po-all", icon: "file" },
           { name: "Payment Instruction Slip", key: "pis", icon: "pis" },
-          { name: "Request for Supply", key: "rfs", icon: "rfs" },
           { name: "Canvass Sheet", key: "canvass", icon: "canvass" },
+          { name: "Procurement Approval", key: "procurement-approval", icon: "check" },
           { name: "Supplier Registry", key: "suppliers", icon: "users" },
           { name: "Supplier Summary", key: "supplier-report", icon: "reports" },
           { name: "Supplier Analytics", key: "supplier-analytics", icon: "reports" },
@@ -538,11 +628,10 @@ export default function App() {
     return true;
   };
 
-  const getModuleForTab = (tab: string): "Purchase Order" | "Request For Supply" | "Payment Instruction Slip" | "Canvass Sheet" | "Request For Supply (RFS) Approval" | null => {
+  const getModuleForTab = (tab: string): "Purchase Order" | "Request For Supply" | "Payment Instruction Slip" | "Canvass Sheet" | "Procurement Approval" | null => {
     if (tab === "po-list" || tab === "po-form") return "Purchase Order";
     if (tab === "pis") return "Payment Instruction Slip";
     if (tab === "rfs") return "Request For Supply";
-    if (tab === "rfs-approval") return "Request For Supply (RFS) Approval";
     if (tab === "canvass") return "Canvass Sheet";
     return null;
   };
@@ -559,11 +648,11 @@ export default function App() {
     else if (menuKey === "waste-movement") targetTab = "waste-movement";
     else if (menuKey === "timestamp") targetTab = "timestamp";
     else if (menuKey === "manifest-summary") targetTab = "manifest-summary";
-    else if (menuKey === "po-all" || menuKey === "po-review" || menuKey === "approval-queue" || menuKey === "verification-queue" || menuKey === "final-approval-queue" || menuKey === "excel-import" || menuKey === "excel-export") targetTab = "po-list";
+    else if (menuKey === "po-all" || menuKey === "po-review" || menuKey === "approval-queue" || menuKey === "verification-queue" || menuKey === "final-approval-queue") targetTab = "po-list";
     else if (menuKey === "pis") targetTab = "pis";
     else if (menuKey === "rfs") targetTab = "rfs";
-    else if (menuKey === "rfs-approval") targetTab = "rfs-approval";
     else if (menuKey === "canvass") targetTab = "canvass";
+    else if (menuKey === "procurement-approval") targetTab = "procurement-approval";
     else if (menuKey === "suppliers") targetTab = "suppliers";
     else if (menuKey === "supplier-report") targetTab = "supplier-report";
     else if (menuKey === "supplier-analytics") targetTab = "supplier-analytics";
@@ -599,10 +688,10 @@ export default function App() {
         setCurrentTab("pis");
       } else if (menuKey === "rfs") {
         setCurrentTab("rfs");
-      } else if (menuKey === "rfs-approval") {
-        setCurrentTab("rfs-approval");
       } else if (menuKey === "canvass") {
         setCurrentTab("canvass");
+      } else if (menuKey === "procurement-approval") {
+        setCurrentTab("procurement-approval");
       } else if (menuKey === "suppliers") {
         setCurrentTab("suppliers");
       } else if (menuKey === "supplier-report") {
@@ -626,18 +715,6 @@ export default function App() {
       } else if (menuKey === "final-approval-queue") {
         setPoListStatusFilter("Pending Approval");
         setCurrentTab("po-list");
-      } else if (menuKey === "excel-import") {
-        setPoListStatusFilter("All");
-        setCurrentTab("po-list");
-        setTimeout(() => {
-          alert("To bulk-import spreadsheets, click the 'Bulk Spreadsheet Excel Import' button at the top of the Purchase Orders Directory.");
-        }, 150);
-      } else if (menuKey === "excel-export") {
-        setPoListStatusFilter("All");
-        setCurrentTab("po-list");
-        setTimeout(() => {
-          alert("To export purchase orders, select any approved Purchase Order to view its document, or use the summary reports options.");
-        }, 150);
       }
     };
 
@@ -696,8 +773,8 @@ export default function App() {
     if (menuKey === "manifest-summary") return currentTab === "manifest-summary";
     if (menuKey === "pis") return currentTab === "pis";
     if (menuKey === "rfs") return currentTab === "rfs";
-    if (menuKey === "rfs-approval") return currentTab === "rfs-approval";
     if (menuKey === "canvass") return currentTab === "canvass";
+    if (menuKey === "procurement-approval") return currentTab === "procurement-approval";
     if (menuKey === "suppliers") return currentTab === "suppliers";
     if (menuKey === "supplier-report") return currentTab === "supplier-report";
     if (menuKey === "supplier-analytics") return currentTab === "supplier-analytics";
@@ -1028,7 +1105,7 @@ export default function App() {
             }
           }}
           currentTab={currentTab}
-          unreadCount={unreadAlertsCount}
+          unreadCount={totalHeaderBadgeCount}
           onOpenNotifications={() => setIsNotificationsOpen(true)}
           onOpenProfile={(section) => {
             setProfileModalSection(section);
@@ -1040,7 +1117,6 @@ export default function App() {
             if (checkUnsavedChanges()) {
               setActiveSystem(null);
               localStorage.removeItem("smei_active_system");
-              sessionStorage.removeItem("smei_portal_unlocked");
             }
           }}
         />
@@ -1098,25 +1174,22 @@ export default function App() {
                 )
               )}
 
-              {currentTab === "control-no" && (
-                <ControlNoModule />
-              )}
-
-              {currentTab === "unloading-loading" && (
-                <UnloadingLoadingModule />
-              )}
-
-              {currentTab === "hazardous-waste" && (
-                <HazardousWasteModule />
-              )}
-
-              {currentTab === "waste-movement" && (
-                <WasteMovementModule />
-              )}
-
-              {currentTab === "timestamp" && (
-                <TimestampModule />
-              )}
+              {["control-no", "unloading-loading", "hazardous-waste", "waste-movement", "timestamp"].includes(currentTab) ? (
+                <div className="flex flex-col xl:flex-row items-start gap-6 w-full max-w-[1600px] mx-auto">
+                  <div className="flex-1 min-w-0 w-full">
+                    {currentTab === "control-no" && <ControlNoModule />}
+                    {currentTab === "unloading-loading" && <UnloadingLoadingModule />}
+                    {currentTab === "hazardous-waste" && <HazardousWasteModule />}
+                    {currentTab === "waste-movement" && <WasteMovementModule />}
+                    {currentTab === "timestamp" && <TimestampModule />}
+                  </div>
+                  <COAWorkflowTracker
+                    activeTab={currentTab}
+                    onNavigate={(tab) => setCurrentTab(tab)}
+                    currentUser={currentUser}
+                  />
+                </div>
+              ) : null}
 
               {currentTab === "manifest-summary" && (
                 <ManifestSummaryModule />
@@ -1187,20 +1260,18 @@ export default function App() {
                 </ModuleSecurityGate>
               )}
 
-              {currentTab === "rfs-approval" && (
-                <ModuleSecurityGate moduleName="Request For Supply (RFS) Approval" currentUser={currentUser}>
-                  <RfsApprovalModule
-                    currentUser={currentUser}
-                  />
-                </ModuleSecurityGate>
-              )}
-
               {currentTab === "canvass" && (
                 <ModuleSecurityGate moduleName="Canvass Sheet" currentUser={currentUser}>
                   <CanvassSheetModule
                     currentUser={currentUser}
                   />
                 </ModuleSecurityGate>
+              )}
+
+              {currentTab === "procurement-approval" && (
+                <ProcurementApprovalModule
+                  currentUser={currentUser}
+                />
               )}
 
               {(currentTab === "users" || currentTab === "roles" || currentTab === "audit-logs") && currentUser.role !== UserRole.Administrator ? (
@@ -1212,7 +1283,7 @@ export default function App() {
                 <>
                   {currentTab === "users" && (
                     <div className="p-6 md:p-10 max-w-7xl mx-auto">
-                      <UserManagement />
+                      <UserManagement currentUser={currentUser} />
                     </div>
                   )}
 
@@ -1242,15 +1313,32 @@ export default function App() {
           onClose={() => setIsNotificationsOpen(false)}
           notifications={notifications}
           currentUser={currentUser}
+          activeSystem={activeSystem}
+          tsdWorkflowProgress={activeSystem === "tsd" ? tsdWorkflowProgress : undefined}
           onMarkAsRead={handleMarkNotifRead}
           onMarkAllAsRead={handleMarkAllNotifRead}
+          onClearReadNotifications={handleClearReadNotif}
           onSelectPO={handleSelectPOFromNotif}
+          onNavigate={(tab) => {
+            const targetModule = getModuleForTab(tab);
+            if (targetModule) {
+              checkModuleAccess(targetModule, () => {
+                setSelectedPO(null);
+                setShowPOForm(false);
+                setCurrentTab(tab);
+              });
+            } else {
+              setSelectedPO(null);
+              setShowPOForm(false);
+              setCurrentTab(tab);
+            }
+          }}
         />
 
         {/* 5. App Footer (Hidden on Print) */}
         <footer id="smei-poms-footer" className="bg-white border-t border-gray-100 dark:bg-neutral-950 dark:border-neutral-900 py-4 px-6 md:px-12 text-center text-[10px] text-gray-400 dark:text-neutral-500 font-mono flex flex-col sm:flex-row items-center justify-between gap-2 no-print transition-colors duration-300">
           <div>
-            © 2026 SOUTHCOAST METAL ENTERPRISE, INC. • POMS SECURED TERMINAL
+            © 2026 SMEI Management System Developed by <span className="animate-pulse font-bold text-gray-600 dark:text-neutral-300">Paul Joseph Salgado</span>
           </div>
           <div className="flex items-center gap-2">
             <span className="inline-block w-1.5 h-1.5 bg-green-500 rounded-full animate-pulse" />
@@ -1278,6 +1366,7 @@ export default function App() {
         {securityChallenge && (
           <SecurityPINModal
             moduleName={securityChallenge.moduleName}
+            currentUser={currentUser}
             onSuccess={() => {
               const successCallback = securityChallenge.onSuccess;
               setSecurityChallenge(null);

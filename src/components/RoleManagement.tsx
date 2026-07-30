@@ -6,6 +6,7 @@
 import React, { useState, useEffect } from "react";
 import { api } from "../lib/api";
 import { Shield, Check, Save, RefreshCw, AlertCircle, CheckCircle2 } from "lucide-react";
+import { SecurityService, PinProtectionRule } from "../services/securityService";
 
 interface RoleRecord {
   id: string;
@@ -40,77 +41,21 @@ export default function RoleManagement() {
   const [newPinCode, setNewPinCode] = useState("");
 
   const [isGlobalPinEnabled, setIsGlobalPinEnabled] = useState<boolean>(() => {
-    const savedSetting = localStorage.getItem("smei_security_config");
-    if (savedSetting !== null) {
-      try {
-        return JSON.parse(savedSetting).enabled;
-      } catch (e) {
-        return false;
-      }
-    }
-    return false;
+    return SecurityService.getGlobalSecurityEnabled();
   });
 
   const handleToggleGlobalPin = () => {
     const newValue = !isGlobalPinEnabled;
     setIsGlobalPinEnabled(newValue);
-    localStorage.setItem("smei_security_config", JSON.stringify({ enabled: newValue }));
+    SecurityService.setGlobalSecurityEnabled(newValue);
   };
 
-  const [isPortalPinEnabled, setIsPortalPinEnabled] = useState<boolean>(() => {
-    const savedSetting = localStorage.getItem("smei_portal_security_config");
-    if (savedSetting !== null) {
-      try {
-        return JSON.parse(savedSetting).enabled;
-      } catch (e) {
-        return false;
-      }
-    }
-    return false;
-  });
-
-  const [poPortalPinCode, setPoPortalPinCode] = useState<string>(() => {
-    const savedSetting = localStorage.getItem("smei_portal_security_config");
-    if (savedSetting !== null) {
-      try {
-        const parsed = JSON.parse(savedSetting);
-        return parsed.poPinCode || parsed.pinCode || "1111";
-      } catch (e) {
-        return "1111";
-      }
-    }
-    return "1111";
-  });
-
-  const [tsdPortalPinCode, setTsdPortalPinCode] = useState<string>(() => {
-    const savedSetting = localStorage.getItem("smei_portal_security_config");
-    if (savedSetting !== null) {
-      try {
-        const parsed = JSON.parse(savedSetting);
-        return parsed.tsdPinCode || parsed.pinCode || "1111";
-      } catch (e) {
-        return "1111";
-      }
-    }
-    return "1111";
-  });
-
   // Modal PIN Editor state to prevent uncontrolled instant-edit
-  const [editingPinType, setEditingPinType] = useState<"po" | "tsd" | "module" | null>(null);
+  const [editingPinType, setEditingPinType] = useState<"module" | null>(null);
   const [editingModuleRuleId, setEditingModuleRuleId] = useState<string | null>(null);
   const [tempNewPin, setTempNewPin] = useState("");
   const [tempConfirmPin, setTempConfirmPin] = useState("");
   const [pinEditError, setPinEditError] = useState("");
-
-  const handleTogglePortalPin = () => {
-    const newValue = !isPortalPinEnabled;
-    setIsPortalPinEnabled(newValue);
-    localStorage.setItem("smei_portal_security_config", JSON.stringify({
-      enabled: newValue,
-      poPinCode: poPortalPinCode,
-      tsdPinCode: tsdPortalPinCode
-    }));
-  };
 
   const closePinEditor = () => {
     setEditingPinType(null);
@@ -134,23 +79,7 @@ export default function RoleManagement() {
       return;
     }
 
-    if (editingPinType === "po") {
-      setPoPortalPinCode(tempNewPin);
-      localStorage.setItem("smei_portal_security_config", JSON.stringify({
-        enabled: isPortalPinEnabled,
-        poPinCode: tempNewPin,
-        tsdPinCode: tsdPortalPinCode
-      }));
-      setSuccess("PO Portal PIN code updated successfully!");
-    } else if (editingPinType === "tsd") {
-      setTsdPortalPinCode(tempNewPin);
-      localStorage.setItem("smei_portal_security_config", JSON.stringify({
-        enabled: isPortalPinEnabled,
-        poPinCode: poPortalPinCode,
-        tsdPinCode: tempNewPin
-      }));
-      setSuccess("TSD Portal PIN code updated successfully!");
-    } else if (editingPinType === "module" && editingModuleRuleId) {
+    if (editingPinType === "module" && editingModuleRuleId) {
       const updated = modulePins.map((rule) => {
         if (rule.id === editingModuleRuleId) {
           return { ...rule, pinCode: tempNewPin };
@@ -167,39 +96,12 @@ export default function RoleManagement() {
 
   // Load and initialize dynamic security PIN rules
   useEffect(() => {
-    const defaultRules = [
-      { id: "po_status_change", moduleName: "Purchase Order", actionName: "Access Purchase Orders", pinCode: "1234", isEnabled: true },
-      { id: "rfs_approval", moduleName: "Request For Supply", actionName: "Access Request For Supply", pinCode: "5678", isEnabled: true },
-      { id: "rfs_approval_gate", moduleName: "Request For Supply (RFS) Approval", actionName: "Access Request For Supply (RFS) Approval", pinCode: "7777", isEnabled: true },
-      { id: "pis_access", moduleName: "Payment Instruction Slip", actionName: "Access Payment Instruction Slip", pinCode: "4321", isEnabled: true },
-      { id: "canvass_access", moduleName: "Canvass Sheet", actionName: "Access Canvass Sheets", pinCode: "9999", isEnabled: true }
-    ];
-
-    const saved = localStorage.getItem("smei_module_pins");
-    if (saved) {
-      try {
-        let loaded = JSON.parse(saved);
-        // Ensure "Request For Supply (RFS) Approval" rule is present
-        const hasRfsApproval = loaded.some((r: any) => r.moduleName === "Request For Supply (RFS) Approval" || r.id === "rfs_approval_gate");
-        if (!hasRfsApproval) {
-          loaded.push({ id: "rfs_approval_gate", moduleName: "Request For Supply (RFS) Approval", actionName: "Access Request For Supply (RFS) Approval", pinCode: "7777", isEnabled: true });
-          localStorage.setItem("smei_module_pins", JSON.stringify(loaded));
-        }
-        setModulePins(loaded);
-      } catch (e) {
-        console.error("Failed to parse saved module pins", e);
-        setModulePins(defaultRules);
-        localStorage.setItem("smei_module_pins", JSON.stringify(defaultRules));
-      }
-    } else {
-      setModulePins(defaultRules);
-      localStorage.setItem("smei_module_pins", JSON.stringify(defaultRules));
-    }
+    setModulePins(SecurityService.getModuleRules());
   }, []);
 
   const saveModulePins = (updatedRules: PinProtectionRule[]) => {
     setModulePins(updatedRules);
-    localStorage.setItem("smei_module_pins", JSON.stringify(updatedRules));
+    SecurityService.saveModuleRules(updatedRules);
   };
 
   const handleAddPinRule = (e: React.FormEvent) => {
@@ -267,8 +169,6 @@ export default function RoleManagement() {
     { key: "view_suppliers", label: "View Suppliers", desc: "Browse corporate supplier directories" },
     { key: "manage_suppliers", label: "Manage Suppliers", desc: "Create, edit or remove partner supplier records" },
     { key: "view_audit_logs", label: "View Audit Logs", desc: "Query immutable administrative log grids" },
-    { key: "import_excel", label: "Import Excel", desc: "Upload batch contracts from spreadsheets" },
-    { key: "export_excel", label: "Export Excel/PDF", desc: "Download validated compliance files" },
     { key: "manage_users", label: "Manage Accounts", desc: "Full administrative CRUD on employee users" },
     { key: "manage_roles", label: "Manage Roles", desc: "Modify fine-grained RBAC permission matrix" },
     { key: "approve_rfs", label: "Approve RFS", desc: "Access the RFS Approval queue to authorize Supply Delivery Status & Due Date" }
@@ -549,78 +449,6 @@ export default function RoleManagement() {
         </div>
       )}
 
-      {/* Enterprise Control Portal Security PIN Protection Container */}
-      <div id="enterprise-portal-pin-section" className="bg-white border border-gray-200 rounded-xl shadow-sm overflow-hidden mt-8">
-        <div className="bg-gray-50/70 p-4 border-b border-gray-200 flex flex-col sm:flex-row justify-between items-start sm:items-center gap-4">
-          <div>
-            <h3 className="font-bold text-gray-800 font-display text-base tracking-wide uppercase flex items-center gap-2">
-              <span className="w-2.5 h-2.5 bg-amber-500 rounded-full animate-pulse" />
-              Enterprise Control Portal Security PIN Protection
-            </h3>
-            <p className="text-xs text-gray-500 mt-0.5">
-              Enforce a secure, independent PIN gate challenge when users select portals (POMS / TSD) from the main selector.
-            </p>
-          </div>
-          <div className="flex items-center gap-3">
-            <span className={`text-xs font-bold uppercase ${isPortalPinEnabled ? "text-amber-600 dark:text-amber-400" : "text-gray-400 dark:text-gray-500"}`}>
-              {isPortalPinEnabled ? "Enforced" : "Disabled"}
-            </span>
-            <label className="relative inline-flex items-center cursor-pointer select-none">
-              <input
-                type="checkbox"
-                checked={isPortalPinEnabled}
-                onChange={handleTogglePortalPin}
-                className="sr-only peer"
-              />
-              <div className="w-11 h-6 bg-gray-200 dark:bg-slate-800 rounded-full peer peer-checked:after:translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-0.5 after:left-[2px] after:bg-white after:border-gray-300 after:border after:rounded-full after:h-5 after:w-5 after:transition-all peer-checked:bg-amber-600"></div>
-            </label>
-          </div>
-        </div>
-        <div className="p-6">
-          <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-            {/* Purchase Order PIN Config */}
-            <div className="p-4 bg-gray-50 dark:bg-slate-900 border border-gray-200 dark:border-slate-800 rounded-xl flex items-center justify-between">
-              <div>
-                <p className="text-xs font-bold text-gray-600 dark:text-gray-400 uppercase tracking-wider">Purchase Order (PO) PIN</p>
-                <p className="text-sm font-mono font-bold text-gray-800 dark:text-gray-200 mt-1">•••• (Configured)</p>
-              </div>
-              <button
-                type="button"
-                onClick={() => {
-                  setEditingPinType("po");
-                  setTempNewPin("");
-                  setTempConfirmPin("");
-                  setPinEditError("");
-                }}
-                className="px-3.5 py-1.5 bg-white border border-gray-300 hover:bg-gray-50 text-gray-700 rounded-lg text-xs font-bold shadow-xs transition-all active:scale-95 cursor-pointer"
-              >
-                Change PIN
-              </button>
-            </div>
-
-            {/* TSD Compliance PIN Config */}
-            <div className="p-4 bg-gray-50 dark:bg-slate-900 border border-gray-200 dark:border-slate-800 rounded-xl flex items-center justify-between">
-              <div>
-                <p className="text-xs font-bold text-gray-600 dark:text-gray-400 uppercase tracking-wider">TSD Compliance PIN</p>
-                <p className="text-sm font-mono font-bold text-gray-800 dark:text-gray-200 mt-1">•••• (Configured)</p>
-              </div>
-              <button
-                type="button"
-                onClick={() => {
-                  setEditingPinType("tsd");
-                  setTempNewPin("");
-                  setTempConfirmPin("");
-                  setPinEditError("");
-                }}
-                className="px-3.5 py-1.5 bg-white border border-gray-300 hover:bg-gray-50 text-gray-700 rounded-lg text-xs font-bold shadow-xs transition-all active:scale-95 cursor-pointer"
-              >
-                Change PIN
-              </button>
-            </div>
-          </div>
-        </div>
-      </div>
-
       {/* Module Security PIN Protection Container */}
       <div id="module-pin-protection-section" className="bg-white border border-gray-200 rounded-xl shadow-sm overflow-hidden mt-8">
         <div className="bg-gray-50/70 p-4 border-b border-gray-200 flex flex-col sm:flex-row justify-between items-start sm:items-center gap-4">
@@ -671,7 +499,7 @@ export default function RoleManagement() {
             </div>
           </div>
 
-          {modulePins.length === 0 ? (
+          {modulePins.filter((r) => !r.id.endsWith("_approval_gate")).length === 0 ? (
             <div className="text-center py-8 border-2 border-dashed border-gray-100 rounded-xl">
               <p className="text-sm text-gray-400">No custom module PIN protection bounds defined.</p>
             </div>
@@ -688,7 +516,9 @@ export default function RoleManagement() {
                   </tr>
                 </thead>
                 <tbody className="divide-y divide-gray-100 font-medium">
-                  {modulePins.map((rule) => (
+                  {modulePins
+                    .filter((rule) => !rule.id.endsWith("_approval_gate"))
+                    .map((rule) => (
                     <tr key={rule.id} className="hover:bg-gray-50/40 transition-colors">
                       <td className="py-3.5 px-4">
                         <span className="px-2 py-0.5 bg-red-50 text-smei-crimson text-[10px] rounded font-bold uppercase">
@@ -731,7 +561,7 @@ export default function RoleManagement() {
                         </label>
                       </td>
                       <td className="py-3.5 px-4 text-right">
-                        {rule.id !== "po_status_change" && rule.id !== "rfs_approval" && rule.id !== "rfs_approval_gate" && rule.id !== "canvass_access" && rule.id !== "pis_access" ? (
+                        {rule.id !== "po_status_change" && rule.id !== "rfs_approval" && rule.id !== "canvass_access" && rule.id !== "pis_access" ? (
                           <button
                             onClick={() => handleDeletePinRule(rule.id)}
                             className="text-gray-400 hover:text-red-600 transition-colors"
@@ -749,6 +579,84 @@ export default function RoleManagement() {
               </table>
             </div>
           )}
+        </div>
+      </div>
+
+      {/* Procurement Approval Security Container */}
+      <div id="procurement-approval-security-section" className="bg-white border border-gray-200 rounded-xl shadow-sm overflow-hidden mt-8">
+        <div className="bg-gray-50/70 p-4 border-b border-gray-200 flex flex-col sm:flex-row justify-between items-start sm:items-center gap-4">
+          <div>
+            <h3 className="font-bold text-gray-800 font-display text-base tracking-wide uppercase flex items-center gap-2">
+              <span className="w-2.5 h-2.5 bg-red-600 rounded-full animate-pulse" />
+              PROCUREMENT APPROVAL SECURITY
+            </h3>
+            <p className="text-xs text-gray-500 mt-0.5">
+              Independent security PIN authorization controls for individual procurement document approval workspaces.
+            </p>
+          </div>
+        </div>
+
+        <div className="p-6 grid grid-cols-1 md:grid-cols-2 gap-4">
+          {[
+            { id: "po_approval_gate", label: "PO APPROVAL PIN", name: "PO Approval", desc: "Access PO Approval Workspace" },
+            { id: "pis_approval_gate", label: "PIS APPROVAL PIN", name: "PIS Approval", desc: "Access PIS Approval Workspace" },
+            { id: "rfs_approval_gate", label: "RFS APPROVAL PIN", name: "RFS Approval", desc: "Access RFS Approval Workspace" },
+            { id: "canvass_approval_gate", label: "CANVASS SHEET APPROVAL PIN", name: "Canvass Approval", desc: "Access Canvass Approval Workspace" },
+          ].map((item) => {
+            const rule = modulePins.find((r) => r.id === item.id) || {
+              id: item.id,
+              moduleName: item.name,
+              actionName: item.desc,
+              pinCode: item.id === "po_approval_gate" ? "1234" : item.id === "pis_approval_gate" ? "5678" : item.id === "rfs_approval_gate" ? "9012" : "3456",
+              isEnabled: true,
+            };
+
+            return (
+              <div key={item.id} className="p-4 bg-gray-50 dark:bg-slate-900 border border-gray-200 dark:border-slate-800 rounded-xl flex items-center justify-between">
+                <div className="space-y-1">
+                  <div className="flex items-center gap-2">
+                    <span className="px-2.5 py-1 bg-red-50 text-smei-crimson text-xs rounded-md font-bold uppercase tracking-wider">
+                      {item.label}
+                    </span>
+                  </div>
+                  <p className="text-xs text-gray-500 font-medium">{rule.actionName}</p>
+                  <div className="flex items-center gap-2 pt-2">
+                    <span className="bg-gray-200 dark:bg-slate-800 px-3 py-1 rounded-lg font-mono font-bold text-xs text-gray-800 dark:text-gray-200">
+                      {rule.pinCode}
+                    </span>
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setEditingPinType("module");
+                        setEditingModuleRuleId(rule.id);
+                        setTempNewPin("");
+                        setTempConfirmPin("");
+                        setPinEditError("");
+                      }}
+                      className="px-3 py-1 bg-white border border-gray-300 hover:bg-gray-50 text-gray-700 rounded-lg text-xs font-bold shadow-xs transition-all active:scale-95 cursor-pointer"
+                    >
+                      Change PIN
+                    </button>
+                  </div>
+                </div>
+
+                <div className="flex flex-col items-end gap-2">
+                  <label className="relative inline-flex items-center cursor-pointer select-none">
+                    <input
+                      type="checkbox"
+                      checked={rule.isEnabled}
+                      onChange={() => handleTogglePinRule(rule.id)}
+                      className="sr-only peer"
+                    />
+                    <div className="w-9 h-5 bg-gray-200 rounded-full peer peer-checked:after:translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-0.5 after:left-[2px] after:bg-white after:border-gray-300 after:border after:rounded-full after:h-4 after:w-4 after:transition-all peer-checked:bg-red-600"></div>
+                  </label>
+                  <span className={`text-[10px] uppercase font-bold ${rule.isEnabled ? "text-red-600" : "text-gray-400"}`}>
+                    {rule.isEnabled ? "Enforced" : "Bypassed"}
+                  </span>
+                </div>
+              </div>
+            );
+          })}
         </div>
       </div>
 
@@ -795,7 +703,6 @@ export default function RoleManagement() {
                       <>
                         <option value="Purchase Order">Purchase Order (PO)</option>
                         <option value="Request For Supply">Request For Supply (RFS)</option>
-                        <option value="Request For Supply (RFS) Approval">Request For Supply (RFS) Approval</option>
                         <option value="Payment Instruction Slip">Payment Instruction Slip (PIS)</option>
                         <option value="Canvass Sheet">Canvass Sheet (Canvass)</option>
                       </>
@@ -846,8 +753,6 @@ export default function RoleManagement() {
           <div className="bg-white dark:bg-slate-900 border border-neutral-200 dark:border-slate-800 rounded-2xl shadow-xl max-w-sm w-full overflow-hidden animate-scaleIn">
             <div className="p-5 border-b border-neutral-100 dark:border-slate-800/80 bg-neutral-50 dark:bg-slate-950/40 flex items-center justify-between">
               <h3 className="font-bold text-neutral-800 dark:text-neutral-200 text-sm tracking-wide uppercase">
-                {editingPinType === "po" && "Change PO Portal PIN"}
-                {editingPinType === "tsd" && "Change TSD Portal PIN"}
                 {editingPinType === "module" && "Change Module PIN"}
               </h3>
               <button

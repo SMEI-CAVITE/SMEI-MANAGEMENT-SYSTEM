@@ -92,10 +92,10 @@ export default function Header({
         return "Payment Instruction Slips";
       case "rfs":
         return "Requests For Supply";
-      case "rfs-approval":
-        return "RFS Approval Workspace";
       case "canvass":
         return "Canvass Sheets Directory";
+      case "procurement-approval":
+        return "Procurement Approval Dashboard";
       case "users":
         return "User Management";
       case "roles":
@@ -165,7 +165,7 @@ export default function Header({
             >
               <Bell className="w-5 h-5 pointer-events-none" />
               {unreadCount > 0 && (
-                <span className="absolute top-2 right-2 md:top-1.5 md:right-1.5 bg-[#B22222] text-white text-[9px] font-bold px-1.5 py-0.5 rounded-full border border-white dark:border-neutral-950 animate-pulse pointer-events-none">
+                <span className="absolute top-1 right-1 md:top-0.5 md:right-0.5 min-w-[15px] h-[15px] px-1 bg-[#B22222] text-white text-[8px] font-bold rounded-full border border-white dark:border-neutral-950 flex items-center justify-center leading-none pointer-events-none">
                   {unreadCount}
                 </span>
               )}
@@ -305,8 +305,8 @@ export default function Header({
         )}
       </div>      {/* Navigation and System Operations Bar */}
       {currentUser && (
-        <div className="lg:hidden bg-gray-50 border-t border-gray-200 dark:bg-neutral-950 dark:border-neutral-900 px-6 md:px-10 py-2 overflow-x-auto scrollbar-none flex items-center justify-between gap-2">
-          <nav className="flex flex-nowrap items-center gap-1 md:gap-2 whitespace-nowrap">
+        <div className="lg:hidden bg-gray-50 border-t border-gray-200 dark:bg-neutral-950 dark:border-neutral-900 px-4 md:px-10 py-2 overflow-x-auto">
+          <nav className="flex flex-nowrap items-center gap-2 w-max">
             {activeSystem === "tsd" ? (
               <>
                 <button
@@ -392,7 +392,6 @@ export default function Header({
                 >
                   Dashboard
                 </button>
-                
                 <button
                   onClick={() => onNavigate("po-list")}
                   className={`px-3 py-1.5 text-xs font-mono uppercase tracking-wider rounded transition-all duration-200 ${
@@ -403,18 +402,6 @@ export default function Header({
                 >
                   Purchase Orders
                 </button>
-
-                <button
-                  onClick={() => onNavigate("suppliers")}
-                  className={`px-3 py-1.5 text-xs font-mono uppercase tracking-wider rounded transition-all duration-200 ${
-                    currentTab === "suppliers"
-                      ? "bg-[#B22222] text-white shadow-[0_2px_8px_rgba(178,34,34,0.3)] scale-[1.03]"
-                      : "text-gray-600 hover:text-[#B22222] hover:bg-red-50 hover:scale-[1.04] active:scale-95 dark:text-neutral-400 dark:hover:text-white dark:hover:bg-neutral-900"
-                  }`}
-                >
-                  Suppliers
-                </button>
-
                 <button
                   onClick={() => onNavigate("pis")}
                   className={`px-3 py-1.5 text-xs font-mono uppercase tracking-wider rounded transition-all duration-200 ${
@@ -423,9 +410,8 @@ export default function Header({
                       : "text-gray-600 hover:text-[#B22222] hover:bg-red-50 hover:scale-[1.04] active:scale-95 dark:text-neutral-400 dark:hover:text-white dark:hover:bg-neutral-900"
                   }`}
                 >
-                  PIS
+                  Payment Instruction Slip
                 </button>
-
                 <button
                   onClick={() => onNavigate("rfs")}
                   className={`px-3 py-1.5 text-xs font-mono uppercase tracking-wider rounded transition-all duration-200 ${
@@ -434,9 +420,8 @@ export default function Header({
                       : "text-gray-600 hover:text-[#B22222] hover:bg-red-50 hover:scale-[1.04] active:scale-95 dark:text-neutral-400 dark:hover:text-white dark:hover:bg-neutral-900"
                   }`}
                 >
-                  RFS
+                  Request for Supply
                 </button>
-
                 <button
                   onClick={() => onNavigate("canvass")}
                   className={`px-3 py-1.5 text-xs font-mono uppercase tracking-wider rounded transition-all duration-200 ${
@@ -445,21 +430,48 @@ export default function Header({
                       : "text-gray-600 hover:text-[#B22222] hover:bg-red-50 hover:scale-[1.04] active:scale-95 dark:text-neutral-400 dark:hover:text-white dark:hover:bg-neutral-900"
                   }`}
                 >
-                  Canvass
+                  Canvass Sheet
                 </button>
-
-                {(currentUser.role === UserRole.Administrator || currentUser.role === UserRole.PurchasingStaff) && (
-                  <button
-                    onClick={() => onNavigate("rfs-approval")}
-                    className={`px-3 py-1.5 text-xs font-mono uppercase tracking-wider rounded transition-all duration-200 ${
-                      currentTab === "rfs-approval"
-                        ? "bg-[#B22222] text-white shadow-[0_2px_8px_rgba(178,34,34,0.3)] scale-[1.03]"
-                        : "text-gray-600 hover:text-[#B22222] hover:bg-red-50 hover:scale-[1.04] active:scale-95 dark:text-neutral-400 dark:hover:text-white dark:hover:bg-neutral-900"
-                    }`}
-                  >
-                    RFS Approval
-                  </button>
-                )}
+                <button
+                  onClick={() => onNavigate("procurement-approval")}
+                  className={`px-3 py-1.5 text-xs font-mono uppercase tracking-wider rounded transition-all duration-200 ${
+                    currentTab === "procurement-approval"
+                      ? "bg-[#B22222] text-white shadow-[0_2px_8px_rgba(178,34,34,0.3)] scale-[1.03]"
+                      : "text-gray-600 hover:text-[#B22222] hover:bg-red-50 hover:scale-[1.04] active:scale-95 dark:text-neutral-400 dark:hover:text-white dark:hover:bg-neutral-900"
+                  }`}
+                >
+                  Procurement Approval
+                </button>
+                <button
+                  onClick={() => onNavigate("suppliers")}
+                  className={`px-3 py-1.5 text-xs font-mono uppercase tracking-wider rounded transition-all duration-200 ${
+                    currentTab === "suppliers"
+                      ? "bg-[#B22222] text-white shadow-[0_2px_8px_rgba(178,34,34,0.3)] scale-[1.03]"
+                      : "text-gray-600 hover:text-[#B22222] hover:bg-red-50 hover:scale-[1.04] active:scale-95 dark:text-neutral-400 dark:hover:text-white dark:hover:bg-neutral-900"
+                  }`}
+                >
+                  Supplier Registry
+                </button>
+                <button
+                  onClick={() => onNavigate("supplier-report")}
+                  className={`px-3 py-1.5 text-xs font-mono uppercase tracking-wider rounded transition-all duration-200 ${
+                    currentTab === "supplier-report"
+                      ? "bg-[#B22222] text-white shadow-[0_2px_8px_rgba(178,34,34,0.3)] scale-[1.03]"
+                      : "text-gray-600 hover:text-[#B22222] hover:bg-red-50 hover:scale-[1.04] active:scale-95 dark:text-neutral-400 dark:hover:text-white dark:hover:bg-neutral-900"
+                  }`}
+                >
+                  Supplier Summary
+                </button>
+                <button
+                  onClick={() => onNavigate("supplier-analytics")}
+                  className={`px-3 py-1.5 text-xs font-mono uppercase tracking-wider rounded transition-all duration-200 ${
+                    currentTab === "supplier-analytics"
+                      ? "bg-[#B22222] text-white shadow-[0_2px_8px_rgba(178,34,34,0.3)] scale-[1.03]"
+                      : "text-gray-600 hover:text-[#B22222] hover:bg-red-50 hover:scale-[1.04] active:scale-95 dark:text-neutral-400 dark:hover:text-white dark:hover:bg-neutral-900"
+                  }`}
+                >
+                  Supplier Analytics
+                </button>
               </>
             )}
 
@@ -473,7 +485,7 @@ export default function Header({
                       : "text-gray-600 hover:text-[#B22222] hover:bg-red-50 hover:scale-[1.04] active:scale-95 dark:text-neutral-400 dark:hover:text-white dark:hover:bg-neutral-900"
                   }`}
                 >
-                  Users
+                  User Accounts
                 </button>
                 <button
                   onClick={() => onNavigate("roles")}
@@ -483,7 +495,7 @@ export default function Header({
                       : "text-gray-600 hover:text-[#B22222] hover:bg-red-50 hover:scale-[1.04] active:scale-95 dark:text-neutral-400 dark:hover:text-white dark:hover:bg-neutral-900"
                   }`}
                 >
-                  Roles
+                  Security
                 </button>
                 <button
                   onClick={() => onNavigate("audit-logs")}
@@ -493,7 +505,7 @@ export default function Header({
                       : "text-gray-600 hover:text-[#B22222] hover:bg-red-50 hover:scale-[1.04] active:scale-95 dark:text-neutral-400 dark:hover:text-white dark:hover:bg-neutral-900"
                   }`}
                 >
-                  Audit Trail
+                  Audit Trail Logs
                 </button>
               </>
             )}

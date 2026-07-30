@@ -7,8 +7,9 @@ import React, { useState, useEffect } from "react";
 import { PurchaseOrder, Supplier, User, UserRole } from "../types";
 import { motion } from "motion/react";
 import { LineChart, Line, BarChart, Bar, Legend, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, Cell } from "recharts";
-import { FileText, ClipboardCheck, TrendingUp, Users, ArrowRight, Eye, RefreshCw, Calendar, CreditCard, Package, GitCompare } from "lucide-react";
+import { FileText, ClipboardCheck, TrendingUp, Users, ArrowRight, Eye, RefreshCw, Calendar, CreditCard, Package, GitCompare, UserCheck } from "lucide-react";
 import { api } from "../lib/api";
+import SystemMonitoringModule from "./SystemMonitoringModule";
 
 interface DashboardProps {
   pos: PurchaseOrder[];
@@ -271,6 +272,9 @@ export default function Dashboard({
 
   return (
     <div id="smei-dashboard" className="relative p-6 md:p-10 space-y-8 max-w-7xl mx-auto overflow-hidden">
+      {/* 1. System Resource & Storage Monitoring Section */}
+      <SystemMonitoringModule />
+
       {/* Welcome Banner */}
       <div className="flex flex-col md:flex-row md:items-center justify-between gap-4 bg-white dark:bg-neutral-900 p-6 rounded-2xl border border-gray-100 dark:border-neutral-800 shadow-sm relative z-10">
         <div>
@@ -392,6 +396,15 @@ export default function Dashboard({
         <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6">
           {[
             {
+              title: "Procurement Approval Hub",
+              desc: "Unified document-specific approval portal for PO, PIS, RFS, and Canvass Sheets.",
+              icon: UserCheck,
+              tab: "procurement-approval",
+              color: "border-l-rose-600",
+              iconColor: "text-rose-600",
+              badge: "Central Approval"
+            },
+            {
               title: "Purchase Order Registry",
               desc: "Create, view, manage, and process procurement contracts and purchase order worksheets.",
               icon: FileText,
@@ -417,15 +430,6 @@ export default function Dashboard({
               color: "border-l-blue-500",
               iconColor: "text-blue-500",
               badge: "Inventory"
-            },
-            {
-              title: "RFS Approval Queue",
-              desc: "Review, authorize, and approve pending Request for Supply transactions.",
-              icon: ClipboardCheck,
-              tab: "rfs-approval",
-              color: "border-l-emerald-500",
-              iconColor: "text-emerald-500",
-              badge: "Approvals"
             },
             {
               title: "Canvass Sheet Module",

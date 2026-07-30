@@ -12,21 +12,28 @@ import {
   X
 } from "lucide-react";
 import { exportExcelWithTemplate } from "../utils/templateExport";
-import { ExportExcelButton } from "./SharedButtons";
+import { getTsdExportFilename } from "../utils/tsdFilename";
+import { ExportExcelButton, CreateButton } from "./SharedButtons";
 import { validateManifestNumber } from "../utils/manifestHelper";
-import { formatControlNumber } from "../utils/controlNumber";
+import { formatControlNumber, normalizeControlNo } from "../utils/controlNumber";
+import { attachRecordToWorkflow, setActiveWorkflow, getActiveWorkflow, getAllWorkflows, WorkflowRecord } from "../utils/workflowManager";
+import { getHeavyPayload, saveHeavyPayload, deleteHeavyPayload, safeSetLocalStorage } from "../utils/heavyStorage";
+import { notificationRepository } from "../services/notificationRepository";
 
 interface ComplianceRecord {
   id: string;
+  workflowId?: string;
   caNumber: string;
   title: string;
   date: string;
   unloadingFileName?: string;
-  unloadingFileData?: string; // base64
+  unloadingFileData?: string; // base64 placeholder or data
   loadingFileName?: string;
-  loadingFileData?: string; // base64
+  loadingFileData?: string; // base64 placeholder or data
   createdAt: string;
 }
+
+const PLACEHOLDER_GIF = "data:image/gif;base64,R0lGODlhAQABAIAAAP///wAAACH5BAEAAAAALAAAAAABAAEAAAICRAEAOw==";
 
 export default function UnloadingLoadingModule() {
   const [compRecords, setCompRecords] = useState<ComplianceRecord[]>([]);
@@ -50,13 +57,40 @@ export default function UnloadingLoadingModule() {
   const [activeUnloadingData, setActiveUnloadingData] = useState<string>("");
   const [activeLoadingData, setActiveLoadingData] = useState<string>("");
 
+  const handleRecordSelect = (rec: ComplianceRecord) => {
+    setSelectedRecordId(rec.id);
+    const activeWf = getActiveWorkflow();
+    const allWorkflows = getAllWorkflows();
+    const code = rec.caNumber;
+
+    let targetWf = rec.workflowId ? allWorkflows.find((w) => w.id === rec.workflowId) : null;
+    if (!targetWf && code) {
+      targetWf = allWorkflows.find((w) => w.controlNo && normalizeControlNo(w.controlNo) === normalizeControlNo(code)) || null;
+    }
+
+    if (!targetWf) {
+      targetWf = attachRecordToWorkflow("unloading-loading", rec, code);
+    }
+
+    if (targetWf && targetWf.id) {
+      if (!activeWf || targetWf.id !== activeWf.id) {
+        setActiveWorkflow(targetWf.id, targetWf.controlNo);
+        window.dispatchEvent(new Event("tsd_data_changed"));
+        window.dispatchEvent(new Event("tsd_workflows_updated"));
+      }
+    }
+  };
+
   // Lazy-load data on selected record change
   useEffect(() => {
     if (selectedRecordId) {
       const rec = compRecords.find(r => r.id === selectedRecordId);
       if (rec) {
-        setActiveUnloadingData(localStorage.getItem(`tsd_unloading_data_${rec.id}`) || rec.unloadingFileData || "");
-        setActiveLoadingData(localStorage.getItem(`tsd_loading_data_${rec.id}`) || rec.loadingFileData || "");
+        const savedUnloading = getHeavyPayload(`tsd_unloading_data_${rec.id}`);
+        setActiveUnloadingData(savedUnloading || (rec.unloadingFileData !== PLACEHOLDER_GIF ? rec.unloadingFileData : "") || "");
+
+        const savedLoading = getHeavyPayload(`tsd_loading_data_${rec.id}`);
+        setActiveLoadingData(savedLoading || (rec.loadingFileData !== PLACEHOLDER_GIF ? rec.loadingFileData : "") || "");
       } else {
         setActiveUnloadingData("");
         setActiveLoadingData("");
@@ -77,30 +111,41 @@ export default function UnloadingLoadingModule() {
 
         parsed = parsed.map(rec => {
           let updated = false;
-          if (rec.unloadingFileData) {
-            localStorage.setItem(`tsd_unloading_data_${rec.id}`, rec.unloadingFileData);
+          if (rec.unloadingFileData && rec.unloadingFileData !== PLACEHOLDER_GIF) {
+            saveHeavyPayload(`tsd_unloading_data_${rec.id}`, rec.unloadingFileData);
             updated = true;
             migrated = true;
           }
-          if (rec.loadingFileData) {
-            localStorage.setItem(`tsd_loading_data_${rec.id}`, rec.loadingFileData);
+          if (rec.loadingFileData && rec.loadingFileData !== PLACEHOLDER_GIF) {
+            saveHeavyPayload(`tsd_loading_data_${rec.id}`, rec.loadingFileData);
             updated = true;
             migrated = true;
           }
           if (updated) {
-            const { unloadingFileData, loadingFileData, ...rest } = rec;
-            return rest;
+            return {
+              ...rec,
+              unloadingFileData: rec.unloadingFileName ? PLACEHOLDER_GIF : undefined,
+              loadingFileData: rec.loadingFileName ? PLACEHOLDER_GIF : undefined
+            };
           }
           return rec;
         });
 
         if (migrated) {
-          localStorage.setItem("tsd_compliance_records", JSON.stringify(parsed));
+          safeSetLocalStorage("tsd_compliance_records", JSON.stringify(parsed));
         }
 
         setCompRecords(parsed);
         if (parsed.length > 0) {
-          setSelectedRecordId(parsed[0].id);
+          const activeWf = getActiveWorkflow();
+          const match = activeWf
+            ? parsed.find(
+                (r) =>
+                  r.workflowId === activeWf.id ||
+                  (activeWf.controlNo && r.caNumber && normalizeControlNo(r.caNumber) === normalizeControlNo(activeWf.controlNo))
+              )
+            : null;
+          setSelectedRecordId(match ? match.id : parsed[0].id);
         }
       } catch (e) {
         console.error("Failed to parse compliance records", e);
@@ -113,19 +158,35 @@ export default function UnloadingLoadingModule() {
           title: "Inbound Acid Digestion Consignment Checklist",
           date: new Date().toISOString().split("T")[0],
           unloadingFileName: "inbound_leak_test_report.pdf",
+          unloadingFileData: PLACEHOLDER_GIF,
           loadingFileName: "treated_ash_consignment_receipt.pdf",
+          loadingFileData: PLACEHOLDER_GIF,
           createdAt: new Date().toLocaleDateString() + " 10:00 AM"
         }
       ];
       setCompRecords(initial);
       setSelectedRecordId(initial[0].id);
-      localStorage.setItem("tsd_compliance_records", JSON.stringify(initial));
+      safeSetLocalStorage("tsd_compliance_records", JSON.stringify(initial));
     }
   }, []);
 
   const saveCompToStorage = (updated: ComplianceRecord[]) => {
-    setCompRecords(updated);
-    localStorage.setItem("tsd_compliance_records", JSON.stringify(updated));
+    // Keep metadata registry lightweight by replacing binary payloads with PLACEHOLDER_GIF
+    const sanitized = updated.map(rec => ({
+      ...rec,
+      unloadingFileData: rec.unloadingFileName ? PLACEHOLDER_GIF : undefined,
+      loadingFileData: rec.loadingFileName ? PLACEHOLDER_GIF : undefined
+    }));
+
+    setCompRecords(sanitized);
+    safeSetLocalStorage("tsd_compliance_records", JSON.stringify(sanitized));
+    if (sanitized && sanitized.length > 0 && sanitized[0].caNumber) {
+      safeSetLocalStorage("tsd_active_control_no", sanitized[0].caNumber.toUpperCase());
+    }
+
+    window.dispatchEvent(new Event("tsd_data_changed"));
+    window.dispatchEvent(new Event("tsd_workflows_updated"));
+    window.dispatchEvent(new Event("tsd_storage_updated"));
   };
 
   const processUnloadingFile = (file: File) => {
@@ -222,13 +283,18 @@ export default function UnloadingLoadingModule() {
     }
   };
 
-  const handleCreateNew = () => {
+  const handleCloseModal = () => {
+    setIsModalOpen(false);
     setEditingRecord(null);
     setCompCA("");
     setCompUnloadingFileName("");
     setCompUnloadingData("");
     setCompLoadingFileName("");
     setCompLoadingData("");
+  };
+
+  const handleCreateNew = () => {
+    handleCloseModal();
     setIsModalOpen(true);
   };
 
@@ -240,63 +306,88 @@ export default function UnloadingLoadingModule() {
     }
 
     let updatedDocs = [...compRecords];
+    const recordId = editingRecord ? editingRecord.id : `comp-${Date.now()}`;
+
+    // Store binary payloads separately in heavy storage (IndexedDB + memory cache)
+    if (compUnloadingData && compUnloadingData !== PLACEHOLDER_GIF) {
+      saveHeavyPayload(`tsd_unloading_data_${recordId}`, compUnloadingData);
+    }
+    if (compLoadingData && compLoadingData !== PLACEHOLDER_GIF) {
+      saveHeavyPayload(`tsd_loading_data_${recordId}`, compLoadingData);
+    }
+
+    let targetRecord: ComplianceRecord;
+    let targetWf: WorkflowRecord;
 
     if (editingRecord) {
       // Edit mode
-      if (compUnloadingData && compUnloadingData !== editingRecord.unloadingFileData) {
-        localStorage.setItem(`tsd_unloading_data_${editingRecord.id}`, compUnloadingData);
+      targetRecord = {
+        ...editingRecord,
+        caNumber: compCA.toUpperCase(),
+        unloadingFileName: compUnloadingFileName || editingRecord.unloadingFileName,
+        unloadingFileData: compUnloadingFileName ? PLACEHOLDER_GIF : undefined,
+        loadingFileName: compLoadingFileName || editingRecord.loadingFileName,
+        loadingFileData: compLoadingFileName ? PLACEHOLDER_GIF : undefined
+      };
+      try {
+        targetWf = attachRecordToWorkflow("unloading-loading", targetRecord, targetRecord.caNumber);
+      } catch (err: any) {
+        alert(err.message || "No active workflow is selected. Please select or create a workflow before saving this document.");
+        return;
       }
-      if (compLoadingData && compLoadingData !== editingRecord.loadingFileData) {
-        localStorage.setItem(`tsd_loading_data_${editingRecord.id}`, compLoadingData);
-      }
-
-      updatedDocs = compRecords.map(r => {
-        if (r.id === editingRecord.id) {
-          return {
-            ...r,
-            caNumber: compCA.toUpperCase(),
-            unloadingFileName: compUnloadingFileName || r.unloadingFileName,
-            loadingFileName: compLoadingFileName || r.loadingFileName
-          };
-        }
-        return r;
-      });
+      updatedDocs = compRecords.map(r => r.id === editingRecord.id ? targetRecord : r);
       saveCompToStorage(updatedDocs);
       setSelectedRecordId(editingRecord.id);
     } else {
       // New record
-      const newRecordId = `comp-${Date.now()}`;
-      if (compUnloadingData) {
-        localStorage.setItem(`tsd_unloading_data_${newRecordId}`, compUnloadingData);
-      }
-      if (compLoadingData) {
-        localStorage.setItem(`tsd_loading_data_${newRecordId}`, compLoadingData);
-      }
-
-      const newRec: ComplianceRecord = {
-        id: newRecordId,
+      targetRecord = {
+        id: recordId,
         caNumber: compCA.toUpperCase(),
         title: "Geotagged Loading and Unloading Photograph Record",
         date: new Date().toISOString().split("T")[0],
-        unloadingFileName: compUnloadingFileName,
-        loadingFileName: compLoadingFileName,
+        unloadingFileName: compUnloadingFileName || undefined,
+        unloadingFileData: compUnloadingFileName ? PLACEHOLDER_GIF : undefined,
+        loadingFileName: compLoadingFileName || undefined,
+        loadingFileData: compLoadingFileName ? PLACEHOLDER_GIF : undefined,
         createdAt: new Date().toLocaleDateString() + " " + new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
       };
-      updatedDocs = [newRec, ...compRecords];
+      try {
+        targetWf = attachRecordToWorkflow("unloading-loading", targetRecord, targetRecord.caNumber);
+      } catch (err: any) {
+        alert(err.message || "No active workflow is selected. Please select or create a workflow before saving this document.");
+        return;
+      }
+      updatedDocs = [targetRecord, ...compRecords];
       saveCompToStorage(updatedDocs);
-      setSelectedRecordId(newRec.id);
+      setSelectedRecordId(targetRecord.id);
     }
 
-    setIsModalOpen(false);
+    notificationRepository.createNotification({
+      portal: "TSD",
+      module: "unloading-loading",
+      workflowId: targetWf.id,
+      documentId: targetRecord.id,
+      documentNumber: targetRecord.caNumber,
+      title: editingRecord ? "Unloading / Loading Record Updated" : "Unloading / Loading Record Completed",
+      message: `Unloading/Loading photograph record ${editingRecord ? 'updated' : 'saved'} for Workflow ${targetWf.workflowCode || targetWf.id} (Control No: ${compCA.toUpperCase()}).`,
+      priority: "MEDIUM"
+    }).catch(() => {});
+
+    handleCloseModal();
   };
 
   const handleEditComp = (record: ComplianceRecord) => {
     setEditingRecord(record);
     setCompCA((record.caNumber || "").toUpperCase());
+    
     setCompUnloadingFileName(record.unloadingFileName || "");
-    setCompUnloadingData(localStorage.getItem(`tsd_unloading_data_${record.id}`) || record.unloadingFileData || "");
+    const savedUnloading = getHeavyPayload(`tsd_unloading_data_${record.id}`);
+    setCompUnloadingData(savedUnloading || (record.unloadingFileData !== PLACEHOLDER_GIF ? record.unloadingFileData : "") || "");
+
     setCompLoadingFileName(record.loadingFileName || "");
-    setCompLoadingData(localStorage.getItem(`tsd_loading_data_${record.id}`) || record.loadingFileData || "");
+    const savedLoading = getHeavyPayload(`tsd_loading_data_${record.id}`);
+    setCompLoadingData(savedLoading || (record.loadingFileData !== PLACEHOLDER_GIF ? record.loadingFileData : "") || "");
+
     setIsModalOpen(true);
   };
 
@@ -305,13 +396,13 @@ export default function UnloadingLoadingModule() {
     if (confirm("Are you sure you want to permanently delete this unloading/loading compliance record?")) {
       const updated = compRecords.filter(r => r.id !== id);
       saveCompToStorage(updated);
-      localStorage.removeItem(`tsd_unloading_data_${id}`);
-      localStorage.removeItem(`tsd_loading_data_${id}`);
+      deleteHeavyPayload(`tsd_unloading_data_${id}`);
+      deleteHeavyPayload(`tsd_loading_data_${id}`);
       if (selectedRecordId === id) {
         setSelectedRecordId(updated.length > 0 ? updated[0].id : null);
       }
       if (editingRecord?.id === id) {
-        setEditingRecord(null);
+        handleCloseModal();
       }
     }
   };
@@ -319,19 +410,24 @@ export default function UnloadingLoadingModule() {
   const handleExportExcel = async (record: ComplianceRecord) => {
     try {
       const FALLBACK_1X1_PNG = "data:image/png;base64,iVBOR000KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNkYAAAAAYAAjCB0C8AAAAASUVORK5CYII=";
+      const unloadingPayload = getHeavyPayload(`tsd_unloading_data_${record.id}`) || (record.unloadingFileData !== PLACEHOLDER_GIF ? record.unloadingFileData : "") || FALLBACK_1X1_PNG;
+      const loadingPayload = getHeavyPayload(`tsd_loading_data_${record.id}`) || (record.loadingFileData !== PLACEHOLDER_GIF ? record.loadingFileData : "") || FALLBACK_1X1_PNG;
+
       const exportData = {
         CONTROL_NO: record.caNumber,
         CA_NO: record.caNumber,
-        UNLOADING_IMAGE: localStorage.getItem(`tsd_unloading_data_${record.id}`) || record.unloadingFileData || FALLBACK_1X1_PNG,
-        LOADING_IMAGE: localStorage.getItem(`tsd_loading_data_${record.id}`) || record.loadingFileData || FALLBACK_1X1_PNG
+        UNLOADING_IMAGE: unloadingPayload,
+        LOADING_IMAGE: loadingPayload
       };
+
+      const exportFileName = getTsdExportFilename("unloading-loading", record.date || record.createdAt, "xlsm");
 
       await exportExcelWithTemplate(
         "UNLOADING_LOADING_TEMPLATE.xlsm",
         exportData,
         "items",
         [],
-        `${record.caNumber}_UNLOADING_LOADING.xlsm`
+        exportFileName
       );
     } catch (err) {
       console.error("Excel Export failed", err);
@@ -388,13 +484,10 @@ export default function UnloadingLoadingModule() {
       {/* Standard Management Toolbar */}
       <div className="bg-white dark:bg-slate-900 p-4 rounded-xl border border-gray-100 dark:border-slate-800 shadow-sm flex flex-col sm:flex-row sm:items-center justify-between gap-4">
         <div className="flex flex-wrap items-center gap-2">
-          <button
+          <CreateButton
             onClick={handleCreateNew}
-            className="bg-smei-crimson hover:bg-smei-darkred text-white text-xs font-semibold h-[38px] px-4 rounded-lg flex items-center justify-center gap-1.5 shadow-sm transition-all hover:scale-[1.02] active:scale-95 cursor-pointer"
-          >
-            <Plus className="w-4 h-4" />
-            <span>+ New Unloading / Loading Log</span>
-          </button>
+            label="+ New Unloading / Loading Log"
+          />
 
           <ExportExcelButton
             onClick={handleExportExcelSelected}
@@ -455,7 +548,7 @@ export default function UnloadingLoadingModule() {
                     filteredComp.map((rec, index) => (
                       <tr
                         key={rec.id}
-                        onClick={() => setSelectedRecordId(rec.id)}
+                        onClick={() => handleRecordSelect(rec)}
                         onDoubleClick={() => handleEditComp(rec)}
                         className={`cursor-pointer transition-all group ${
                           selectedRecordId === rec.id
@@ -514,7 +607,15 @@ export default function UnloadingLoadingModule() {
                   ) : (
                     <tr>
                       <td colSpan={5} className="py-12 text-center text-gray-400 dark:text-slate-500">
-                        No records found. Click "+ New Unloading / Loading Log" to create a new record.
+                        <span>No records found. Click </span>
+                        <button
+                          type="button"
+                          onClick={handleCreateNew}
+                          className="text-smei-crimson dark:text-rose-400 font-bold hover:underline cursor-pointer inline-flex items-center gap-1 mx-1"
+                        >
+                          + New Unloading / Loading Log
+                        </button>
+                        <span> to create a new record.</span>
                       </td>
                     </tr>
                   )}
@@ -638,16 +739,17 @@ export default function UnloadingLoadingModule() {
 
       {/* Form Dialog Modal */}
       {isModalOpen && (
-        <div className="fixed inset-0 z-50 bg-slate-950/60 backdrop-blur-xs flex items-center justify-center p-4">
+        <div className="fixed inset-0 z-[100] bg-slate-950/60 backdrop-blur-xs flex items-center justify-center p-4">
           <div className="bg-white dark:bg-slate-900 rounded-xl shadow-xl border border-gray-100 dark:border-slate-800 max-w-lg w-full overflow-hidden animate-fadeIn flex flex-col max-h-[90vh]">
             
             {/* Modal Header */}
             <div className="p-4 border-b border-gray-100 dark:border-slate-800 flex items-center justify-between">
               <h3 className="text-sm font-bold text-gray-800 dark:text-slate-200 font-display flex items-center gap-1.5 uppercase tracking-wider">
-                <span>NEW UNLOADING/LOADING LOG</span>
+                <span>{editingRecord ? "EDIT UNLOADING/LOADING LOG" : "NEW UNLOADING/LOADING LOG"}</span>
               </h3>
               <button 
-                onClick={() => setIsModalOpen(false)}
+                type="button"
+                onClick={handleCloseModal}
                 className="text-gray-400 hover:text-gray-600 dark:hover:text-slate-200 p-1 rounded-full hover:bg-gray-50 dark:hover:bg-slate-800 cursor-pointer"
               >
                 <X className="w-4 h-4" />
@@ -848,7 +950,7 @@ export default function UnloadingLoadingModule() {
               <div className="flex gap-2 pt-2 border-t border-gray-100 dark:border-slate-800">
                 <button
                   type="button"
-                  onClick={() => setIsModalOpen(false)}
+                  onClick={handleCloseModal}
                   className="flex-1 border border-gray-200 dark:border-slate-800 hover:bg-gray-50 dark:hover:bg-slate-800 text-slate-700 dark:text-slate-300 text-xs font-semibold h-[38px] rounded-lg cursor-pointer"
                 >
                   Cancel

@@ -9,7 +9,7 @@ import { api } from "../lib/api";
 import { Search, Plus, Trash2, Edit3, Eye, FileText, X, Calculator, PlusCircle } from "lucide-react";
 import { exportWordWithTemplate, exportExcelWithTemplate } from "../utils/templateExport";
 import { mapCanvassData } from "../utils/templateMapping";
-import { ExportWordButton, CreateButton, ExportPdfButton } from "./SharedButtons";
+import { ExportWordButton, CreateButton } from "./SharedButtons";
 import { TableSkeleton } from "./ui/Skeleton";
 
 interface CanvassModuleProps {
@@ -608,20 +608,6 @@ export default function CanvassSheetModule({ currentUser }: CanvassModuleProps) 
     handleExport(active, "word");
   };
 
-  const handleTriggerPDFExport = async () => {
-    const active = sheets.find((s) => s.id === activeSheetId);
-    if (active) {
-      try {
-        const { printDocument } = await import("../utils/printDocument");
-        await printDocument("canvass", active);
-      } catch (err: any) {
-        alert("Failed to print: " + (err.message || err));
-      }
-    } else {
-      alert("Please select a Canvass Sheet first.");
-    }
-  };
-
   return (
     <div id="smei-canvass-list" className="p-4 md:p-6 space-y-4 max-w-[130rem] mx-auto w-full">
       {/* Upper Action Bar */}
@@ -642,14 +628,6 @@ export default function CanvassSheetModule({ currentUser }: CanvassModuleProps) 
           )}
 
           <div className="flex flex-wrap items-center gap-2 w-full sm:w-auto justify-end">
-            <ExportWordButton
-              onClick={handleExportWord}
-              disabled={!activeSheetId}
-            />
-            <ExportPdfButton
-              onClick={handleTriggerPDFExport}
-              disabled={!activeSheetId}
-            />
             {isAuthorized && (
               <CreateButton onClick={() => handleOpenModal(null)} label="Create Canvass" />
             )}
@@ -760,14 +738,6 @@ export default function CanvassSheetModule({ currentUser }: CanvassModuleProps) 
                               <Edit3 className="w-4 h-4" />
                             </button>
                           )}
-
-                          <button
-                            onClick={() => handleExport(sheet, "word")}
-                            className="p-1 hover:bg-indigo-50 hover:text-indigo-600 text-gray-400 rounded transition-all"
-                            title="Export to Word"
-                          >
-                            <FileText className="w-4 h-4" />
-                          </button>
 
                           {isAuthorized && (
                             <button

@@ -218,7 +218,7 @@ export const exportPOToWord = async (po: PurchaseOrder) => {
     return totalLines;
   };
 
-  const formattedPurpose = po.purpose ?? "";
+  const formattedPurpose = (po.purpose ?? "").toUpperCase();
 
   // 2. CURRENCY ALIGNMENT & MULTI-LINE ITEMS FORMATTING
   const itemsCount = po.items.length;
@@ -311,55 +311,8 @@ export const exportPOToWord = async (po: PurchaseOrder) => {
     }
   }
 
-  // Define exportData block for rendering
-  const exportData = {
-    DOCUMENT_NO: "FM-PPD-03",
-    RFS_NO: rfsNo,
-    SUPPLIER_NAME: po.supplierName ?? "",
-    PO_NUMBER: po.poNumber ?? "",
-    ATTENTION: po.attention ?? "",
-    PO_DATE: formatDate(po.poDate) ?? "",
-    TEL_FAX: `${po.telNo ?? ""} ${po.faxNo ? `/ ${po.faxNo}` : ""}`.trim() || "",
-    DELIVERY_DATE: formatDate(po.deliveryDate) ?? "",
-    PURPOSE: formattedPurpose,
-    CATEGORY: po.category ?? "Vatable",
-
-    QUANTITY,
-    UNIT,
-    DESCRIPTION,
-    UNIT_PRICE,
-    AMOUNT,
-
-    items,
-
-    VATABLE_AMOUNT: po.category?.toLowerCase().includes("vatable") ? formatCurrency(po.vatableAmount, symbol) : "",
-    VAT_AMOUNT: po.category?.toLowerCase().includes("vatable") ? formatCurrency(po.vat12, symbol) : "",
-    VAT_EXEMPT_AMOUNT: po.category?.toLowerCase().includes("exempt") ? formatCurrency(po.vatExemptAmount, symbol) : "",
-    ZERO_RATED_AMOUNT: po.category?.toLowerCase().includes("zero") ? formatCurrency(po.zeroRatedAmount, symbol) : "",
-    TOTAL_AMOUNT: formatCurrency(po.totalAmount, symbol),
-    GROSS_AMOUNT: formatCurrency(po.grossAmount || po.totalAmount, symbol),
-    PARTS_EWT: (po.partsEwt1 && po.partsEwt1 > 0) ? formatCurrency(po.partsEwt1, symbol) : "",
-    LABOR_EWT: (po.laborEwt2 && po.laborEwt2 > 0) ? formatCurrency(po.laborEwt2, symbol) : "",
-    EWT_TYPE: po.ewtType ?? "",
-    EWT_PERCENTAGE: (po.ewtPercentage !== undefined && po.ewtPercentage !== null) ? `${po.ewtPercentage}%` : "",
-    DISCOUNT_VAT_AMOUNT: (po.discountVatAmount && po.discountVatAmount > 0) ? formatCurrency(po.discountVatAmount, symbol) : "",
-
-    PAYMENT_TERMS: po.paymentTerms ?? "N/A",
-    WORK_DURATION: po.workDuration ?? "N/A",
-    WARRANTY: po.warranty ?? "N/A",
-
-    PREPARED_BY: prepared.name,
-    PREPARED_BY_POSITION: prepared.position,
-    APPROVED_BY: approved.name,
-    APPROVED_BY_POSITION: approved.position,
-    CHECKED_BY: checked.name,
-    CHECKED_BY_POSITION: checked.position,
-
-    VERIFIED_BY1,
-    VERIFIED_BY_POSITION1,
-    VERIFIED_BY2,
-    VERIFIED_BY_POSITION2,
-  };
+  const { mapPOData } = await import("./templateMapping");
+  const exportData = mapPOData(po);
 
   // Log export action asynchronously to match audit trail behavior
   try {

@@ -1,35 +1,33 @@
 import React, { useState, useEffect } from "react";
 import { 
   Plus, 
-  ArrowRight, 
-  ClipboardList, 
   Search, 
   Trash2, 
   Edit, 
   X, 
   CheckCircle, 
   FileSpreadsheet, 
-  UploadCloud, 
   FileText, 
-  Eye, 
-  Save,
-  Calendar,
-  User,
-  Info,
   AlertCircle,
   ArrowUp,
   ArrowDown,
+  ChevronDown,
   Shield,
-  Trash
+  Layers
 } from "lucide-react";
 import { exportExcelWithTemplate } from "../utils/templateExport";
-import { formatControlNumber } from "../utils/controlNumber";
+import { getTsdExportFilename } from "../utils/tsdFilename";
+import { formatControlNumber, validateControlNumber, getTrackingCode, normalizeControlNo } from "../utils/controlNumber";
+import { RcNumberInput } from "./RcNumberInput";
+import { attachRecordToWorkflow, setActiveWorkflow, getActiveWorkflow, getAllWorkflows, WorkflowRecord } from "../utils/workflowManager";
+import { notificationRepository } from "../services/notificationRepository";
+import { safeSetLocalStorage } from "../utils/heavyStorage";
 
 export function formatQuantityDisplay(qty: any): string {
   if (qty === null || qty === undefined || String(qty).trim() === "") return "-";
   const num = Number(qty);
   if (isNaN(num)) return String(qty).trim() || "-";
-  return String(num);
+  return num.toFixed(5);
 }
 
 // Self-contained IndexedDB utility inside WasteMovementModule.tsx
@@ -92,31 +90,108 @@ async function deleteFileFromIndexedDB(key: string): Promise<void> {
 }
 
 export interface WasteMovementMethodEntry {
-  method: string; // "Export for recovery", "Disposal", or "Recycling/Recovery"
-  quantity: number; // in MT
+  method: string;
+  quantity: number;
   destination: string;
   remarks?: string;
 }
 
 export interface WasteMovementRecord {
   id: string;
+  breakdownId: string;
+  breakdownManifestNo: string;
+  controlNo?: string;
+  caNumber?: string;
+  breakdownClient: string;
+  breakdownDate: string;
   transportDate: string; // YYYY-MM-DD
   crdNo: string;
   rcNo: string;
   signedBy: string;
   notedBy: string;
-  sourceFileName: string;
+  sourceFileName: string; // COA Document
   sourceFileData: string; // Base64
-  methods: WasteMovementMethodEntry[];
-  totalQty: number; // dynamic sum of method quantities
+  quantity1: number; // Export for recovery (MT)
+  quantity2: number; // Disposal (MT)
+  quantity3: number; // Recycling/Recovery (MT)
+  totalQty: number;  // Computed sum of quantity1 + quantity2 + quantity3
   dateTime: string;
   status: string; // "Completed" etc.
+  methods?: WasteMovementMethodEntry[]; // Legacy compatibility
+  workflowId?: string;
+}
+
+// Compute authoritative quantities from Hazardous Waste Breakdown record
+export function computeBreakdownQuantities(breakdown: any) {
+  if (!breakdown) {
+    return { quantity1: 0, quantity2: 0, quantity3: 0, totalQty: 0 };
+  }
+
+  let totalHazKg = 0;
+  let totalTsdKg = 0;
+  let totalNonHazKg = 0;
+
+  if (Array.isArray(breakdown.items) && breakdown.items.length > 0) {
+    totalHazKg = breakdown.items.reduce((sum: number, item: any) => sum + (Number(item.haz_waste) || 0), 0);
+    totalTsdKg = breakdown.items.reduce((sum: number, item: any) => sum + (Number(item.local_tsd) || 0), 0);
+    totalNonHazKg = breakdown.items.reduce((sum: number, item: any) => sum + (Number(item.non_haz) || 0), 0);
+  } else {
+    totalHazKg = Number(breakdown.totalHaz ?? breakdown.totalHazWaste ?? breakdown.haz_waste ?? (breakdown.quantity1 ? breakdown.quantity1 * 1000 : 0));
+    totalTsdKg = Number(breakdown.totalTsd ?? breakdown.totalLocalTsd ?? breakdown.local_tsd ?? (breakdown.quantity2 ? breakdown.quantity2 * 1000 : 0));
+    totalNonHazKg = Number(breakdown.totalNonHaz ?? breakdown.non_haz ?? (breakdown.quantity3 ? breakdown.quantity3 * 1000 : 0));
+  }
+
+  // QUANTITY_1 = TOTAL_HAZ_WASTE ÷ 1000 (Conversion to Metric Tons only, no business rounding)
+  // QUANTITY_2 = TOTAL_LOCAL_TSD ÷ 1000
+  // QUANTITY_3 = TOTAL_NON_HAZ ÷ 1000
+  const qty1 = totalHazKg / 1000;
+  const qty2 = totalTsdKg / 1000;
+  const qty3 = totalNonHazKg / 1000;
+
+  // TOTAL_QTY = QUANTITY_1 + QUANTITY_2 + QUANTITY_3 (direct sum)
+  const totalQty = Number((qty1 + qty2 + qty3).toFixed(5));
+
+  return {
+    quantity1: qty1,
+    quantity2: qty2,
+    quantity3: qty3,
+    totalQty: totalQty
+  };
+}
+
+// Helper function to determine if RC Number is required based on breakdown contents
+export function requiresRcNumber(breakdown: any): boolean {
+  if (!breakdown) return false;
+
+  // If breakdown has items array (raw breakdown object)
+  if (Array.isArray(breakdown.items)) {
+    const totalTsdKg = breakdown.items.reduce((sum: number, item: any) => sum + (Number(item.local_tsd) || 0), 0);
+    const totalNonHazKg = breakdown.items.reduce((sum: number, item: any) => sum + (Number(item.non_haz) || 0), 0);
+    return totalTsdKg > 0 || totalNonHazKg > 0;
+  }
+
+  // Check calculated or direct properties
+  const totalLocalTsd = Number(
+    breakdown.totalLocalTsd ??
+    breakdown.quantity2 ??
+    breakdown.totalTsd ??
+    breakdown.local_tsd ??
+    0
+  );
+  const totalNonHaz = Number(
+    breakdown.totalNonHaz ??
+    breakdown.quantity3 ??
+    breakdown.non_haz ??
+    0
+  );
+
+  return totalLocalTsd > 0 || totalNonHaz > 0;
 }
 
 export default function WasteMovementModule() {
   const [movements, setMovements] = useState<WasteMovementRecord[]>([]);
+  const [breakdownRecords, setBreakdownRecords] = useState<any[]>([]);
   const [searchTerm, setSearchTerm] = useState("");
-  const [methodFilter, setMethodFilter] = useState("All");
   const [selectedMovementId, setSelectedMovementId] = useState<string | null>(null);
 
   // Sorting state
@@ -128,20 +203,49 @@ export default function WasteMovementModule() {
   const [editingRecordId, setEditingRecordId] = useState<string | null>(null);
 
   // Modal Form Fields
+  const [formBreakdownId, setFormBreakdownId] = useState("");
+  const [formBreakdownDetails, setFormBreakdownDetails] = useState<any | null>(null);
+  const [isBreakdownDropdownOpen, setIsBreakdownDropdownOpen] = useState(false);
+  const [breakdownSearchQuery, setBreakdownSearchQuery] = useState("");
+  const breakdownDropdownRef = React.useRef<HTMLDivElement>(null);
+
+  // Auto-selection state
+  const [isAutoSelected, setIsAutoSelected] = useState(false);
+  const [autoSelectedControlNo, setAutoSelectedControlNo] = useState("");
+
+  const [formQuantity1, setFormQuantity1] = useState(0);
+  const [formQuantity2, setFormQuantity2] = useState(0);
+  const [formQuantity3, setFormQuantity3] = useState(0);
+  const [formTotalQty, setFormTotalQty] = useState(0);
+
   const [formTransportDate, setFormTransportDate] = useState("");
   const [formCrdNo, setFormCrdNo] = useState("");
-  const [formRcNo, setFormRcNo] = useState("");
+  const [formRcNo, setFormRcNo] = useState("N/A");
+  const [rcError, setRcError] = useState("");
   const [formSignedBy, setFormSignedBy] = useState("ENGR. MARY ANN PEDROSO");
   const [formNotedBy, setFormNotedBy] = useState("APRILYN ROGADOR");
-  const [formMethods, setFormMethods] = useState<WasteMovementMethodEntry[]>([]);
   const [formSourceFileName, setFormSourceFileName] = useState("");
   const [formSourceFileData, setFormSourceFileData] = useState("");
 
-  // Inner form "Add Method" state
-  const [selectedMethod, setSelectedMethod] = useState("");
-  const [methodQty, setMethodQty] = useState<number | "">("");
-  const [methodDest, setMethodDest] = useState("");
-  const [methodRemarks, setMethodRemarks] = useState("");
+  // Close breakdown dropdown on click outside
+  useEffect(() => {
+    const handleClickOutside = (event: MouseEvent) => {
+      if (breakdownDropdownRef.current && !breakdownDropdownRef.current.contains(event.target as Node)) {
+        setIsBreakdownDropdownOpen(false);
+      }
+    };
+    document.addEventListener("mousedown", handleClickOutside);
+    return () => document.removeEventListener("mousedown", handleClickOutside);
+  }, []);
+
+  // Real-time synchronization event listener
+  useEffect(() => {
+    const handleDataChanged = () => {
+      loadBreakdownRecords();
+    };
+    window.addEventListener("tsd_data_changed", handleDataChanged);
+    return () => window.removeEventListener("tsd_data_changed", handleDataChanged);
+  }, []);
 
   // Warnings / Error messages
   const [showFileWarning, setShowFileWarning] = useState(false);
@@ -163,6 +267,46 @@ export default function WasteMovementModule() {
 
   const [isExportingPdf, setIsExportingPdf] = useState(false);
 
+  // Load Breakdown records from localStorage
+  const loadBreakdownRecords = () => {
+    const saved = localStorage.getItem("tsd_hazwaste_records");
+    if (saved) {
+      try {
+        setBreakdownRecords(JSON.parse(saved));
+      } catch (e) {
+        console.error("Failed to parse hazardous waste breakdown records", e);
+      }
+    }
+  };
+
+  useEffect(() => {
+    loadBreakdownRecords();
+  }, []);
+
+  const handleMovementSelect = (rec: WasteMovementRecord) => {
+    setSelectedMovementId(rec.id);
+    const activeWf = getActiveWorkflow();
+    const allWorkflows = getAllWorkflows();
+    const code = rec.controlNo || rec.caNumber || rec.breakdownManifestNo;
+
+    let targetWf = rec.workflowId ? allWorkflows.find((w) => w.id === rec.workflowId) : null;
+    if (!targetWf && code) {
+      targetWf = allWorkflows.find((w) => w.controlNo && normalizeControlNo(w.controlNo) === normalizeControlNo(code)) || null;
+    }
+
+    if (!targetWf) {
+      targetWf = attachRecordToWorkflow("waste-movement", rec, code);
+    }
+
+    if (targetWf && targetWf.id) {
+      if (!activeWf || targetWf.id !== activeWf.id) {
+        setActiveWorkflow(targetWf.id, targetWf.controlNo);
+        window.dispatchEvent(new Event("tsd_data_changed"));
+        window.dispatchEvent(new Event("tsd_workflows_updated"));
+      }
+    }
+  };
+
   // Load ledger from local storage on mount
   useEffect(() => {
     const saved = localStorage.getItem("tsd_waste_movements");
@@ -171,7 +315,17 @@ export default function WasteMovementModule() {
         const parsed = JSON.parse(saved) as WasteMovementRecord[];
         setMovements(parsed);
         if (parsed.length > 0) {
-          setSelectedMovementId(parsed[0].id);
+          const activeWf = getActiveWorkflow();
+          const match = activeWf
+            ? parsed.find(
+                (r: any) =>
+                  r.workflowId === activeWf.id ||
+                  (activeWf.controlNo &&
+                    (r.controlNo || r.caNumber || r.breakdownManifestNo) &&
+                    normalizeControlNo(r.controlNo || r.caNumber || r.breakdownManifestNo) === normalizeControlNo(activeWf.controlNo))
+              )
+            : null;
+          setSelectedMovementId(match ? match.id : parsed[0].id);
         }
       } catch (e) {
         console.error("Failed to load waste movements", e);
@@ -180,51 +334,23 @@ export default function WasteMovementModule() {
       const initial: WasteMovementRecord[] = [
         {
           id: "wm-1",
+          breakdownId: "MAN-2026-018",
+          breakdownManifestNo: "M-R4A-2026-07-0028",
+          breakdownClient: "Cavite Semiconductor Corp.",
+          breakdownDate: "2026-07-13",
           transportDate: "2026-07-13",
           crdNo: "CRD-06-1309-26",
           rcNo: "N/A",
           signedBy: "ENGR. MARY ANN PEDROSO",
           notedBy: "APRILYN ROGADOR",
-          sourceFileName: "Delivery_Slip_048.pdf",
+          sourceFileName: "COA_Delivery_Slip_048.pdf",
           sourceFileData: "data:application/pdf;base64,JVBERi0xLjQK...", 
-          totalQty: 2.974,
+          quantity1: 0,
+          quantity2: 3.600,
+          quantity3: 0.900,
+          totalQty: 4.500,
           dateTime: "2026-07-13 09:15 AM",
-          status: "Completed",
-          methods: [
-            {
-              method: "Export for recovery",
-              quantity: 2.974,
-              destination: "Off-shore Treater",
-              remarks: "Original Delivery Slip"
-            }
-          ]
-        },
-        {
-          id: "wm-2",
-          transportDate: "2026-07-15",
-          crdNo: "CRD-07-1422-26",
-          rcNo: "RC-2026-T1",
-          signedBy: "ENGR. MARY ANN PEDROSO",
-          notedBy: "APRILYN ROGADOR",
-          sourceFileName: "Receipt_991.png",
-          sourceFileData: "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==",
-          totalQty: 6.342,
-          dateTime: "2026-07-15 11:30 AM",
-          status: "Completed",
-          methods: [
-            {
-              method: "Export for recovery",
-              quantity: 2.974,
-              destination: "Off-shore Treater",
-              remarks: "Batch loaded"
-            },
-            {
-              method: "Disposal",
-              quantity: 3.368,
-              destination: "Disposal by SMEI",
-              remarks: "Disposed"
-            }
-          ]
+          status: "Completed"
         }
       ];
       setMovements(initial);
@@ -232,68 +358,29 @@ export default function WasteMovementModule() {
       try {
         localStorage.setItem("tsd_waste_movements", JSON.stringify(initial));
       } catch (err) {
-        console.error("SMEI: Initial seed of movements failed", err);
+        console.error("Initial seed of movements failed", err);
       }
-
-      // Asynchronously pre-seed files to IndexedDB
-      initial.forEach(rec => {
-        if (rec.sourceFileData) {
-          saveFileToIndexedDB(`tsd_wm_file_${rec.id}`, rec.sourceFileData).catch(err => {
-            console.warn("Seeding to IndexedDB failed, storing in localStorage as fallback", err);
-            try {
-              localStorage.setItem(`tsd_wm_file_${rec.id}`, rec.sourceFileData);
-            } catch (e) {
-              console.error("Storage fallback failed too", e);
-            }
-          });
-        }
-      });
     }
   }, []);
 
   const saveToStorage = (updated: WasteMovementRecord[]) => {
     setMovements(updated);
-    try {
-      localStorage.setItem("tsd_waste_movements", JSON.stringify(updated));
-    } catch (error) {
-      console.error("SMEI: Failed to save movements to localStorage:", error);
-      const isQuota = error instanceof DOMException && (
-        error.name === "QuotaExceededError" ||
-        error.code === 22 ||
-        error.name === "NS_ERROR_DOM_QUOTA_REACHED"
-      );
-      if (isQuota) {
-        showNotification("Warning: Browser storage is full. Your list changes are saved in memory but could not be persisted.", "error");
-      } else {
-        showNotification("Warning: Failed to save record changes to browser storage.", "error");
+    safeSetLocalStorage("tsd_waste_movements", JSON.stringify(updated));
+    if (updated && updated.length > 0) {
+      const activeCa = updated[0].controlNo || updated[0].caNumber || updated[0].breakdownManifestNo;
+      if (activeCa) {
+        safeSetLocalStorage("tsd_active_control_no", activeCa.toUpperCase());
       }
     }
+
+    window.dispatchEvent(new Event("tsd_data_changed"));
+    window.dispatchEvent(new Event("tsd_workflows_updated"));
+    window.dispatchEvent(new Event("tsd_storage_updated"));
   };
 
-  // Method selector prefill
-  useEffect(() => {
-    if (selectedMethod === "Export for recovery") {
-      setMethodDest("Off-shore Treater");
-    } else if (selectedMethod === "Disposal") {
-      setMethodDest("Disposal by SMEI");
-    } else if (selectedMethod === "Recycling/Recovery") {
-      setMethodDest("Local/Offshore");
-    } else {
-      setMethodDest("");
-    }
-  }, [selectedMethod]);
-
   // Format filename helper
-  const getFormattedFilename = (dateStr: string): string => {
-    if (!dateStr) return "COT & Waste Movement";
-    const date = new Date(dateStr);
-    const months = [
-      "January", "February", "March", "April", "May", "June",
-      "July", "August", "September", "October", "November", "December"
-    ];
-    const month = months[date.getMonth()] || "Month";
-    const year = date.getFullYear() || "Year";
-    return `COT & Waste Movement ${month}-${year}`;
+  const getFormattedFilename = (dateStr: string, ext: string = "xlsm"): string => {
+    return getTsdExportFilename("waste-movement", dateStr, ext);
   };
 
   // Validation checkers
@@ -301,66 +388,59 @@ export default function WasteMovementModule() {
     return /^CRD-\d{2}-\d{4}-\d{2}$/.test(num);
   };
 
-  // Add a method entry to form list
-  const handleAddMethodEntry = () => {
-    if (!selectedMethod) return;
-    const qtyVal = Number(methodQty);
-    if (methodQty === "" || isNaN(qtyVal) || qtyVal < 0) {
-      alert("Please enter a valid quantity of 0 or greater.");
-      return;
+  // Dropdown selection handler for Breakdown Record
+  const handleSelectBreakdown = (breakdownId: string, isAuto: boolean = false) => {
+    setFormBreakdownId(breakdownId);
+    setIsAutoSelected(isAuto);
+    if (!isAuto) {
+      setAutoSelectedControlNo("");
     }
-    if (!methodDest.trim()) {
-      alert("Please specify a destination.");
-      return;
-    }
-    if (formMethods.some(m => m.method === selectedMethod)) {
-      alert("This method has already been added.");
-      return;
-    }
+    const selected = breakdownRecords.find(b => b.id === breakdownId);
+    if (selected) {
+      const totals = computeBreakdownQuantities(selected);
+      setFormQuantity1(totals.quantity1);
+      setFormQuantity2(totals.quantity2);
+      setFormQuantity3(totals.quantity3);
+      setFormTotalQty(totals.totalQty);
+      setFormBreakdownDetails(selected);
 
-    const newEntry: WasteMovementMethodEntry = {
-      method: selectedMethod,
-      quantity: qtyVal,
-      destination: methodDest.trim(),
-      remarks: methodRemarks.trim()
-    };
-
-    const updatedMethods = [...formMethods, newEntry];
-    setFormMethods(updatedMethods);
-
-    // Manage RC No. transition directly
-    const hasDisposalOrRecycle = updatedMethods.some(
-      m => m.method === "Disposal" || m.method === "Recycling/Recovery"
-    );
-    if (!hasDisposalOrRecycle) {
-      setFormRcNo("N/A");
+      if (!requiresRcNumber(selected)) {
+        setFormRcNo("N/A");
+      } else {
+        if (formRcNo === "N/A") {
+          setFormRcNo("");
+        }
+      }
     } else {
-      setFormRcNo(prev => prev === "N/A" ? "" : prev);
-    }
-
-    setSelectedMethod("");
-    setMethodQty("");
-    setMethodDest("");
-    setMethodRemarks("");
-  };
-
-  // Remove a method entry
-  const handleRemoveMethodEntry = (methodName: string) => {
-    const updatedMethods = formMethods.filter(m => m.method !== methodName);
-    setFormMethods(updatedMethods);
-
-    // Manage RC No. transition directly
-    const hasDisposalOrRecycle = updatedMethods.some(
-      m => m.method === "Disposal" || m.method === "Recycling/Recovery"
-    );
-    if (!hasDisposalOrRecycle) {
+      setFormQuantity1(0);
+      setFormQuantity2(0);
+      setFormQuantity3(0);
+      setFormTotalQty(0);
+      setFormBreakdownDetails(null);
       setFormRcNo("N/A");
-    } else {
-      setFormRcNo(prev => prev === "N/A" ? "" : prev);
     }
   };
 
-  // File Upload Drag & Drop handlers
+  // Auto-selection effect when modal opens for new records or breakdown records update
+  useEffect(() => {
+    if (isModalOpen && !editingRecordId && !formBreakdownId && breakdownRecords.length > 0) {
+      const activeControlNo = localStorage.getItem("tsd_active_control_no") || "";
+      let autoMatch = null;
+      if (activeControlNo) {
+        autoMatch = breakdownRecords.find(b => getTrackingCode(b) === activeControlNo);
+      }
+      if (!autoMatch && breakdownRecords.length > 0) {
+        autoMatch = breakdownRecords[0];
+      }
+      if (autoMatch) {
+        handleSelectBreakdown(autoMatch.id, true);
+        setIsAutoSelected(true);
+        setAutoSelectedControlNo(activeControlNo || getTrackingCode(autoMatch));
+      }
+    }
+  }, [isModalOpen, editingRecordId, breakdownRecords, formBreakdownId]);
+
+  // File Upload Drag & Drop handlers for COA
   const processSourceFile = (file: File) => {
     const allowedExtensions = ["pdf", "docx", "png", "jpg", "jpeg"];
     const ext = file.name.split(".").pop()?.toLowerCase() || "";
@@ -412,13 +492,45 @@ export default function WasteMovementModule() {
 
   // Create new record modal trigger
   const handleCreateNew = () => {
+    loadBreakdownRecords();
     setEditingRecordId(null);
+    setIsBreakdownDropdownOpen(false);
+    setBreakdownSearchQuery("");
+    setIsAutoSelected(false);
+    setAutoSelectedControlNo("");
+
+    // Determine active Control Number
+    const activeControlNo = localStorage.getItem("tsd_active_control_no") || "";
+    const savedHaz = localStorage.getItem("tsd_hazwaste_records");
+    const currentHaz: any[] = savedHaz ? JSON.parse(savedHaz) : [];
+
+    let autoMatch = null;
+    if (activeControlNo && currentHaz.length > 0) {
+      autoMatch = currentHaz.find(b => getTrackingCode(b) === activeControlNo);
+    }
+    if (!autoMatch && currentHaz.length > 0) {
+      autoMatch = currentHaz[0];
+    }
+
+    if (autoMatch) {
+      handleSelectBreakdown(autoMatch.id, true);
+      setIsAutoSelected(true);
+      setAutoSelectedControlNo(activeControlNo || getTrackingCode(autoMatch));
+    } else {
+      setFormBreakdownId("");
+      setFormBreakdownDetails(null);
+      setFormQuantity1(0);
+      setFormQuantity2(0);
+      setFormQuantity3(0);
+      setFormTotalQty(0);
+      setFormRcNo("N/A");
+    }
+
     setFormTransportDate(new Date().toISOString().split("T")[0]);
     setFormCrdNo("");
-    setFormRcNo("N/A");
+    setRcError("");
     setFormSignedBy("ENGR. MARY ANN PEDROSO");
     setFormNotedBy("APRILYN ROGADOR");
-    setFormMethods([]);
     setFormSourceFileName("");
     setFormSourceFileData("");
     setShowFileWarning(false);
@@ -427,16 +539,57 @@ export default function WasteMovementModule() {
 
   // Edit record trigger
   const handleEditRecord = async (rec: WasteMovementRecord) => {
+    loadBreakdownRecords();
     setEditingRecordId(rec.id);
+    setFormBreakdownId(rec.breakdownId || "");
+    setIsBreakdownDropdownOpen(false);
+    setBreakdownSearchQuery("");
+    setIsAutoSelected(false);
+    setAutoSelectedControlNo("");
+    
+    const matchedBreakdown = breakdownRecords.find(b => b.id === rec.breakdownId);
+    const breakdownData = matchedBreakdown || (rec.breakdownManifestNo ? {
+      manifestNo: rec.breakdownManifestNo,
+      client: rec.breakdownClient,
+      date: rec.breakdownDate,
+      quantity2: rec.quantity2,
+      quantity3: rec.quantity3
+    } : { quantity2: rec.quantity2, quantity3: rec.quantity3 });
+
+    if (matchedBreakdown) {
+      setFormBreakdownDetails(matchedBreakdown);
+    } else if (rec.breakdownManifestNo) {
+      setFormBreakdownDetails(breakdownData);
+    }
+
+    setFormQuantity1(rec.quantity1 || 0);
+    setFormQuantity2(rec.quantity2 || 0);
+    setFormQuantity3(rec.quantity3 || 0);
+    setFormTotalQty(rec.totalQty || 0);
+
     setFormTransportDate(rec.transportDate);
     setFormCrdNo((rec.crdNo || "").toUpperCase());
-    setFormRcNo((rec.rcNo || "").toUpperCase());
+
+    const rcNeeded = requiresRcNumber(breakdownData);
+    if (!rcNeeded) {
+      setFormRcNo("N/A");
+      setRcError("");
+    } else {
+      const existingRc = (rec.rcNo || "").toUpperCase();
+      const loadedRc = existingRc === "N/A" ? "" : existingRc;
+      setFormRcNo(loadedRc);
+      if (loadedRc) {
+        const rcVal = validateControlNumber(loadedRc, "rcNumber");
+        setRcError(rcVal.isValid ? "" : rcVal.error || "Invalid Recycle Cert No. Expected format: R-123 (e.g., R-932, R-15402).");
+      } else {
+        setRcError("");
+      }
+    }
+
     setFormSignedBy(rec.signedBy);
     setFormNotedBy(rec.notedBy);
-    setFormMethods(rec.methods);
     setFormSourceFileName(rec.sourceFileName);
     
-    // Load file asynchronously from IndexedDB or fallback to localStorage
     let fileData = "";
     try {
       fileData = await getFileFromIndexedDB(`tsd_wm_file_${rec.id}`);
@@ -455,34 +608,57 @@ export default function WasteMovementModule() {
   const handleSaveRecord = async (e: React.FormEvent) => {
     e.preventDefault();
 
-    // Required File validation
+    // RULE 1: Hazardous Waste Breakdown MUST be selected
+    if (!formBreakdownId) {
+      alert("Validation Error: A Hazardous Waste Breakdown record must be selected as the authoritative source.");
+      showNotification("Validation Error: Hazardous Waste Breakdown selection is required.", "error");
+      return;
+    }
+
+    // RULE 2: COA Document MUST be uploaded
     if (!formSourceFileName) {
       setShowFileWarning(true);
+      alert("Validation Error: A COA (Certificate of Analysis) source document must be uploaded.");
+      showNotification("Validation Error: COA document upload is required.", "error");
       return;
     }
 
-    // Required CRD Validation
+    // RULE 3: Signatories MUST be provided
+    if (!formSignedBy.trim() || !formNotedBy.trim()) {
+      alert("Validation Error: Document must be signed by required signatories (Signed By & Noted By).");
+      showNotification("Validation Error: Required signatories missing.", "error");
+      return;
+    }
+
+    // RULE 4: CRD Number validation
     if (!validateCrdNumber(formCrdNo)) {
-      alert("Invalid CRD Number format. Please use the format: CRD-XX-XXXX-XX");
+      alert("Validation Error: Invalid CRD Number format. Please use the pattern: CRD-XX-XXXX-XX");
       return;
     }
 
-    // Check if RC No is required and filled
-    const hasDisposalOrRecycle = formMethods.some(
-      m => m.method === "Disposal" || m.method === "Recycling/Recovery"
-    );
-    if (hasDisposalOrRecycle && (!formRcNo.trim() || formRcNo === "N/A")) {
-      alert("RC Number is required because Disposal or Recycling/Recovery method is added.");
-      return;
+    // RULE 5: RC Number validation based on selected breakdown methods
+    const selectedBreakdown = breakdownRecords.find(b => b.id === formBreakdownId);
+    const currentBreakdownData = selectedBreakdown || formBreakdownDetails || { quantity2: formQuantity2, quantity3: formQuantity3 };
+    const isRcRequired = requiresRcNumber(currentBreakdownData);
+
+    if (isRcRequired) {
+      if (!formRcNo.trim() || formRcNo.trim().toUpperCase() === "N/A") {
+        setRcError("RC Number is required because the selected breakdown contains Disposal or Recycling/Recovery quantities.");
+        alert("RC Number is required because the selected breakdown contains Disposal or Recycling/Recovery quantities.");
+        showNotification("RC Number is required because the selected breakdown contains Disposal or Recycling/Recovery quantities.", "error");
+        return;
+      }
+      const rcVal = validateControlNumber(formRcNo, "rcNumber");
+      if (!rcVal.isValid) {
+        const err = rcVal.error || "Invalid Recycle Cert No. Expected format: R-123 (e.g., R-932, R-15402).";
+        setRcError(err);
+        alert(`Validation Error: ${err}`);
+        showNotification(err, "error");
+        return;
+      }
     }
 
-    // Check if at least one method is added
-    if (formMethods.length === 0) {
-      alert("Please add at least one waste movement method.");
-      return;
-    }
-
-    const calculatedTotal = formMethods.reduce((sum, m) => sum + m.quantity, 0);
+    const finalRcNo = isRcRequired ? formRcNo.trim().toUpperCase() : "N/A";
 
     const now = new Date();
     const formattedDateTime = now.toLocaleDateString("en-US", {
@@ -498,79 +674,111 @@ export default function WasteMovementModule() {
     const targetId = editingRecordId || `wm-${Date.now()}`;
     const fileKey = `tsd_wm_file_${targetId}`;
 
-    let fileSaved = false;
     try {
-      // 1. Try to save to IndexedDB
       await saveFileToIndexedDB(fileKey, formSourceFileData);
-      fileSaved = true;
     } catch (idbErr) {
-      console.warn("IndexedDB save failed, falling back to localStorage", idbErr);
       try {
-        // 2. Fallback to localStorage
         localStorage.setItem(fileKey, formSourceFileData);
-        fileSaved = true;
       } catch (lsErr) {
-        console.error("localStorage save failed", lsErr);
-        const isQuota = lsErr instanceof DOMException && (
-          lsErr.name === "QuotaExceededError" ||
-          lsErr.code === 22 ||
-          lsErr.name === "NS_ERROR_DOM_QUOTA_REACHED"
-        );
-        if (isQuota) {
-          alert("Unable to save this source document because the file is too large for browser storage. Please use a smaller file or compress the document.");
-        } else {
-          alert(`Failed to save source file: ${lsErr instanceof Error ? lsErr.message : "Storage quota exceeded"}`);
-        }
-        return; // Prevent partially saved states
+        console.error("Storage save failed", lsErr);
       }
-    }
-
-    if (!fileSaved) {
-      alert("Error: File could not be saved to browser storage.");
-      return;
     }
 
     const finalSignedBy = formSignedBy.trim().toUpperCase() || "ENGR. MARY ANN PEDROSO";
     const finalNotedBy = formNotedBy.trim().toUpperCase() || "APRILYN ROGADOR";
 
+    const breakdownManifestNo = selectedBreakdown?.manifestNo || formBreakdownDetails?.manifestNo || "N/A";
+    const resolvedControlNo = getTrackingCode(selectedBreakdown) || getTrackingCode(formBreakdownDetails) || breakdownManifestNo;
+    const breakdownClient = selectedBreakdown?.client || formBreakdownDetails?.client || "N/A";
+    const breakdownDate = selectedBreakdown?.date || formBreakdownDetails?.date || formTransportDate;
+
+    // Methods structure for backward compatibility
+    const methodsList: WasteMovementMethodEntry[] = [
+      { method: "Export for recovery", quantity: formQuantity1, destination: "Off-shore Treater", remarks: "" },
+      { method: "Disposal", quantity: formQuantity2, destination: "Disposal by SMEI", remarks: "" },
+      { method: "Recycling/Recovery", quantity: formQuantity3, destination: "Local/Offshore", remarks: "" }
+    ].filter(m => m.quantity > 0);
+
+    let targetRecord: WasteMovementRecord;
+    let targetWf: WorkflowRecord;
+
     if (editingRecordId) {
-      const updated = movements.map(m => {
-        if (m.id === editingRecordId) {
-          return {
-            ...m,
-            transportDate: formTransportDate,
-            crdNo: formCrdNo,
-            rcNo: formRcNo,
-            signedBy: finalSignedBy,
-            notedBy: finalNotedBy,
-            methods: formMethods,
-            totalQty: calculatedTotal,
-            sourceFileName: formSourceFileName
-          };
-        }
-        return m;
-      });
-      saveToStorage(updated);
-      showNotification("Waste movement transaction updated successfully.", "success");
-    } else {
-      const newRec: WasteMovementRecord = {
-        id: targetId,
+      const existing = movements.find(m => m.id === editingRecordId);
+      targetRecord = {
+        ...(existing || {} as WasteMovementRecord),
+        id: editingRecordId,
+        breakdownId: formBreakdownId,
+        breakdownManifestNo,
+        controlNo: resolvedControlNo,
+        caNumber: resolvedControlNo,
+        breakdownClient,
+        breakdownDate,
         transportDate: formTransportDate,
         crdNo: formCrdNo,
-        rcNo: formRcNo,
+        rcNo: finalRcNo,
+        signedBy: finalSignedBy,
+        notedBy: finalNotedBy,
+        quantity1: formQuantity1,
+        quantity2: formQuantity2,
+        quantity3: formQuantity3,
+        totalQty: formTotalQty,
+        sourceFileName: formSourceFileName,
+        methods: methodsList
+      };
+      try {
+        targetWf = attachRecordToWorkflow("waste-movement", targetRecord, resolvedControlNo);
+      } catch (err: any) {
+        alert(err.message || "No active workflow is selected. Please select or create a workflow before saving this document.");
+        return;
+      }
+      const updated = movements.map(m => m.id === editingRecordId ? targetRecord : m);
+      saveToStorage(updated);
+      showNotification("Waste movement summary document updated successfully.", "success");
+    } else {
+      targetRecord = {
+        id: targetId,
+        breakdownId: formBreakdownId,
+        breakdownManifestNo,
+        controlNo: resolvedControlNo,
+        caNumber: resolvedControlNo,
+        breakdownClient,
+        breakdownDate,
+        transportDate: formTransportDate,
+        crdNo: formCrdNo,
+        rcNo: finalRcNo,
         signedBy: finalSignedBy,
         notedBy: finalNotedBy,
         sourceFileName: formSourceFileName,
-        sourceFileData: "", // Keep main array light
-        methods: formMethods,
-        totalQty: calculatedTotal,
+        sourceFileData: "",
+        quantity1: formQuantity1,
+        quantity2: formQuantity2,
+        quantity3: formQuantity3,
+        totalQty: formTotalQty,
+        methods: methodsList,
         dateTime: formattedDateTime,
         status: "Completed"
       };
-      saveToStorage([newRec, ...movements]);
+      try {
+        targetWf = attachRecordToWorkflow("waste-movement", targetRecord, resolvedControlNo);
+      } catch (err: any) {
+        alert(err.message || "No active workflow is selected. Please select or create a workflow before saving this document.");
+        return;
+      }
+      saveToStorage([targetRecord, ...movements]);
       setSelectedMovementId(targetId);
-      showNotification("Waste movement transaction created successfully.", "success");
+      showNotification("Waste movement summary document created successfully.", "success");
     }
+
+    notificationRepository.createNotification({
+      portal: "TSD",
+      module: "waste-movement",
+      workflowId: targetWf.id,
+      documentId: targetRecord.id,
+      documentNumber: resolvedControlNo,
+      title: editingRecordId ? "Waste Movement Record Updated" : "Waste Movement Summary Completed",
+      message: `Waste movement summary ${editingRecordId ? 'updated' : 'completed'} for Workflow ${targetWf.workflowCode || targetWf.id} (Control No: ${resolvedControlNo}).`,
+      priority: "HIGH"
+    }).catch(() => {});
 
     setIsModalOpen(false);
   };
@@ -578,7 +786,7 @@ export default function WasteMovementModule() {
   // Delete transaction
   const handleDeleteRecord = async (id: string, e: React.MouseEvent) => {
     e.stopPropagation();
-    if (confirm("Are you sure you want to permanently delete this waste movement transaction?")) {
+    if (confirm("Are you sure you want to permanently delete this waste movement summary document?")) {
       const updated = movements.filter(m => m.id !== id);
       saveToStorage(updated);
       try {
@@ -590,18 +798,29 @@ export default function WasteMovementModule() {
       if (selectedMovementId === id) {
         setSelectedMovementId(updated.length > 0 ? updated[0].id : null);
       }
-      showNotification("Waste movement transaction deleted successfully.", "success");
+      showNotification("Waste movement summary document deleted successfully.", "success");
     }
   };
 
-
-
   // Export Excel handler
   const handleExportExcel = async (rec: WasteMovementRecord) => {
-    const methodsList = rec.methods || [];
-    const m1 = methodsList.find(m => m.method === "Export for recovery");
-    const m2 = methodsList.find(m => m.method === "Disposal");
-    const m3 = methodsList.find(m => m.method === "Recycling/Recovery");
+    // Validate required fields before exporting
+    if (!rec.breakdownId && !rec.breakdownManifestNo) {
+      alert("Export Blocked: This Waste Movement document lacks a reference to an authoritative Hazardous Waste Breakdown record.");
+      return;
+    }
+    if (!rec.sourceFileName) {
+      alert("Export Blocked: A COA source document must be uploaded before exporting.");
+      return;
+    }
+    if (!rec.signedBy || !rec.notedBy) {
+      alert("Export Blocked: Document must be signed by required signatories before exporting.");
+      return;
+    }
+
+    const q1 = rec.quantity1 || 0;
+    const q2 = rec.quantity2 || 0;
+    const q3 = rec.quantity3 || 0;
 
     const exportData = {
       TRANSPORT_DATE: rec.transportDate || "",
@@ -614,22 +833,22 @@ export default function WasteMovementModule() {
       TOTAL_QTY: formatQuantityDisplay(rec.totalQty),
       
       METHOD_1: "Export for recovery",
-      QUANTITY_1: formatQuantityDisplay(m1?.quantity),
-      DESTINATION_1: m1?.destination || "Off-shore Treater",
-      REMARKS_1: m1 ? (m1.remarks || rec.sourceFileName || "") : "",
+      QUANTITY_1: formatQuantityDisplay(q1),
+      DESTINATION_1: "Off-shore Treater",
+      REMARKS_1: q1 > 0 ? (rec.sourceFileName || "COA Verified") : "",
 
       METHOD_2: "Disposal",
-      QUANTITY_2: formatQuantityDisplay(m2?.quantity),
-      DESTINATION_2: m2?.destination || "Disposal by SMEI",
-      REMARKS_2: m2 ? (m2.remarks || rec.sourceFileName || "") : "",
+      QUANTITY_2: formatQuantityDisplay(q2),
+      DESTINATION_2: "Disposal by SMEI",
+      REMARKS_2: q2 > 0 ? (rec.sourceFileName || "COA Verified") : "",
 
       METHOD_3: "Recycling/Recovery",
-      QUANTITY_3: formatQuantityDisplay(m3?.quantity),
-      DESTINATION_3: m3?.destination || "Local/Offshore",
-      REMARKS_3: m3 ? (m3.remarks || rec.sourceFileName || "") : ""
+      QUANTITY_3: formatQuantityDisplay(q3),
+      DESTINATION_3: "Local/Offshore",
+      REMARKS_3: q3 > 0 ? (rec.sourceFileName || "COA Verified") : ""
     };
 
-    const outputFilename = getFormattedFilename(rec.transportDate) + ".xlsm";
+    const outputFilename = getFormattedFilename(rec.transportDate, "xlsm");
 
     try {
       await exportExcelWithTemplate(
@@ -655,10 +874,24 @@ export default function WasteMovementModule() {
 
   const handleExportPdf = async (rec: WasteMovementRecord) => {
     if (isExportingPdf) return;
+
+    if (!rec.breakdownId && !rec.breakdownManifestNo) {
+      alert("Export Blocked: This Waste Movement document lacks a reference to an authoritative Hazardous Waste Breakdown record.");
+      return;
+    }
+    if (!rec.sourceFileName) {
+      alert("Export Blocked: A COA source document must be uploaded before exporting.");
+      return;
+    }
+    if (!rec.signedBy || !rec.notedBy) {
+      alert("Export Blocked: Document must be signed by required signatories before exporting.");
+      return;
+    }
+
     setIsExportingPdf(true);
     try {
       if (rec.sourceFileName?.toLowerCase().endsWith(".docx")) {
-        showNotification("High-fidelity DOCX to PDF conversion is not supported in the current browser architecture. Please upload the source document as a PDF or image instead.", "error");
+        showNotification("DOCX format is not supported for combined PDF conversion. Please use PDF or image instead.", "error");
         setIsExportingPdf(false);
         return;
       }
@@ -674,7 +907,7 @@ export default function WasteMovementModule() {
       }
       
       if (!fileData) {
-        alert("The original source file could not be retrieved from local storage. Please re-upload or edit the entry.");
+        alert("The original source file could not be retrieved from storage. Please re-upload the COA document.");
         setIsExportingPdf(false);
         return;
       }
@@ -683,17 +916,13 @@ export default function WasteMovementModule() {
       const { blob: mergedPdfBlob, hasMultiplePages } = await mergeSourceAndExcelPdf(rec.sourceFileName, fileData, rec);
       
       const { saveAs } = await import("file-saver");
-      const filename = getFormattedFilename(rec.transportDate) + ".pdf";
+      const filename = getFormattedFilename(rec.transportDate, "pdf");
       saveAs(mergedPdfBlob, filename);
       
-      if (hasMultiplePages) {
-        showNotification("Multi-page combined PDF generated successfully. All source document pages have been fully preserved with the Waste Movement page attached at the end.", "success");
-      } else {
-        showNotification("Combined PDF generated successfully. The source document and Waste Movement page have been merged.", "success");
-      }
+      showNotification("Combined PDF generated successfully.", "success");
     } catch (error) {
       console.error("Failed to generate combined PDF:", error);
-      alert("Failed to compile and merge combined PDF. Please verify document formatting.");
+      alert("Failed to compile combined PDF. Please verify document formatting.");
     } finally {
       setIsExportingPdf(false);
     }
@@ -712,16 +941,15 @@ export default function WasteMovementModule() {
     const safeCrdNo = m.crdNo || "";
     const safeRcNo = m.rcNo || "";
     const safeSourceFileName = m.sourceFileName || "";
-    const safeMethods = m.methods || [];
+    const safeManifest = m.breakdownManifestNo || "";
+    const safeClient = m.breakdownClient || "";
     const term = (searchTerm || "").toLowerCase();
 
-    const matchesSearch = 
-      safeCrdNo.toLowerCase().includes(term) ||
-      safeRcNo.toLowerCase().includes(term) ||
-      safeSourceFileName.toLowerCase().includes(term) ||
-      safeMethods.some(method => (method.method || "").toLowerCase().includes(term));
-    const matchesMethod = methodFilter === "All" || safeMethods.some(method => method.method === methodFilter);
-    return matchesSearch && matchesMethod;
+    return safeCrdNo.toLowerCase().includes(term) ||
+           safeRcNo.toLowerCase().includes(term) ||
+           safeSourceFileName.toLowerCase().includes(term) ||
+           safeManifest.toLowerCase().includes(term) ||
+           safeClient.toLowerCase().includes(term);
   });
 
   // Sorting
@@ -740,13 +968,6 @@ export default function WasteMovementModule() {
   });
 
   const selectedRecord = movements.find(m => m.id === selectedMovementId);
-
-  // Available options for Inner Method Addition
-  const availableMethods = [
-    "Export for recovery",
-    "Disposal",
-    "Recycling/Recovery"
-  ].filter(m => !formMethods.some(added => added.method === m));
 
   return (
     <div id="smei-wastemovement-portal" className="p-4 md:p-6 space-y-6 max-w-[130rem] mx-auto w-full text-slate-800 dark:text-slate-100">
@@ -772,19 +993,19 @@ export default function WasteMovementModule() {
         </div>
       )}
 
-      {/* Header matching Hazardous Waste Layout */}
+      {/* Header */}
       <div className="flex flex-col md:flex-row md:items-center justify-between gap-4">
         <div>
           <h2 className="text-xl md:text-2xl font-bold text-gray-800 dark:text-white tracking-tight font-display uppercase">
-            Internal Material Loop & Waste Movement Ledger
+            Waste Movement Summary Ledger
           </h2>
           <p className="text-xs md:text-sm text-slate-500 dark:text-slate-400 mt-0.5">
-            Log, validate, and compute precise quantities of waste movement with high-fidelity Excel report macros.
+            Automated waste movement summary documents generated directly from authoritative Hazardous Waste Breakdown records.
           </p>
         </div>
       </div>
 
-      {/* Standard Management Toolbar */}
+      {/* Management Toolbar */}
       <div className="bg-white dark:bg-slate-900 p-4 rounded-xl border border-gray-100 dark:border-slate-800 shadow-sm flex flex-col sm:flex-row sm:items-center justify-between gap-4">
         <div className="flex flex-wrap items-center gap-2">
           <button
@@ -792,7 +1013,7 @@ export default function WasteMovementModule() {
             className="bg-smei-crimson hover:bg-smei-darkred text-white text-xs font-semibold h-[38px] px-4 rounded-lg flex items-center justify-center gap-1.5 shadow-sm transition-all hover:scale-[1.02] active:scale-95 cursor-pointer font-sans"
           >
             <Plus className="w-4 h-4" />
-            <span>Create Waste Movement</span>
+            <span>Generate Waste Movement Summary</span>
           </button>
 
           <button
@@ -819,7 +1040,7 @@ export default function WasteMovementModule() {
 
           {selectedRecord && (
             <div className="flex items-center gap-2 ml-2">
-              <span className="text-[10px] font-bold text-gray-500 uppercase font-mono tracking-wider">Selected:</span>
+              <span className="text-[10px] font-bold text-gray-500 uppercase font-mono tracking-wider">Selected CRD:</span>
               <span className="text-[11px] font-bold font-mono text-smei-crimson bg-red-50 border border-red-200 px-2.5 py-1 rounded-md">
                 {selectedRecord.crdNo}
               </span>
@@ -832,7 +1053,7 @@ export default function WasteMovementModule() {
           <Search className="absolute left-3 top-2.5 w-4 h-4 text-gray-400" />
           <input
             type="text"
-            placeholder="Search CRD, RC, or Reference..."
+            placeholder="Search CRD, Breakdown, Client..."
             value={searchTerm}
             onChange={(e) => setSearchTerm(e.target.value)}
             className="w-full pl-9 pr-4 py-2 bg-gray-50 dark:bg-slate-950 border border-gray-200 dark:border-slate-800 rounded-lg text-xs font-sans focus:outline-none focus:ring-1 focus:ring-smei-crimson focus:border-transparent focus:bg-white dark:focus:bg-slate-900 transition-all text-gray-700 dark:text-slate-200 font-mono"
@@ -844,26 +1065,11 @@ export default function WasteMovementModule() {
       <div className="bg-white dark:bg-slate-900 p-5 rounded-xl border border-gray-100 dark:border-slate-800 shadow-sm space-y-4">
         <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 border-b border-gray-100 dark:border-slate-800 pb-3">
           <h3 className="text-sm font-bold text-gray-800 dark:text-slate-200 font-display uppercase tracking-wider flex items-center gap-2">
-            <span>Material Transfer Registry</span>
+            <span>Waste Movement Summary Registry</span>
             <span className="bg-slate-100 dark:bg-slate-800 text-slate-600 dark:text-slate-400 text-[10px] font-mono px-2 py-0.5 rounded-full font-bold">
               {filteredMovements.length} Entries
             </span>
           </h3>
-          <div className="flex items-center gap-2">
-            <label className="text-xs font-bold text-slate-500 dark:text-slate-400 uppercase tracking-wider font-mono">
-              Method:
-            </label>
-            <select
-              value={methodFilter}
-              onChange={(e) => setMethodFilter(e.target.value)}
-              className="bg-slate-50 dark:bg-slate-950 text-slate-800 dark:text-slate-200 border border-gray-200 dark:border-slate-800 text-xs rounded-lg px-2.5 py-1.5 focus:outline-none focus:ring-1 focus:ring-smei-crimson cursor-pointer font-medium"
-            >
-              <option value="All">All Methods</option>
-              <option value="Export for recovery">Export for recovery</option>
-              <option value="Disposal">Disposal</option>
-              <option value="Recycling/Recovery">Recycling/Recovery</option>
-            </select>
-          </div>
         </div>
 
         <div className="border border-gray-100 dark:border-slate-800 rounded-xl overflow-hidden shadow-xs">
@@ -889,16 +1095,10 @@ export default function WasteMovementModule() {
                       {sortField === "crdNo" && (sortDirection === "asc" ? <ArrowUp className="w-3 h-3 text-smei-crimson" /> : <ArrowDown className="w-3 h-3 text-smei-crimson" />)}
                     </div>
                   </th>
-                  <th 
-                    onClick={() => { setSortField("rcNo"); setSortDirection(prev => prev === "asc" ? "desc" : "asc"); }}
-                    className="py-3 px-4 font-display cursor-pointer hover:bg-slate-100 dark:hover:bg-slate-900 transition-colors"
-                  >
-                    <div className="flex items-center gap-1">
-                      <span>Recycle Number</span>
-                      {sortField === "rcNo" && (sortDirection === "asc" ? <ArrowUp className="w-3 h-3 text-smei-crimson" /> : <ArrowDown className="w-3 h-3 text-smei-crimson" />)}
-                    </div>
-                  </th>
-                  <th className="py-3 px-4 font-display">Methods Selected</th>
+                  <th className="py-3 px-4 font-display">Authoritative Breakdown Record</th>
+                  <th className="py-3 px-4 font-display text-right">Export Qty (MT)</th>
+                  <th className="py-3 px-4 font-display text-right">Disposal Qty (MT)</th>
+                  <th className="py-3 px-4 font-display text-right">Recycle Qty (MT)</th>
                   <th 
                     onClick={() => { setSortField("totalQty"); setSortDirection(prev => prev === "asc" ? "desc" : "asc"); }}
                     className="py-3 px-4 font-display text-right cursor-pointer hover:bg-slate-100 dark:hover:bg-slate-900 transition-colors"
@@ -908,20 +1108,17 @@ export default function WasteMovementModule() {
                       {sortField === "totalQty" && (sortDirection === "asc" ? <ArrowUp className="w-3 h-3 text-smei-crimson" /> : <ArrowDown className="w-3 h-3 text-smei-crimson" />)}
                     </div>
                   </th>
-                  <th className="py-3 px-4 font-display truncate">Attached Document</th>
+                  <th className="py-3 px-4 font-display truncate">COA Document</th>
                   <th className="py-3 px-4 font-display text-center">Actions</th>
                 </tr>
               </thead>
               <tbody className="divide-y divide-gray-100 dark:divide-slate-800/80">
                 {sortedMovements.length > 0 ? (
                   sortedMovements.map((rec, index) => {
-                    const uniqueMethods = Array.from(new Set((rec.methods || []).map(item => item.method)));
-                    const methodsStr = uniqueMethods.join(" | ");
-
                     return (
                       <tr
                         key={rec.id}
-                        onClick={() => setSelectedMovementId(rec.id)}
+                        onClick={() => handleMovementSelect(rec)}
                         onDoubleClick={() => handleEditRecord(rec)}
                         className={`cursor-pointer transition-all group ${
                           selectedMovementId === rec.id
@@ -937,33 +1134,29 @@ export default function WasteMovementModule() {
                         <td className="py-3 px-4 font-mono font-bold text-smei-crimson dark:text-rose-400">
                           {rec.crdNo}
                         </td>
-                        <td className="py-3 px-4 font-mono text-gray-600 dark:text-slate-400">
-                          <span className={rec.rcNo === "N/A" ? "text-gray-400" : ""}>
-                            {rec.rcNo}
-                          </span>
-                        </td>
                         <td className="py-3 px-4">
-                          <div className="flex flex-wrap gap-1">
-                            {uniqueMethods.map((m) => (
-                              <span
-                                key={m}
-                                className={`inline-flex items-center px-2 py-0.5 rounded-md text-[10px] font-semibold tracking-wide border ${
-                                  m === "Export for recovery"
-                                    ? "bg-blue-50 text-blue-700 border-blue-200 dark:bg-blue-950/40 dark:text-blue-300 dark:border-blue-800"
-                                    : m === "Disposal"
-                                    ? "bg-amber-50 text-amber-700 border-amber-200 dark:bg-amber-950/40 dark:text-amber-300 dark:border-amber-800"
-                                    : "bg-emerald-50 text-emerald-700 border-emerald-200 dark:bg-emerald-950/40 dark:text-emerald-300 dark:border-emerald-800"
-                                }`}
-                              >
-                                {m}
-                              </span>
-                            ))}
+                          <div className="flex flex-col">
+                            <span className="font-mono font-bold text-slate-800 dark:text-slate-200">
+                              {rec.breakdownManifestNo || rec.breakdownId || "Manifest Reference"}
+                            </span>
+                            <span className="text-[10px] text-slate-500 truncate max-w-[160px]">
+                              {rec.breakdownClient || "Authoritative Breakdown"}
+                            </span>
                           </div>
                         </td>
-                        <td className="py-3 px-4 font-mono text-right font-bold text-slate-700 dark:text-slate-300">
+                        <td className="py-3 px-4 font-mono text-right text-blue-600 dark:text-blue-400 font-semibold">
+                          {formatQuantityDisplay(rec.quantity1)}
+                        </td>
+                        <td className="py-3 px-4 font-mono text-right text-amber-600 dark:text-amber-400 font-semibold">
+                          {formatQuantityDisplay(rec.quantity2)}
+                        </td>
+                        <td className="py-3 px-4 font-mono text-right text-emerald-600 dark:text-emerald-400 font-semibold">
+                          {formatQuantityDisplay(rec.quantity3)}
+                        </td>
+                        <td className="py-3 px-4 font-mono text-right font-bold text-slate-800 dark:text-slate-100">
                           {formatQuantityDisplay(rec.totalQty)}
                         </td>
-                        <td className="py-3 px-4 text-slate-500 dark:text-slate-400 truncate max-w-[150px]" title={rec.sourceFileName}>
+                        <td className="py-3 px-4 text-slate-500 dark:text-slate-400 truncate max-w-[130px]" title={rec.sourceFileName}>
                           <span className="flex items-center gap-1">
                             <FileText className="w-3.5 h-3.5 text-blue-500 shrink-0" />
                             <span className="truncate">{rec.sourceFileName}</span>
@@ -992,8 +1185,8 @@ export default function WasteMovementModule() {
                   })
                 ) : (
                   <tr>
-                    <td colSpan={7} className="py-12 text-center text-gray-400 dark:text-slate-500">
-                      No waste movement entries found. Click "Create Waste Movement" to register.
+                    <td colSpan={9} className="py-12 text-center text-gray-400 dark:text-slate-500">
+                      No waste movement entries found. Click "Generate Waste Movement Summary" to create one.
                     </td>
                   </tr>
                 )}
@@ -1003,8 +1196,6 @@ export default function WasteMovementModule() {
         </div>
       </div>
 
-
-
       {/* Interactive Form Modal */}
       {isModalOpen && (
         <div className="fixed inset-0 z-50 bg-slate-950/60 backdrop-blur-xs flex items-center justify-center p-4">
@@ -1013,7 +1204,7 @@ export default function WasteMovementModule() {
             {/* Modal Header */}
             <div className="p-4 border-b border-gray-100 dark:border-slate-800 flex items-center justify-between">
               <h3 className="text-sm font-bold text-gray-800 dark:text-slate-200 font-display flex items-center gap-1.5 uppercase tracking-wider">
-                <span>{editingRecordId ? "Modify Waste Movement Transaction" : "Create Waste Movement"}</span>
+                <span>{editingRecordId ? "Modify Waste Movement Summary" : "Generate Waste Movement Summary Document"}</span>
               </h3>
               <button
                 onClick={() => setIsModalOpen(false)}
@@ -1024,6 +1215,12 @@ export default function WasteMovementModule() {
             </div>
 
             {/* Modal Body */}
+            {(() => {
+              const selectedBreakdown = breakdownRecords.find(b => b.id === formBreakdownId);
+              const currentBreakdownData = selectedBreakdown || formBreakdownDetails || { quantity2: formQuantity2, quantity3: formQuantity3 };
+              const isRcRequired = requiresRcNumber(currentBreakdownData);
+
+              return (
             <form onSubmit={handleSaveRecord} className="p-6 space-y-6 overflow-y-auto flex-1 text-xs">
               
               {/* Form Validation Alert Box */}
@@ -1031,80 +1228,241 @@ export default function WasteMovementModule() {
                 <div className="p-3.5 bg-red-50 border border-red-200 text-red-700 dark:bg-red-950/30 dark:border-red-900/30 dark:text-red-400 rounded-lg flex items-start gap-2.5 animate-fadeIn">
                   <AlertCircle className="w-4.5 h-4.5 shrink-0 text-red-600 mt-0.5" />
                   <div>
-                    <p className="font-semibold text-xs">Missing Original Source Document</p>
+                    <p className="font-semibold text-xs">Missing Required COA Source Document</p>
                     <p className="text-[10px] mt-0.5 opacity-90 leading-normal">
-                      A validated original source file (PDF, DOCX, or Image) must be attached before saving or exporting.
+                      A validated COA (Certificate of Analysis) source file (PDF, DOCX, or Image) must be attached before saving or exporting.
                     </p>
                   </div>
                 </div>
               )}
 
-              {/* Grid 1: Basic Fields & Source Document Drag zone */}
-              <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
+              {/* SECTION 1: Hazardous Waste Breakdown Dropdown Selection */}
+              <div className="grid grid-cols-1 md:grid-cols-2 gap-4 bg-slate-50 dark:bg-slate-950 p-4 rounded-xl border border-gray-200 dark:border-slate-800">
+                <div className="md:col-span-2 space-y-1">
+                  <label className="block text-[10px] font-bold text-gray-500 dark:text-slate-400 uppercase tracking-wider flex items-center gap-1.5">
+                    <Layers className="w-4 h-4 text-smei-crimson" />
+                    <span>Authoritative Hazardous Waste Breakdown Document *</span>
+                  </label>
+
+                  <div className="relative w-full" ref={breakdownDropdownRef}>
+                    <button
+                      type="button"
+                      onClick={() => setIsBreakdownDropdownOpen(!isBreakdownDropdownOpen)}
+                      className={`w-full h-10 min-h-[40px] px-3.5 py-2 flex items-center justify-between gap-2 bg-white dark:bg-slate-900 border rounded-lg text-xs text-left transition-all cursor-pointer shadow-xs ${
+                        !formBreakdownId
+                          ? "border-gray-200 dark:border-slate-800 text-gray-400 dark:text-slate-500"
+                          : "border-gray-200 dark:border-slate-800 text-gray-800 dark:text-slate-100 font-mono font-medium"
+                      } focus:outline-none focus:ring-2 focus:ring-smei-crimson/20 focus:border-smei-crimson`}
+                    >
+                      <span className="truncate leading-tight block flex-1">
+                        {selectedBreakdown ? (
+                          `Control No: ${getTrackingCode(selectedBreakdown) || selectedBreakdown.manifestNo} | Client: ${selectedBreakdown.client} | Date: ${selectedBreakdown.date} | Total Qty: ${computeBreakdownQuantities(selectedBreakdown).totalQty} MT (MRR: ${selectedBreakdown.mrrNo || 'N/A'})`
+                        ) : (
+                          "-- Select Hazardous Waste Breakdown Record --"
+                        )}
+                      </span>
+                      <ChevronDown className={`w-4 h-4 text-gray-400 shrink-0 transition-transform duration-200 ${isBreakdownDropdownOpen ? "rotate-180" : ""}`} />
+                    </button>
+
+                    {isBreakdownDropdownOpen && (
+                      <div className="absolute z-50 left-0 right-0 mt-1 bg-white dark:bg-slate-900 border border-gray-200 dark:border-slate-800 rounded-lg shadow-xl max-h-60 overflow-y-auto py-1 animate-fadeIn">
+                        {breakdownRecords.length > 5 && (
+                          <div className="p-2 border-b border-gray-100 dark:border-slate-800 sticky top-0 bg-white dark:bg-slate-900 z-10">
+                            <div className="relative flex items-center">
+                              <Search className="w-3.5 h-3.5 text-gray-400 absolute left-2.5 pointer-events-none" />
+                              <input
+                                type="text"
+                                placeholder="Search manifest, client, or MRR..."
+                                value={breakdownSearchQuery}
+                                onChange={(e) => setBreakdownSearchQuery(e.target.value)}
+                                className="w-full pl-8 pr-2.5 py-1.5 text-xs bg-slate-50 dark:bg-slate-950 border border-gray-200 dark:border-slate-800 rounded focus:outline-none focus:ring-1 focus:ring-smei-crimson text-gray-800 dark:text-slate-200"
+                                onClick={(e) => e.stopPropagation()}
+                              />
+                            </div>
+                          </div>
+                        )}
+
+                        {(() => {
+                          const filtered = breakdownRecords.filter((b) => {
+                            if (!breakdownSearchQuery.trim()) return true;
+                            const q = breakdownSearchQuery.toLowerCase();
+                            return (
+                              (b.manifestNo || "").toLowerCase().includes(q) ||
+                              (b.client || "").toLowerCase().includes(q) ||
+                              (b.mrrNo || "").toLowerCase().includes(q) ||
+                              (b.date || "").toLowerCase().includes(q)
+                            );
+                          });
+
+                          if (filtered.length === 0) {
+                            return (
+                              <div className="px-3.5 py-3 text-xs text-gray-400 dark:text-slate-500 text-center">
+                                No matching breakdown records found.
+                              </div>
+                            );
+                          }
+
+                          return filtered.map((b) => {
+                            const totals = computeBreakdownQuantities(b);
+                            const isSelected = b.id === formBreakdownId;
+                            const displayLabel = `Control No: ${getTrackingCode(b) || b.manifestNo} | Client: ${b.client} | Date: ${b.date} | Total Qty: ${totals.totalQty} MT (MRR: ${b.mrrNo || 'N/A'})`;
+
+                            return (
+                              <button
+                                key={b.id}
+                                type="button"
+                                onClick={() => {
+                                  handleSelectBreakdown(b.id);
+                                  setIsBreakdownDropdownOpen(false);
+                                  setBreakdownSearchQuery("");
+                                }}
+                                className={`w-full text-left px-3.5 py-2.5 text-xs font-mono flex items-center justify-between gap-2 transition-colors cursor-pointer border-b last:border-b-0 border-gray-50 dark:border-slate-800/50 ${
+                                  isSelected
+                                    ? "bg-smei-crimson/10 text-smei-crimson dark:text-red-400 font-bold"
+                                    : "text-gray-700 dark:text-slate-200 hover:bg-slate-100 dark:hover:bg-slate-800/80"
+                                }`}
+                                title={displayLabel}
+                              >
+                                <span className="truncate flex-1">{displayLabel}</span>
+                                {isSelected && <CheckCircle className="w-3.5 h-3.5 text-smei-crimson shrink-0" />}
+                              </button>
+                            );
+                          });
+                        })()}
+                      </div>
+                    )}
+                  </div>
+
+                  {isAutoSelected && selectedBreakdown && (
+                    <div className="flex items-center gap-1.5 text-xs text-emerald-700 dark:text-emerald-300 font-semibold mt-1.5 bg-emerald-50 dark:bg-emerald-950/50 px-3 py-1.5 rounded-lg border border-emerald-200 dark:border-emerald-800/60 shadow-2xs">
+                      <CheckCircle className="w-4 h-4 text-emerald-600 dark:text-emerald-400 shrink-0" />
+                      <span>✓ Automatically selected based on Control Number ({autoSelectedControlNo || getTrackingCode(selectedBreakdown)})</span>
+                    </div>
+                  )}
+
+                  <p className="text-[10px] text-slate-500 dark:text-slate-400 mt-1">
+                    Select a saved Hazardous Waste Breakdown document. Quantities will be computed automatically and locked to preserve data integrity.
+                  </p>
+                </div>
+
+                {/* Read-Only Computed Quantities Display */}
+                {formBreakdownId ? (
+                  <div className="md:col-span-2 bg-white dark:bg-slate-900 p-4 rounded-xl border border-emerald-200 dark:border-emerald-900/40 space-y-3">
+                    <div className="flex items-center justify-between border-b border-gray-100 dark:border-slate-800 pb-2">
+                      <div className="flex items-center gap-2">
+                        <Shield className="w-4 h-4 text-emerald-600 dark:text-emerald-400" />
+                        <span className="font-bold text-xs uppercase tracking-wider text-slate-700 dark:text-slate-200">
+                          Auto-Populated Breakdown Quantities (Read-Only)
+                        </span>
+                      </div>
+                      <span className="text-[10px] font-mono bg-emerald-100 text-emerald-800 dark:bg-emerald-950/80 dark:text-emerald-300 px-2.5 py-0.5 rounded font-bold">
+                        Source: {formBreakdownDetails?.manifestNo || formBreakdownId}
+                      </span>
+                    </div>
+
+                    <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
+                      <div className="bg-slate-50 dark:bg-slate-950 p-2.5 rounded-lg border border-gray-200 dark:border-slate-800">
+                        <span className="block text-[10px] font-bold text-gray-500 dark:text-slate-400 uppercase">
+                          QUANTITY 1 (Export)
+                        </span>
+                        <span className="text-sm font-mono font-bold text-blue-600 dark:text-blue-400">
+                          {formatQuantityDisplay(formQuantity1)} MT
+                        </span>
+                        <span className="block text-[9px] text-gray-400">Export for recovery</span>
+                      </div>
+
+                      <div className="bg-slate-50 dark:bg-slate-950 p-2.5 rounded-lg border border-gray-200 dark:border-slate-800">
+                        <span className="block text-[10px] font-bold text-gray-500 dark:text-slate-400 uppercase">
+                          QUANTITY 2 (Disposal)
+                        </span>
+                        <span className="text-sm font-mono font-bold text-amber-600 dark:text-amber-400">
+                          {formatQuantityDisplay(formQuantity2)} MT
+                        </span>
+                        <span className="block text-[9px] text-gray-400">Local TSD Disposal</span>
+                      </div>
+
+                      <div className="bg-slate-50 dark:bg-slate-950 p-2.5 rounded-lg border border-gray-200 dark:border-slate-800">
+                        <span className="block text-[10px] font-bold text-gray-500 dark:text-slate-400 uppercase">
+                          QUANTITY 3 (Recycle)
+                        </span>
+                        <span className="text-sm font-mono font-bold text-emerald-600 dark:text-emerald-400">
+                          {formatQuantityDisplay(formQuantity3)} MT
+                        </span>
+                        <span className="block text-[9px] text-gray-400">Recycling/Recovery</span>
+                      </div>
+
+                      <div className="bg-slate-50 dark:bg-slate-950 p-2.5 rounded-lg border border-gray-200 dark:border-slate-800">
+                        <span className="block text-[10px] font-bold text-gray-500 dark:text-slate-400 uppercase">
+                          TOTAL QUANTITY
+                        </span>
+                        <span className="text-sm font-mono font-bold text-slate-800 dark:text-slate-100">
+                          {formatQuantityDisplay(formTotalQty)} MT
+                        </span>
+                        <span className="block text-[9px] text-gray-400">Authoritative Sum</span>
+                      </div>
+                    </div>
+                  </div>
+                ) : (
+                  <div className="md:col-span-2 p-4 bg-amber-50 dark:bg-amber-950/20 border border-amber-200 dark:border-amber-900/30 rounded-xl text-amber-800 dark:text-amber-400 text-xs font-medium text-center">
+                    Please select a Hazardous Waste Breakdown record above to auto-populate waste movement quantities.
+                  </div>
+                )}
+              </div>
+
+              {/* SECTION 2: General Document Headers & COA Upload */}
+              <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
                 
-                {/* Drag Zone */}
+                {/* Drag & Drop COA Upload Zone */}
                 <div className="space-y-2">
                   <label className="block text-[10px] font-bold text-gray-500 dark:text-slate-400 uppercase tracking-wider">
-                    Original Source Document (PDF/DOCX/Image) *
+                    COA / Certificate of Analysis Source File *
                   </label>
                   
                   <div
                     onDragOver={handleDragOver}
                     onDragLeave={handleDragLeave}
                     onDrop={handleDrop}
-                    className={`border-2 border-dashed rounded-xl p-4 flex flex-col items-center justify-center min-h-[160px] transition-all relative ${
+                    className={`border-2 border-dashed rounded-xl p-4 flex flex-col items-center justify-center min-h-[140px] transition-all relative ${
                       showFileWarning 
                         ? "border-red-500 bg-red-50/20 dark:bg-red-950/10"
                         : isDragOver
-                        ? "border-smei-crimson bg-red-50/50 dark:bg-red-950/20"
-                        : "border-gray-200 dark:border-slate-800 hover:border-smei-crimson bg-slate-50/20 dark:bg-slate-950/30"
+                        ? "border-smei-crimson bg-red-50/10"
+                        : "border-gray-200 dark:border-slate-800 bg-gray-50/50 dark:bg-slate-950/50"
                     }`}
                   >
+                    <input
+                      type="file"
+                      accept=".pdf,.docx,.png,.jpg,.jpeg"
+                      onChange={handleFileChange}
+                      className="absolute inset-0 opacity-0 cursor-pointer w-full h-full"
+                    />
+
                     {formSourceFileName ? (
-                      <div className="w-full space-y-3">
-                        <div className="flex items-center justify-between gap-2 p-2 bg-slate-100/50 dark:bg-slate-950 rounded-lg border border-gray-100 dark:border-slate-800">
-                          <div className="flex items-center gap-2 truncate text-left">
-                            <FileText className="w-8 h-8 text-rose-500 shrink-0" />
-                            <div className="truncate">
-                              <p className="text-xs font-semibold text-gray-700 dark:text-slate-200 truncate">{formSourceFileName}</p>
-                              <p className="text-[9px] text-gray-400 font-mono uppercase">Attached</p>
-                            </div>
-                          </div>
-                          <button
-                            type="button"
-                            onClick={() => {
-                              setFormSourceFileName("");
-                              setFormSourceFileData("");
-                            }}
-                            className="p-1.5 text-gray-400 hover:text-red-500 hover:bg-red-50 dark:hover:bg-red-950/50 rounded-lg cursor-pointer transition-colors"
-                            title="Clear file"
-                          >
-                            <Trash2 className="w-4 h-4" />
-                          </button>
-                        </div>
+                      <div className="flex flex-col items-center text-center p-2 space-y-1">
+                        <FileText className="w-8 h-8 text-blue-500" />
+                        <span className="font-bold text-xs text-gray-800 dark:text-slate-200 font-mono truncate max-w-[200px]">
+                          {formSourceFileName}
+                        </span>
+                        <span className="text-[10px] text-emerald-600 dark:text-emerald-400 font-semibold flex items-center gap-1">
+                          <CheckCircle className="w-3 h-3" /> File Attached & Ready
+                        </span>
                       </div>
                     ) : (
-                      <label className="flex flex-col items-center gap-2 cursor-pointer text-center py-4 w-full h-full">
-                        <UploadCloud className="w-10 h-10 text-gray-400" />
-                        <span className="text-xs font-semibold text-gray-600 dark:text-slate-300">
-                          Drag and drop source document here, or click to select
+                      <div className="flex flex-col items-center text-center space-y-1.5">
+                        <FileText className="w-7 h-7 text-gray-400" />
+                        <span className="font-semibold text-xs text-gray-600 dark:text-slate-300">
+                          Click or drag & drop COA source document
                         </span>
                         <span className="text-[10px] text-gray-400">
-                          Accepts PDF, DOCX, PNG, JPG, JPEG (Max 10MB)
+                          Supports PDF, DOCX, PNG, JPG (Max 10MB)
                         </span>
-                        <input 
-                          type="file" 
-                          accept=".pdf,.docx,.png,.jpg,.jpeg" 
-                          className="hidden" 
-                          onChange={handleFileChange} 
-                        />
-                      </label>
+                      </div>
                     )}
                   </div>
                 </div>
 
-                {/* Date and CRD/RC Inputs */}
-                <div className="space-y-4">
+                {/* Form Fields: Dates, Numbers, Signatories */}
+                <div className="space-y-3">
                   <div>
                     <label className="block text-[10px] font-bold text-gray-500 dark:text-slate-400 uppercase tracking-wider mb-1">
                       Transport Date *
@@ -1114,171 +1472,52 @@ export default function WasteMovementModule() {
                       required
                       value={formTransportDate}
                       onChange={(e) => setFormTransportDate(e.target.value)}
-                      className="w-full bg-slate-50 dark:bg-slate-950 text-slate-800 dark:text-slate-200 border border-gray-200 dark:border-slate-800 text-xs rounded-lg p-2.5 focus:outline-none focus:ring-1 focus:ring-smei-crimson font-mono cursor-pointer"
+                      className="w-full bg-white dark:bg-slate-950 border border-gray-200 dark:border-slate-800 rounded-lg text-xs p-2.5 focus:outline-none focus:ring-1 focus:ring-smei-crimson text-gray-800 dark:text-slate-200 font-mono"
                     />
                   </div>
 
                   <div>
-                    <div className="flex items-center justify-between mb-1">
-                      <label className="block text-[10px] font-bold text-gray-500 dark:text-slate-400 uppercase tracking-wider">
-                        CRD Number (CRD No.) *
-                      </label>
-                      {formCrdNo && !validateCrdNumber(formCrdNo) && (
-                        <span className="text-[10px] text-amber-600 dark:text-amber-500 font-semibold flex items-center gap-1">
-                          <AlertCircle className="w-3.5 h-3.5" />
-                          Format must be CRD-XX-XXXX-XX
-                        </span>
-                      )}
-                    </div>
+                    <label className="block text-[10px] font-bold text-gray-500 dark:text-slate-400 uppercase tracking-wider mb-1">
+                      CRD Control Number *
+                    </label>
                     <input
                       type="text"
                       required
-                      placeholder="e.g. CRD-06-1309-26"
                       value={formCrdNo}
                       onChange={(e) => setFormCrdNo(formatControlNumber(e.target.value, "crdNumber"))}
-                      className={`w-full bg-slate-50 dark:bg-slate-950 text-slate-800 dark:text-slate-200 border rounded-lg p-2.5 focus:outline-none focus:ring-1 focus:ring-smei-crimson font-mono ${
-                        formCrdNo && !validateCrdNumber(formCrdNo)
-                          ? "border-amber-400 dark:border-amber-500"
-                          : "border-gray-200 dark:border-slate-800"
-                      }`}
+                      placeholder="e.g. CRD-06-1309-26"
+                      className="w-full bg-white dark:bg-slate-950 border border-gray-200 dark:border-slate-800 rounded-lg text-xs p-2.5 focus:outline-none focus:ring-1 focus:ring-smei-crimson text-gray-800 dark:text-slate-200 font-mono uppercase"
                     />
                   </div>
 
-                  <div>
-                    <label className="block text-[10px] font-bold text-gray-500 dark:text-slate-400 uppercase tracking-wider mb-1">
-                      Recycle Number: *
-                    </label>
-                    <input
-                      type="text"
-                      disabled={formRcNo === "N/A"}
-                      required={formRcNo !== "N/A"}
-                      placeholder={formRcNo === "N/A" ? "Auto set to N/A (Disposal/Recycle not added)" : "e.g. R-123"}
-                      value={formRcNo}
-                      onChange={(e) => setFormRcNo(formatControlNumber(e.target.value, "rcNumber"))}
-                      className="w-full bg-slate-50 dark:bg-slate-950 text-slate-800 dark:text-slate-200 border border-gray-200 dark:border-slate-800 text-xs rounded-lg p-2.5 focus:outline-none focus:ring-1 focus:ring-smei-crimson font-mono disabled:opacity-50"
-                    />
-                  </div>
+                  <RcNumberInput
+                    value={formRcNo}
+                    onChange={(formatted) => {
+                      setFormRcNo(formatted);
+                      if (isRcRequired) {
+                        const v = validateControlNumber(formatted, "rcNumber");
+                        setRcError(v.isValid ? "" : v.error || "Invalid Recycle Cert No. Expected format: R-123 (e.g., R-932, R-15402).");
+                      } else {
+                        setRcError("");
+                      }
+                    }}
+                    required={isRcRequired}
+                    disabled={!isRcRequired}
+                    label="RC Number (Recycle Cert No)"
+                    placeholder={isRcRequired ? "e.g. R-123" : "N/A"}
+                    helperText={
+                      !isRcRequired
+                        ? "Auto-set to N/A (Locked: Breakdown contains Export for Recovery only)."
+                        : "Required format: R-123 (Breakdown contains Disposal or Recycling quantities)."
+                    }
+                    showError={!!rcError}
+                    errorMessage={rcError}
+                    id="waste-movement-rc-no"
+                  />
                 </div>
 
-              </div>
-
-              {/* Section 2: Dynamic Method Adder Area */}
-              <div className="p-4 bg-slate-50 dark:bg-slate-950/60 rounded-xl border border-gray-100 dark:border-slate-800/80 space-y-4">
-                <h4 className="text-[10px] font-bold text-smei-crimson dark:text-rose-400 uppercase tracking-widest font-mono flex items-center gap-1.5 border-b border-gray-100 dark:border-slate-800 pb-2">
-                  <ClipboardList className="w-4 h-4 text-smei-crimson" />
-                  <span>Allocate Waste Movement Methods</span>
-                </h4>
-
-                {/* Sub-form inputs */}
-                <div className="grid grid-cols-1 md:grid-cols-4 gap-3 items-end">
-                  <div>
-                    <label className="block text-[10px] font-bold text-gray-500 dark:text-slate-400 uppercase tracking-wider mb-1">
-                      Method *
-                    </label>
-                    <select
-                      value={selectedMethod}
-                      onChange={(e) => setSelectedMethod(e.target.value)}
-                      className="w-full bg-white dark:bg-slate-900 text-slate-800 dark:text-slate-200 border border-gray-200 dark:border-slate-800 text-xs rounded-lg p-2 focus:outline-none focus:ring-1 focus:ring-smei-crimson cursor-pointer"
-                    >
-                      <option value="">Select Method...</option>
-                      {availableMethods.map(m => (
-                        <option key={m} value={m}>{m}</option>
-                      ))}
-                    </select>
-                  </div>
-
-                  <div>
-                    <label className="block text-[10px] font-bold text-gray-500 dark:text-slate-400 uppercase tracking-wider mb-1">
-                      Quantity (MT) *
-                    </label>
-                    <input
-                      type="number"
-                      step="0.0001"
-                      placeholder="MT Quantity..."
-                      value={methodQty}
-                      onChange={(e) => setMethodQty(e.target.value !== "" ? parseFloat(e.target.value) : "")}
-                      className="w-full bg-white dark:bg-slate-900 text-slate-800 dark:text-slate-200 border border-gray-200 dark:border-slate-800 text-xs rounded-lg p-2 focus:outline-none focus:ring-1 focus:ring-smei-crimson font-mono"
-                    />
-                  </div>
-
-                  <div>
-                    <label className="block text-[10px] font-bold text-gray-500 dark:text-slate-400 uppercase tracking-wider mb-1">
-                      Destination *
-                    </label>
-                    <input
-                      type="text"
-                      placeholder="Destination facility..."
-                      value={methodDest}
-                      onChange={(e) => setMethodDest(e.target.value)}
-                      className="w-full bg-white dark:bg-slate-900 text-slate-800 dark:text-slate-200 border border-gray-200 dark:border-slate-800 text-xs rounded-lg p-2 focus:outline-none focus:ring-1 focus:ring-smei-crimson"
-                    />
-                  </div>
-
-                  <button
-                    type="button"
-                    disabled={!selectedMethod}
-                    onClick={handleAddMethodEntry}
-                    className="bg-smei-crimson disabled:opacity-40 hover:bg-smei-darkred text-white text-xs font-semibold h-[36px] rounded-lg transition-all flex items-center justify-center gap-1 cursor-pointer"
-                  >
-                    <Plus className="w-3.5 h-3.5" />
-                    <span>Add Method</span>
-                  </button>
-                </div>
-
-                {/* List of currently added methods */}
-                {formMethods.length > 0 ? (
-                  <div className="border border-gray-100 dark:border-slate-800 rounded-lg overflow-hidden bg-white dark:bg-slate-900">
-                    <table className="w-full text-left text-[11px]">
-                      <thead>
-                        <tr className="bg-gray-50 dark:bg-slate-950 border-b border-gray-100 dark:border-slate-800 font-bold text-slate-500">
-                          <th className="p-2">Method Name</th>
-                          <th className="p-2 text-right">Quantity (MT)</th>
-                          <th className="p-2">Destination</th>
-                          <th className="p-2 text-center">Action</th>
-                        </tr>
-                      </thead>
-                      <tbody className="divide-y divide-gray-100 dark:divide-slate-800/80">
-                        {formMethods.map((m, idx) => (
-                          <tr key={idx}>
-                            <td className="p-2 font-medium">{m.method}</td>
-                            <td className="p-2 text-right font-mono font-bold text-slate-700 dark:text-slate-300">
-                              {formatQuantityDisplay(m.quantity)}
-                            </td>
-                            <td className="p-2 truncate max-w-[150px]">{m.destination}</td>
-                            <td className="p-2 text-center">
-                              <button
-                                type="button"
-                                onClick={() => handleRemoveMethodEntry(m.method)}
-                                className="p-1 hover:bg-red-50 dark:hover:bg-red-950/20 text-red-500 rounded transition-all cursor-pointer"
-                                title="Remove method"
-                              >
-                                <Trash className="w-3.5 h-3.5" />
-                              </button>
-                            </td>
-                          </tr>
-                        ))}
-                      </tbody>
-                    </table>
-
-                    {/* Calculated Grand Total Indicator */}
-                    <div className="p-2.5 bg-slate-50 dark:bg-slate-950 text-right border-t border-gray-100 dark:border-slate-800 font-mono font-bold flex justify-between items-center text-xs">
-                      <span className="text-gray-400 font-sans font-semibold">Grand Total:</span>
-                      <span className="text-emerald-600 dark:text-emerald-400">
-                        {formatQuantityDisplay(formMethods.reduce((sum, m) => sum + (m.quantity || 0), 0))} MT
-                      </span>
-                    </div>
-                  </div>
-                ) : (
-                  <div className="py-6 text-center text-[11px] text-gray-400 bg-white dark:bg-slate-900 rounded-lg border border-gray-100 dark:border-slate-800">
-                    No methods allocated. Select a method from the dropdown and click "Add Method" to allocate quantities.
-                  </div>
-                )}
-              </div>
-
-              {/* Section 3: Signatures */}
-              <div className="p-4 bg-slate-50 dark:bg-slate-950/60 rounded-xl border border-gray-100 dark:border-slate-800/80 space-y-3">
-                <h4 className="text-[10px] font-bold text-gray-400 dark:text-slate-500 uppercase tracking-widest font-mono">Signatures & Approvals</h4>
-                <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                {/* Signatories */}
+                <div className="md:col-span-2 grid grid-cols-1 sm:grid-cols-2 gap-4 bg-slate-50 dark:bg-slate-950 p-4 rounded-xl border border-gray-200 dark:border-slate-800">
                   <div>
                     <label className="block text-[10px] font-bold text-gray-500 dark:text-slate-400 uppercase tracking-wider mb-1">
                       Signed By (Pollution Control Officer) *
@@ -1287,45 +1526,49 @@ export default function WasteMovementModule() {
                       type="text"
                       required
                       value={formSignedBy}
-                      onChange={(e) => setFormSignedBy(e.target.value)}
-                      className="w-full bg-white dark:bg-slate-900 text-slate-800 dark:text-slate-200 border border-gray-200 dark:border-slate-800 text-xs rounded-lg p-2 focus:outline-none focus:ring-1 focus:ring-smei-crimson uppercase"
+                      onChange={(e) => setFormSignedBy(e.target.value.toUpperCase())}
+                      placeholder="ENGR. MARY ANN PEDROSO"
+                      className="w-full bg-white dark:bg-slate-900 border border-gray-200 dark:border-slate-800 rounded-lg text-xs p-2.5 focus:outline-none focus:ring-1 focus:ring-smei-crimson text-gray-800 dark:text-slate-200 font-sans uppercase font-semibold"
                     />
                   </div>
 
                   <div>
                     <label className="block text-[10px] font-bold text-gray-500 dark:text-slate-400 uppercase tracking-wider mb-1">
-                      Noted By (Asst. Admin/Technical Manager) *
+                      Noted By (Technical Manager) *
                     </label>
                     <input
                       type="text"
                       required
                       value={formNotedBy}
-                      onChange={(e) => setFormNotedBy(e.target.value)}
-                      className="w-full bg-white dark:bg-slate-900 text-slate-800 dark:text-slate-200 border border-gray-200 dark:border-slate-800 text-xs rounded-lg p-2 focus:outline-none focus:ring-1 focus:ring-smei-crimson uppercase"
+                      onChange={(e) => setFormNotedBy(e.target.value.toUpperCase())}
+                      placeholder="APRILYN ROGADOR"
+                      className="w-full bg-white dark:bg-slate-900 border border-gray-200 dark:border-slate-800 rounded-lg text-xs p-2.5 focus:outline-none focus:ring-1 focus:ring-smei-crimson text-gray-800 dark:text-slate-200 font-sans uppercase font-semibold"
                     />
                   </div>
                 </div>
+
               </div>
 
-              {/* Form Actions */}
-              <div className="flex gap-3 pt-3 border-t border-gray-100 dark:border-slate-800">
+              {/* Modal Footer */}
+              <div className="pt-4 border-t border-gray-100 dark:border-slate-800 flex items-center justify-end gap-3">
                 <button
                   type="button"
                   onClick={() => setIsModalOpen(false)}
-                  className="flex-1 border border-gray-200 dark:border-slate-800 hover:bg-gray-50 dark:hover:bg-slate-800 text-slate-700 dark:text-slate-300 text-xs font-semibold h-[38px] rounded-lg cursor-pointer"
+                  className="px-4 py-2 border border-gray-200 dark:border-slate-800 text-gray-600 dark:text-slate-300 rounded-lg hover:bg-gray-50 dark:hover:bg-slate-800 font-semibold cursor-pointer"
                 >
                   Cancel
                 </button>
                 <button
                   type="submit"
-                  className="flex-1 bg-smei-crimson hover:bg-smei-darkred text-white text-xs font-semibold h-[38px] rounded-lg transition-all flex items-center justify-center gap-1.5 shadow-sm cursor-pointer hover:scale-[1.02] active:scale-95"
+                  className="px-5 py-2 bg-smei-crimson hover:bg-smei-darkred text-white rounded-lg font-semibold shadow-sm transition-all hover:scale-[1.02] active:scale-95 cursor-pointer"
                 >
-                  <Save className="w-4 h-4" />
-                  <span>{editingRecordId ? "Save Changes" : "Create Record"}</span>
+                  {editingRecordId ? "Save Changes" : "Create Summary Document"}
                 </button>
               </div>
 
             </form>
+              );
+            })()}
           </div>
         </div>
       )}

@@ -4,6 +4,8 @@ import Docxtemplater from "docxtemplater";
 import ImageModule from "docxtemplater-image-module-free";
 import ExcelJS from "exceljs";
 import * as XLSX from "xlsx";
+import { computePurposeFit, computePoFit } from "./purposeAutoFit";
+import { getHazwasteSheetName } from "./hazardousWasteExport";
 
 function base64Parser(dataUrl: string) {
   if (typeof dataUrl !== "string") return dataUrl;
@@ -660,6 +662,222 @@ function parseSheets(zip: PizZip): SheetInfo[] {
 }
 
 // Generate Excel Blob + HTML with exact same core engine
+function colToNum(col: string): number {
+  let num = 0;
+  for (let i = 0; i < col.length; i++) {
+    num = num * 26 + (col.charCodeAt(i) - 64);
+  }
+  return num;
+}
+
+function ensureMergeCellRange(sheetXml: string, rangeRef: string): string {
+  const match = rangeRef.match(/^([A-Z]+)(\d+):([A-Z]+)(\d+)$/);
+  if (!match) return sheetXml;
+  const targetCol1 = match[1];
+  const targetR1 = parseInt(match[2], 10);
+  const targetCol2 = match[3];
+  const targetR2 = parseInt(match[4], 10);
+
+  const tC1 = colToNum(targetCol1);
+  const tC2 = colToNum(targetCol2);
+
+  if (sheetXml.includes(`ref="${rangeRef}"`)) {
+    return sheetXml;
+  }
+
+  let updatedSheetXml = sheetXml.replace(/<mergeCell ref="([A-Z]+)(\d+):([A-Z]+)(\d+)"\/>/g, (fullMatch, c1, r1Str, c2, r2Str) => {
+    const r1 = parseInt(r1Str, 10);
+    const r2 = parseInt(r2Str, 10);
+    const colNum1 = colToNum(c1);
+    const colNum2 = colToNum(c2);
+
+    const rowOverlap = !(r2 < targetR1 || r1 > targetR2);
+    const colOverlap = !(colNum2 < tC1 || colNum1 > tC2);
+
+    if (rowOverlap && colOverlap) {
+      return "";
+    }
+    return fullMatch;
+  });
+
+  const newTag = `<mergeCell ref="${rangeRef}"/>`;
+  if (updatedSheetXml.includes("</mergeCells>")) {
+    updatedSheetXml = updatedSheetXml.replace("</mergeCells>", `${newTag}</mergeCells>`);
+    const countMatches = (updatedSheetXml.match(/<mergeCell /g) || []).length;
+    updatedSheetXml = updatedSheetXml.replace(/<mergeCells count="(\d+)">/, `<mergeCells count="${countMatches}">`);
+  } else if (updatedSheetXml.includes("</worksheet>")) {
+    updatedSheetXml = updatedSheetXml.replace("</worksheet>", `<mergeCells count="1">${newTag}</mergeCells></worksheet>`);
+  }
+
+  return updatedSheetXml;
+}
+
+function replaceExactCell(
+  rowXml: string,
+  cellRef: string,
+  replacement: string
+): string {
+  const escapedCellRef = cellRef.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const regex = new RegExp(
+    `<c\\s+[^>]*?\\br="${escapedCellRef}"[^>]*?\\/>|<c\\s+[^>]*?\\br="${escapedCellRef}"[^>]*?>[\\s\\S]*?<\\/c>`,
+    "s"
+  );
+  return rowXml.replace(regex, replacement);
+}
+
+function createGrandTotalStyle(
+  stylesXml: string,
+  baseStyleId: number
+): { stylesXml: string; newStyleId: string } {
+  if (!stylesXml) return { stylesXml, newStyleId: String(baseStyleId) };
+
+  const xfsMatch = stylesXml.match(/<cellXfs count="(\d+)">([\s\S]*?)<\/cellXfs>/);
+  if (!xfsMatch) return { stylesXml, newStyleId: String(baseStyleId) };
+
+  const xfCount = parseInt(xfsMatch[1], 10);
+  const xfList = xfsMatch[2].match(/<xf [^>]*\/>|<xf [^>]*>[\s\S]*?<\/xf>/g);
+  if (!xfList || !xfList[baseStyleId]) return { stylesXml, newStyleId: String(baseStyleId) };
+
+  const baseXf = xfList[baseStyleId];
+  const fontIdMatch = baseXf.match(/fontId="(\d+)"/);
+  const baseFontId = fontIdMatch ? parseInt(fontIdMatch[1], 10) : 0;
+
+  const fontsMatch = stylesXml.match(/<fonts count="(\d+)">([\s\S]*?)<\/fonts>/);
+  if (!fontsMatch) return { stylesXml, newStyleId: String(baseStyleId) };
+  const fontCount = parseInt(fontsMatch[1], 10);
+  const fontList = fontsMatch[2].match(/<font>[\s\S]*?<\/font>/g);
+  if (!fontList || !fontList[baseFontId]) return { stylesXml, newStyleId: String(baseStyleId) };
+
+  let baseFont = fontList[baseFontId];
+  const szMatch = baseFont.match(/<sz val="(\d+(?:\.\d+)?)"\/>/);
+  const currentSz = szMatch ? parseFloat(szMatch[1]) : 10;
+  const newSz = currentSz + 1;
+
+  let newFont = baseFont;
+  if (szMatch) {
+    newFont = newFont.replace(/<sz val="[^"]*"\/>/, `<sz val="${newSz}"/>`);
+  } else {
+    newFont = newFont.replace("<font>", `<font><sz val="${newSz}"/>`);
+  }
+  if (!newFont.includes("<b/>") && !newFont.includes("<b>")) {
+    newFont = newFont.replace("<font>", "<font><b/>");
+  }
+
+  const newFontId = fontCount;
+  let updatedStyles = stylesXml.replace(/<fonts count="(\d+)">/, `<fonts count="${fontCount + 1}">`);
+  updatedStyles = updatedStyles.replace("</fonts>", `${newFont}</fonts>`);
+
+  let newXf = baseXf.replace(`fontId="${baseFontId}"`, `fontId="${newFontId}"`);
+  if (!newXf.includes("applyFont=")) {
+    newXf = newXf.replace("<xf ", `<xf applyFont="1" `);
+  } else {
+    newXf = newXf.replace(/applyFont="0"/, `applyFont="1"`);
+  }
+
+  const newStyleId = xfCount;
+  updatedStyles = updatedStyles.replace(/<cellXfs count="(\d+)">/, `<cellXfs count="${xfCount + 1}">`);
+  updatedStyles = updatedStyles.replace("</cellXfs>", `${newXf}</cellXfs>`);
+
+  return { stylesXml: updatedStyles, newStyleId: String(newStyleId) };
+}
+
+function parseBufferImageDimensions(buffer: Uint8Array | Buffer): { width: number; height: number } | null {
+  if (!buffer || buffer.length < 8) return null;
+  // PNG
+  if (buffer[0] === 0x89 && buffer[1] === 0x50 && buffer[2] === 0x4E && buffer[3] === 0x47) {
+    const width = (buffer[16] << 24) | (buffer[17] << 16) | (buffer[18] << 8) | buffer[19];
+    const height = (buffer[20] << 24) | (buffer[21] << 16) | (buffer[22] << 8) | buffer[23];
+    if (width > 0 && height > 0) return { width: Math.abs(width), height: Math.abs(height) };
+  }
+  // JPEG
+  if (buffer[0] === 0xFF && buffer[1] === 0xD8) {
+    let offset = 2;
+    while (offset < buffer.length - 8) {
+      if (buffer[offset] !== 0xFF) {
+        offset++;
+        continue;
+      }
+      const marker = buffer[offset + 1];
+      if ((marker >= 0xC0 && marker <= 0xCF) && marker !== 0xC4 && marker !== 0xC8 && marker !== 0xCC) {
+        const height = (buffer[offset + 5] << 8) | buffer[offset + 6];
+        const width = (buffer[offset + 7] << 8) | buffer[offset + 8];
+        if (width > 0 && height > 0) return { width, height };
+      }
+      const len = (buffer[offset + 2] << 8) | buffer[offset + 3];
+      if (isNaN(len) || len <= 0) break;
+      offset += 2 + len;
+    }
+  }
+  return null;
+}
+
+const UNLOADING_LOADING_COL_WIDTHS_EMU: Record<number, number> = {
+  3: 685738,
+  4: 685738,
+  5: 219103,
+  6: 933450,
+  7: 609880
+};
+const UNLOADING_LOADING_ROW_HEIGHT_EMU = 161925; // 12.75pt * 12700
+
+function normalizeRowOffset(row: number, rowOff: number): { row: number; rowOff: number } {
+  let r = row;
+  let off = rowOff;
+  while (off < 0 && r > 0) {
+    r -= 1;
+    off += UNLOADING_LOADING_ROW_HEIGHT_EMU;
+  }
+  while (off >= UNLOADING_LOADING_ROW_HEIGHT_EMU) {
+    off -= UNLOADING_LOADING_ROW_HEIGHT_EMU;
+    r += 1;
+  }
+  return { row: r, rowOff: Math.round(off) };
+}
+
+function normalizeColOffset(col: number, colOff: number): { col: number; colOff: number } {
+  let c = col;
+  let off = colOff;
+  while (off < 0 && c > 0) {
+    c -= 1;
+    off += (UNLOADING_LOADING_COL_WIDTHS_EMU[c] || 609880);
+  }
+  while (off >= (UNLOADING_LOADING_COL_WIDTHS_EMU[c] || 609880)) {
+    off -= (UNLOADING_LOADING_COL_WIDTHS_EMU[c] || 609880);
+    c += 1;
+  }
+  return { col: c, colOff: Math.round(off) };
+}
+
+function computeFitAnchor(
+  frame: { fromCol: number; fromColOff: number; fromRow: number; fromRowOff: number; toCol: number; toColOff: number; toRow: number; toRowOff: number; cx: number; cy: number },
+  imgW: number,
+  imgH: number
+) {
+  const frameW = frame.cx;
+  const frameH = frame.cy;
+  const scale = Math.min(frameW / imgW, frameH / imgH);
+  const renderW = Math.round(imgW * scale);
+  const renderH = Math.round(imgH * scale);
+  const padX = Math.round((frameW - renderW) / 2);
+  const padY = Math.round((frameH - renderH) / 2);
+
+  const rawFromCol = normalizeColOffset(frame.fromCol, frame.fromColOff + padX);
+  const rawFromRow = normalizeRowOffset(frame.fromRow, frame.fromRowOff + padY);
+  const rawToCol = normalizeColOffset(frame.toCol, frame.toColOff - padX);
+  const rawToRow = normalizeRowOffset(frame.toRow, frame.toRowOff - padY);
+
+  return {
+    fromCol: rawFromCol.col,
+    fromColOff: rawFromCol.colOff,
+    fromRow: rawFromRow.row,
+    fromRowOff: rawFromRow.rowOff,
+    toCol: rawToCol.col,
+    toColOff: rawToCol.colOff,
+    toRow: rawToRow.row,
+    toRowOff: rawToRow.rowOff,
+  };
+}
+
 export async function generateXlsxBlob(
   templateName: string,
   data: Record<string, any>,
@@ -685,131 +903,438 @@ export async function generateXlsxBlob(
     let sharedStringsXml = originalZip.file("xl/sharedStrings.xml")?.asText() || "";
     
     if (templateName === "PIS_TEMPLATE.xlsm") {
-      sharedStringsXml = replacePlaceholdersInSharedStrings(sharedStringsXml, data);
       let sheet1Xml = originalZip.file("xl/worksheets/sheet1.xml")?.asText() || "";
-      if (sheet1Xml) {
-        // Collect all payment entries
-        const paymentList: Array<{ poNumber: string; purpose: string; gross: string; ewt: string; total: string }> = [];
 
-        if (Array.isArray(data.payments) && data.payments.length > 0) {
-          data.payments.forEach((p: any) => {
-            paymentList.push({
-              poNumber: p.poNumber || p.po_no || p.poNo || "",
-              purpose: p.paymentPurpose || p.purpose || "",
-              gross: p.gross > 0 ? (typeof p.gross === "string" ? p.gross : String(p.gross)) : (p.grossStr || ""),
-              ewt: p.ewt > 0 ? (typeof p.ewt === "string" ? p.ewt : String(p.ewt)) : (p.ewtStr || ""),
-              total: p.total > 0 ? (typeof p.total === "string" ? p.total : String(p.total)) : (p.totalStr || "")
-            });
-          });
-        } else {
-          let idx = 1;
-          while (
-            data[`PAYMENT_PURPOSE_${idx}`] !== undefined ||
-            data[`GROSS_${idx}`] !== undefined ||
-            data[`EWT_${idx}`] !== undefined ||
-            data[`TOTAL_${idx}`] !== undefined ||
-            data[`PO_NO_${idx}`] !== undefined
-          ) {
-            const purpose = data[`PAYMENT_PURPOSE_${idx}`] || "";
-            const gross = data[`GROSS_${idx}`] || "";
-            const ewt = data[`EWT_${idx}`] || "";
-            const total = data[`TOTAL_${idx}`] || "";
-            const poNumber = data[`PO_NO_${idx}`] || "";
-            if (purpose || gross || ewt || total || poNumber) {
-              paymentList.push({ poNumber, purpose, gross, ewt, total });
-            }
-            idx++;
+      // Extract payments list from data
+      let paymentEntries: Array<{ poNumber: string; purposeText: string; gross?: number; ewt?: number; total?: number }> = data.PIS_PAYMENT_ENTRIES || [];
+
+      if (!paymentEntries || paymentEntries.length === 0) {
+        paymentEntries = [];
+        let i = 1;
+        while (true) {
+          const purp = data[`PURPOSE${i}`] || data[`PURPOSE_${i}`] || data[`PAYMENT_PURPOSE_${i}`] || "";
+          const po = data[`PO_NO${i}`] || data[`PO_NO_${i}`] || data[`COMPLETED_PO_${i}`] || "";
+          if (!purp && !po && i > 3) break;
+          if (purp || po || i <= 3) {
+            paymentEntries.push({ poNumber: po, purposeText: purp });
           }
+          i++;
+        }
+      }
+
+      const activePurposes = paymentEntries.filter(p => (p.purposeText || "").trim() !== "" || (p.poNumber || "").trim() !== "");
+      const totalPurposes = activePurposes.length;
+
+      // Ensure data object has PURPOSE1..3 and PO_NO1..3 mapped for placeholder substitution
+      data.PURPOSE1 = (activePurposes[0]?.purposeText || "").toUpperCase();
+      data.PURPOSE2 = (activePurposes[1]?.purposeText || "").toUpperCase();
+      data.PURPOSE3 = (activePurposes[2]?.purposeText || "").toUpperCase();
+      data.PO_NO1 = (activePurposes[0]?.poNumber || "").slice(0, 40);
+      data.PO_NO2 = (activePurposes[1]?.poNumber || "").slice(0, 40);
+      data.PO_NO3 = (activePurposes[2]?.poNumber || "").slice(0, 40);
+
+      // Extract prototype PURPOSE and PO_NO <si> blocks before placeholder replacement
+      const purposeSiPrototypeMatch = sharedStringsXml.match(/<si\b[^>]*>(?:(?!<\/si>).)*?PURPOSE(?:(?!<\/si>).)*?<\/si>/is);
+      const purposeSiPrototype = purposeSiPrototypeMatch ? purposeSiPrototypeMatch[0] : "";
+
+      const poNoSiPrototypeMatch = sharedStringsXml.match(/<si\b[^>]*>(?:(?!<\/si>).)*?PO_NO(?:(?!<\/si>).)*?<\/si>/is);
+      const poNoSiPrototype = poNoSiPrototypeMatch ? poNoSiPrototypeMatch[0] : "";
+
+      // Replace placeholders in sharedStrings.xml
+      sharedStringsXml = replacePlaceholdersInSharedStrings(sharedStringsXml, data);
+
+      // Check if calculation section values exist (Scenario A vs Scenario B)
+      const hasCalculationValues = !!(
+        (data.GROSS && String(data.GROSS).trim() !== "") ||
+        (data.TOTAL && String(data.TOTAL).trim() !== "") ||
+        (data.GROSS_1 && String(data.GROSS_1).trim() !== "") ||
+        (data.TOTAL_1 && String(data.TOTAL_1).trim() !== "") ||
+        data.HAS_TOTAL
+      );
+
+      if (!hasCalculationValues) {
+        // Scenario A: Hide GROSS, EWT (1%), and TOTAL labels and empty value cells
+        sheet1Xml = injectCellValue(sheet1Xml, "K14", "", true); // GROSS Label
+        sheet1Xml = injectCellValue(sheet1Xml, "N14", "", true); // EWT Label
+        sheet1Xml = injectCellValue(sheet1Xml, "U14", "", true); // TOTAL Label
+        sheet1Xml = injectCellValue(sheet1Xml, "K15", "", true); // GROSS 1
+        sheet1Xml = injectCellValue(sheet1Xml, "N15", "", true); // EWT 1
+        sheet1Xml = injectCellValue(sheet1Xml, "U15", "", true); // TOTAL 1
+        sheet1Xml = injectCellValue(sheet1Xml, "K16", "", true);
+        sheet1Xml = injectCellValue(sheet1Xml, "N16", "", true);
+        sheet1Xml = injectCellValue(sheet1Xml, "U16", "", true);
+        sheet1Xml = injectCellValue(sheet1Xml, "K17", "", true);
+        sheet1Xml = injectCellValue(sheet1Xml, "N17", "", true);
+        sheet1Xml = injectCellValue(sheet1Xml, "U17", "", true);
+      } else {
+        if (data.EWT_PERCENTAGE && data.EWT_PERCENTAGE !== "1%") {
+          sheet1Xml = injectCellValue(sheet1Xml, "N14", `EWT (${data.EWT_PERCENTAGE})`, true);
         }
 
-        if (paymentList.length === 0) {
-          // Clear payment labels and cells entirely to hide section
-          sheet1Xml = injectCellValue(sheet1Xml, "K14", "", true); // GROSS Label
-          sheet1Xml = injectCellValue(sheet1Xml, "N14", "", true); // EWT Label
-          sheet1Xml = injectCellValue(sheet1Xml, "U14", "", true); // TOTAL Label
-          sheet1Xml = injectCellValue(sheet1Xml, "K15", "", true); // GROSS 1
-          sheet1Xml = injectCellValue(sheet1Xml, "N15", "", true); // EWT 1
-          sheet1Xml = injectCellValue(sheet1Xml, "U15", "", true); // TOTAL 1
-          sheet1Xml = injectCellValue(sheet1Xml, "K16", "", true); // GROSS 2
-          sheet1Xml = injectCellValue(sheet1Xml, "N16", "", true); // EWT 2
-          sheet1Xml = injectCellValue(sheet1Xml, "U16", "", true); // TOTAL 2
-          sheet1Xml = injectCellValue(sheet1Xml, "K17", "", true); // GROSS 3
-          sheet1Xml = injectCellValue(sheet1Xml, "N17", "", true); // EWT 3
-          sheet1Xml = injectCellValue(sheet1Xml, "U17", "", true); // TOTAL 3
-        } else {
-          const totalPayments = paymentList.length;
+        const formatVal = (num: number) =>
+          num.toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 });
 
-          // If more than 4 payments, shift footer rows (>= 19) down by (totalPayments - 4)
-          if (totalPayments > 4) {
-            const shiftCount = totalPayments - 4;
-            sheet1Xml = sheet1Xml.replace(/<row\s+([^>]*?)\br="(\d+)"/g, (match, p1, rStr) => {
-              const rVal = parseInt(rStr, 10);
-              if (rVal >= 19) {
-                return `<row ${p1}r="${rVal + shiftCount}"`;
-              }
-              return match;
-            });
-            sheet1Xml = sheet1Xml.replace(/<c\s+([^>]*?)\br="([A-Z]+)(\d+)"/g, (match, p1, col, rStr) => {
-              const rVal = parseInt(rStr, 10);
-              if (rVal >= 19) {
-                return `<c ${p1}r="${col}${rVal + shiftCount}"`;
-              }
-              return match;
-            });
-            sheet1Xml = sheet1Xml.replace(/<mergeCell\s+ref="([A-Z]+)(\d+):([A-Z]+)(\d+)"\/>/g, (match, col1, r1Str, col2, r2Str) => {
-              const r1 = parseInt(r1Str, 10);
-              const r2 = parseInt(r2Str, 10);
-              if (r1 >= 19 && r2 >= 19) {
-                return `<mergeCell ref="${col1}${r1 + shiftCount}:${col2}${r2 + shiftCount}"/>`;
-              }
-              return match;
-            });
+        // Scenario D: Inject values for 2nd and 3rd entries if present
+        const g2 = data.GROSS_2 || (activePurposes[1]?.gross ? formatVal(activePurposes[1].gross) : "");
+        const e2 = data.EWT_2 || (activePurposes[1] && (activePurposes[1].gross || 0) * (activePurposes[1].ewt || 0) > 0 ? formatVal((activePurposes[1].gross || 0) * (activePurposes[1].ewt || 0) / 100) : "");
+        const t2 = data.TOTAL_2 || (activePurposes[1]?.total ? formatVal(activePurposes[1].total) : "");
+        if (g2) sheet1Xml = injectCellValue(sheet1Xml, "K16", g2, true);
+        if (e2) sheet1Xml = injectCellValue(sheet1Xml, "N16", e2, true);
+        if (t2) {
+          sheet1Xml = injectCellValue(sheet1Xml, "T16", t2, true);
+          sheet1Xml = injectCellValue(sheet1Xml, "U16", t2, true);
+        }
 
-            const createEmptyRowXml = (r: number) =>
-              `<row r="${r}" spans="1:21"><c r="A${r}" s="2"/><c r="B${r}" s="2"/><c r="C${r}" s="2"/><c r="D${r}" s="2"/><c r="E${r}" s="2"/><c r="F${r}" s="2"/><c r="G${r}" s="2"/><c r="H${r}" s="66"/><c r="I${r}" s="66"/><c r="J${r}" s="2"/><c r="K${r}" s="2"/><c r="L${r}" s="2"/><c r="M${r}" s="2"/><c r="N${r}" s="2"/><c r="O${r}" s="2"/><c r="P${r}" s="2"/><c r="Q${r}" s="2"/><c r="R${r}" s="2"/><c r="S${r}" s="2"/><c r="T${r}" s="2"/><c r="U${r}" s="2"/></row>`;
+        const g3 = data.GROSS_3 || (activePurposes[2]?.gross ? formatVal(activePurposes[2].gross) : "");
+        const e3 = data.EWT_3 || (activePurposes[2] && (activePurposes[2].gross || 0) * (activePurposes[2].ewt || 0) > 0 ? formatVal((activePurposes[2].gross || 0) * (activePurposes[2].ewt || 0) / 100) : "");
+        const t3 = data.TOTAL_3 || (activePurposes[2]?.total ? formatVal(activePurposes[2].total) : "");
+        if (g3) sheet1Xml = injectCellValue(sheet1Xml, "K17", g3, true);
+        if (e3) sheet1Xml = injectCellValue(sheet1Xml, "N17", e3, true);
+        if (t3) {
+          sheet1Xml = injectCellValue(sheet1Xml, "T17", t3, true);
+          sheet1Xml = injectCellValue(sheet1Xml, "U17", t3, true);
+        }
+      }
 
-            let newRowsXml = "";
-            for (let r = 19; r <= 18 + shiftCount; r++) {
-              newRowsXml += createEmptyRowXml(r);
-            }
+      // Ensure consistent merged-cell structure for Gross Amount, PO Number, Purpose, EWT, and Total across all entries
+      const standardMergeRanges = [
+        "A15:B15", "C15:J15", "K15:M15", "N15:Q15", "T15:U15",
+        "A16:B16", "C16:J16", "K16:M16", "N16:Q16", "T16:U16",
+        "A17:B17", "C17:J17", "K17:M17", "N17:Q17", "T17:U17",
+      ];
+      for (const rng of standardMergeRanges) {
+        sheet1Xml = ensureMergeCellRange(sheet1Xml, rng);
+      }
 
-            const targetRowTag = `<row r="${19 + shiftCount}"`;
-            sheet1Xml = sheet1Xml.replace(targetRowTag, newRowsXml + targetRowTag);
-          }
+      // Extract style IDs from First Entry (Row 15) as the formatting source of truth
+      const getStyleId = (xml: string, cellRef: string): string => {
+        const match = xml.match(new RegExp(`<c\\s+[^>]*?\\br="${cellRef}"[^>]*?\\bs="(\\d+)"`, 'i'))
+          || xml.match(new RegExp(`<c\\s+[^>]*?\\bs="(\\d+)"[^>]*?\\br="${cellRef}"`, 'i'));
+        return match ? match[1] : "";
+      };
 
-          // Inject payment values into rows 15 to 14 + totalPayments
-          for (let i = 0; i < totalPayments; i++) {
-            const rowNum = 15 + i;
-            const entry = paymentList[i];
+      const formatVal = (num: number) =>
+        num.toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 });
 
-            if (rowNum === 15) {
-              if (entry.poNumber) sheet1Xml = injectCellValue(sheet1Xml, "A15", entry.poNumber, true);
-              sheet1Xml = injectCellValue(sheet1Xml, "B15", entry.purpose || "", true);
-              sheet1Xml = injectCellValue(sheet1Xml, "K15", entry.gross || "", true);
-              sheet1Xml = injectCellValue(sheet1Xml, "N15", entry.ewt || "", true);
-              sheet1Xml = injectCellValue(sheet1Xml, "U15", entry.total || "", true);
-            } else if (rowNum === 16) {
-              if (entry.poNumber) sheet1Xml = injectCellValue(sheet1Xml, "A16", entry.poNumber, true);
-              sheet1Xml = injectCellValue(sheet1Xml, "B16", entry.purpose || "", true);
-              sheet1Xml = injectCellValue(sheet1Xml, "K16", entry.gross || "", true);
-              sheet1Xml = injectCellValue(sheet1Xml, "N16", entry.ewt || "", true);
-              sheet1Xml = injectCellValue(sheet1Xml, "U16", entry.total || "", true);
-            } else if (rowNum === 17) {
-              if (entry.poNumber) sheet1Xml = injectCellValue(sheet1Xml, "A17", entry.poNumber, true);
-              sheet1Xml = injectCellValue(sheet1Xml, "B17", entry.purpose || "", true);
-              sheet1Xml = injectCellValue(sheet1Xml, "K17", entry.gross || "", true);
-              sheet1Xml = injectCellValue(sheet1Xml, "N17", entry.ewt || "", true);
-              sheet1Xml = injectCellValue(sheet1Xml, "U17", entry.total || "", true);
+      // Ensure cells in rows 15, 16, 17 use style 7 (blue font style in PIS template) instead of style 57 (red/black)
+      sheet1Xml = sheet1Xml.replace(/<c r="C15" s="57"/g, '<c r="C15" s="7"');
+      sheet1Xml = sheet1Xml.replace(/<c r="C16" s="57"/g, '<c r="C16" s="7"');
+      sheet1Xml = sheet1Xml.replace(/<c r="C17" s="57"/g, '<c r="C17" s="7"');
+      sheet1Xml = sheet1Xml.replace(/<c r="A15" s="57"/g, '<c r="A15" s="7"');
+      sheet1Xml = sheet1Xml.replace(/<c r="A16" s="57"/g, '<c r="A16" s="7"');
+      sheet1Xml = sheet1Xml.replace(/<c r="A17" s="57"/g, '<c r="A17" s="7"');
+
+      const stylePO = getStyleId(sheet1Xml, "A15") || "7";
+      const stylePurpose = getStyleId(sheet1Xml, "C15") || "7";
+      const styleGross = getStyleId(sheet1Xml, "K15") || "41";
+      const styleEwt = getStyleId(sheet1Xml, "N15") || "70";
+      const styleTotal = getStyleId(sheet1Xml, "T15") || "69";
+
+      let stylesXml = originalZip.file("xl/styles.xml")?.asText() || "";
+      let styleGrandTotal = styleTotal;
+      if (stylesXml && styleTotal) {
+        const res = createGrandTotalStyle(stylesXml, parseInt(styleTotal, 10));
+        stylesXml = res.stylesXml;
+        styleGrandTotal = res.newStyleId;
+        originalZip.file("xl/styles.xml", stylesXml);
+      }
+
+      // Perform dynamic purpose expansion if totalPurposes > 3
+      if (totalPurposes > 3 && sheet1Xml) {
+        const extraRows = totalPurposes - 3;
+
+        const addSharedString = (text: string, isPurpose: boolean = false): number => {
+          const matches = sharedStringsXml.match(/<si>/g);
+          const currIdx = matches ? matches.length : 0;
+          const strText = (text || "").toUpperCase();
+          const escapedText = escapeXml(strText);
+
+          const prototype = isPurpose ? purposeSiPrototype : poNoSiPrototype;
+          let newSi = `<si><t>${escapedText}</t></si>`;
+
+          if (prototype) {
+            let inner = prototype.replace(/<si\b[^>]*>([\s\S]*?)<\/si>/i, "$1");
+            inner = inner.replace(/\{\{[^{}]+\}\}|\{[^{}]+\}|PURPOSE\d*|PO_NO\d*/gi, escapedText);
+
+            let targetFontSize: number | null = null;
+            if (isPurpose) {
+              const fit = computePurposeFit(strText);
+              targetFontSize = fit.fontSize;
             } else {
-              sheet1Xml = injectCellValue(sheet1Xml, `A${rowNum}`, entry.poNumber || "", true);
-              sheet1Xml = injectCellValue(sheet1Xml, `C${rowNum}`, entry.purpose || "", true);
-              sheet1Xml = injectCellValue(sheet1Xml, `K${rowNum}`, entry.gross || "", true);
-              sheet1Xml = injectCellValue(sheet1Xml, `N${rowNum}`, entry.ewt || "", true);
-              sheet1Xml = injectCellValue(sheet1Xml, `T${rowNum}`, entry.total || "", true);
-              sheet1Xml = injectCellValue(sheet1Xml, `U${rowNum}`, entry.total || "", true);
+              const fit = computePoFit(strText);
+              targetFontSize = fit.fontSize;
+            }
+
+            if (targetFontSize !== null) {
+              if (/<rPr\b[^>]*>/i.test(inner)) {
+                inner = inner.replace(/<rPr\b([^>]*)>([\s\S]*?)<\/rPr>/gi, (rPrMatch, rPrAttrs, rPrContent) => {
+                  if (/<sz\b[^>]*\/>/i.test(rPrContent)) {
+                    const newContent = rPrContent.replace(/<sz\s+val=["']\d+["']\s*\/?>/gi, `<sz val="${targetFontSize}"/>`);
+                    return `<rPr${rPrAttrs}>${newContent}</rPr>`;
+                  } else {
+                    return `<rPr${rPrAttrs}><sz val="${targetFontSize}"/>${rPrContent}</rPr>`;
+                  }
+                });
+              } else if (targetFontSize < 11) {
+                if (/<t\b[^>]*>([\s\S]*?)<\/t>/i.test(inner)) {
+                  inner = inner.replace(/<t\b([^>]*)>([\s\S]*?)<\/t>/gi, (tMatch, tAttrs, tContent) => {
+                    return `<r><rPr><rFont val="Tahoma"/><sz val="${targetFontSize}"/><color rgb="FF0000FF"/></rPr><t${tAttrs}>${tContent}</t></r>`;
+                  });
+                } else {
+                  inner = `<r><rPr><rFont val="Tahoma"/><sz val="${targetFontSize}"/><color rgb="FF0000FF"/></rPr><t>${inner}</t></r>`;
+                }
+              }
+            }
+            newSi = `<si>${inner}</si>`;
+          } else {
+            let targetFontSize: number | null = null;
+            if (isPurpose) {
+              const fit = computePurposeFit(strText);
+              targetFontSize = fit.fontSize;
+            } else {
+              const fit = computePoFit(strText);
+              targetFontSize = fit.fontSize;
+            }
+
+            if (targetFontSize !== null && targetFontSize < 11) {
+              newSi = `<si><r><rPr><rFont val="Tahoma"/><sz val="${targetFontSize}"/><color rgb="FF0000FF"/></rPr><t>${escapedText}</t></r></si>`;
             }
           }
+
+          sharedStringsXml = sharedStringsXml.replace("</sst>", `${newSi}</sst>`);
+
+          const countMatch = sharedStringsXml.match(/count="(\d+)"/);
+          const uniqueMatch = sharedStringsXml.match(/uniqueCount="(\d+)"/);
+          if (countMatch) {
+            const count = parseInt(countMatch[1], 10);
+            sharedStringsXml = sharedStringsXml.replace(`count="${count}"`, `count="${count + 1}"`);
+          }
+          if (uniqueMatch) {
+            const ucount = parseInt(uniqueMatch[1], 10);
+            sharedStringsXml = sharedStringsXml.replace(`uniqueCount="${ucount}"`, `uniqueCount="${ucount + 1}"`);
+          }
+          return currIdx;
+        };
+
+        // Shift merged cells starting at or after row 18 down by extraRows
+        sheet1Xml = sheet1Xml.replace(/<mergeCell ref="([A-Z]+)(\d+):([A-Z]+)(\d+)"\/>/g, (m, col1, r1Str, col2, r2Str) => {
+          let r1 = parseInt(r1Str, 10);
+          let r2 = parseInt(r2Str, 10);
+          if (r1 >= 18) r1 += extraRows;
+          if (r2 >= 18) r2 += extraRows;
+          return `<mergeCell ref="${col1}${r1}:${col2}${r2}"/>`;
+        });
+
+        // Extract Row 17 XML as prototype
+        const row17Match = sheet1Xml.match(/<row r="17"[^>]*>.*?<\/row>/s);
+        const row17Xml = row17Match ? row17Match[0] : "";
+
+        // Extract all rows from sheet1Xml
+        const rowRegex = /<row r="(\d+)"[^>]*>.*?<\/row>/gs;
+        const allRows: Array<{ full: string; r: number }> = [];
+        let rm;
+        while ((rm = rowRegex.exec(sheet1Xml)) !== null) {
+          allRows.push({ full: rm[0], r: parseInt(rm[1], 10) });
         }
+
+        // Shift rows >= 18 descending
+        allRows.sort((a, b) => b.r - a.r);
+        for (const rowObj of allRows) {
+          if (rowObj.r >= 18) {
+            const oldR = rowObj.r;
+            const newR = oldR + extraRows;
+            let newRowXml = rowObj.full;
+            newRowXml = newRowXml.replace(new RegExp(`r="${oldR}"`, "g"), `r="${newR}"`);
+            newRowXml = newRowXml.replace(new RegExp(`r="([A-Z]+)${oldR}"`, "g"), `r="$1${newR}"`);
+            sheet1Xml = sheet1Xml.replace(rowObj.full, newRowXml);
+          }
+        }
+
+        // Create new rows for index 4..totalPurposes
+        let newRowsXml = "";
+        for (let k = 3; k < totalPurposes; k++) {
+          const item = activePurposes[k];
+          const newR = 18 + (k - 3);
+
+          const poIdx = addSharedString(item.poNumber || "");
+          const purpIdx = addSharedString(item.purposeText || "", true);
+
+          const grossVal = (data[`GROSS_${k+1}`] !== undefined && data[`GROSS_${k+1}`] !== "")
+            ? data[`GROSS_${k+1}`]
+            : (item && item.gross && item.gross > 0 ? formatVal(item.gross) : "");
+
+          const absEwt = item ? ((item.gross || 0) * (item.ewt || 0) / 100) : 0;
+          const ewtVal = (data[`EWT_${k+1}`] !== undefined && data[`EWT_${k+1}`] !== "")
+            ? data[`EWT_${k+1}`]
+            : (absEwt > 0 ? formatVal(absEwt) : "");
+
+          const totalVal = (data[`TOTAL_${k+1}`] !== undefined && data[`TOTAL_${k+1}`] !== "")
+            ? data[`TOTAL_${k+1}`]
+            : (item && item.total && item.total > 0 ? formatVal(item.total) : "");
+
+          let rowXml = row17Xml;
+          rowXml = rowXml.replace(/r="17"/g, `r="${newR}"`);
+          rowXml = rowXml.replace(/r="([A-Z]+)17"/g, `r="$1${newR}"`);
+
+          // Set cell A${newR} (PO_NO) with stylePO from Row 15 (First Entry)
+          rowXml = replaceExactCell(
+            rowXml,
+            `A${newR}`,
+            `<c r="A${newR}" s="${stylePO}" t="s"><v>${poIdx}</v></c>`
+          );
+          rowXml = replaceExactCell(
+            rowXml,
+            `B${newR}`,
+            `<c r="B${newR}" s="${stylePO}"/>`
+          );
+
+          // Set cell C${newR} (PURPOSE) with stylePurpose from Row 15 (First Entry)
+          rowXml = replaceExactCell(
+            rowXml,
+            `C${newR}`,
+            `<c r="C${newR}" s="${stylePurpose}" t="s"><v>${purpIdx}</v></c>`
+          );
+          for (const col of ["D", "E", "F", "G", "H", "I", "J"]) {
+            rowXml = replaceExactCell(
+              rowXml,
+              `${col}${newR}`,
+              `<c r="${col}${newR}" s="${stylePurpose}"/>`
+            );
+          }
+
+          // Set cell K${newR} (GROSS) with styleGross from Row 15 (First Entry)
+          const grossCell = grossVal
+            ? `<c r="K${newR}" s="${styleGross}" t="inlineStr"><is><t>${escapeXml(grossVal)}</t></is></c>`
+            : `<c r="K${newR}" s="${styleGross}"/>`;
+          rowXml = replaceExactCell(
+            rowXml,
+            `K${newR}`,
+            grossCell
+          );
+          for (const col of ["L", "M"]) {
+            rowXml = replaceExactCell(
+              rowXml,
+              `${col}${newR}`,
+              `<c r="${col}${newR}" s="${styleGross}"/>`
+            );
+          }
+
+          // Set cell N${newR} (EWT) with styleEwt from Row 15 (First Entry)
+          const ewtCell = ewtVal
+            ? `<c r="N${newR}" s="${styleEwt}" t="inlineStr"><is><t>${escapeXml(ewtVal)}</t></is></c>`
+            : `<c r="N${newR}" s="${styleEwt}"/>`;
+          rowXml = replaceExactCell(
+            rowXml,
+            `N${newR}`,
+            ewtCell
+          );
+          for (const col of ["O", "P", "Q"]) {
+            rowXml = replaceExactCell(
+              rowXml,
+              `${col}${newR}`,
+              `<c r="${col}${newR}" s="${styleEwt}"/>`
+            );
+          }
+
+          // Set cell T${newR} (TOTAL) with styleTotal from Row 15 (First Entry)
+          const totalCell = totalVal
+            ? `<c r="T${newR}" s="${styleTotal}" t="inlineStr"><is><t>${escapeXml(totalVal)}</t></is></c>`
+            : `<c r="T${newR}" s="${styleTotal}"/>`;
+          rowXml = replaceExactCell(
+            rowXml,
+            `T${newR}`,
+            totalCell
+          );
+          rowXml = replaceExactCell(
+            rowXml,
+            `U${newR}`,
+            `<c r="U${newR}" s="${styleTotal}"/>`
+          );
+
+          newRowsXml += rowXml;
+
+          // Ensure merge cell ranges for dynamic extra row
+          sheet1Xml = ensureMergeCellRange(sheet1Xml, `A${newR}:B${newR}`);
+          sheet1Xml = ensureMergeCellRange(sheet1Xml, `C${newR}:J${newR}`);
+          sheet1Xml = ensureMergeCellRange(sheet1Xml, `K${newR}:M${newR}`);
+          sheet1Xml = ensureMergeCellRange(sheet1Xml, `N${newR}:Q${newR}`);
+          sheet1Xml = ensureMergeCellRange(sheet1Xml, `T${newR}:U${newR}`);
+        }
+
+        // Insert new rows immediately after Row 17
+        sheet1Xml = sheet1Xml.replace(/<row r="17"[^>]*>.*?<\/row>/s, (m) => m + newRowsXml);
+
+        // Update sheet dimensions
+        sheet1Xml = sheet1Xml.replace(/<dimension ref="([A-Z]+\d+):([A-Z]+)(\d+)"\/>/, (m, p1, col2, lastRStr) => {
+          const lastR = parseInt(lastRStr, 10) + extraRows;
+          return `<dimension ref="${p1}:${col2}${lastR}"/>`;
+        });
+      }
+
+      // Automatically insert Grand Total row directly beneath the last payment entry
+      let grandTotalNum = 0;
+      for (let k = 0; k < totalPurposes; k++) {
+        const item = activePurposes[k];
+        let entryTot = 0;
+        if (item && typeof item.total === "number" && item.total > 0) {
+          entryTot = item.total;
+        } else if (item && typeof item.gross === "number" && item.gross > 0) {
+          const absEwt = (item.gross * (item.ewt || 0)) / 100;
+          entryTot = item.gross - absEwt;
+        } else {
+          const totalStr = data[`TOTAL_${k+1}`] || (k === 0 ? data.TOTAL : "");
+          if (totalStr) {
+            const parsed = parseFloat(String(totalStr).replace(/,/g, ""));
+            if (!isNaN(parsed)) entryTot = parsed;
+          }
+        }
+        grandTotalNum += entryTot;
+      }
+      if (grandTotalNum === 0 && data.TOTAL) {
+        const parsedTotal = parseFloat(String(data.TOTAL).replace(/,/g, ""));
+        if (!isNaN(parsedTotal)) grandTotalNum = parsedTotal;
+      }
+
+      if (hasCalculationValues && totalPurposes > 0 && grandTotalNum > 0) {
+        const formattedGrandTotal = formatVal(grandTotalNum);
+        const gtRow = 15 + totalPurposes;
+
+        const gtRowMatch = sheet1Xml.match(new RegExp(`<row r="${gtRow}"[^>]*>.*?<\\/row>`, "s"));
+        const tCell = `<c r="T${gtRow}" s="${styleGrandTotal}" t="inlineStr"><is><t>${escapeXml(formattedGrandTotal)}</t></is></c>`;
+        const uCell = `<c r="U${gtRow}" s="${styleGrandTotal}"/>`;
+
+        if (gtRowMatch) {
+          let rowXml = gtRowMatch[0];
+          // Ensure row height is expanded so Grand Total value is fully visible without clipping
+          rowXml = rowXml
+            .replace(/\bht="[^"]*"\s*/g, "")
+            .replace(/\bcustomHeight="[^"]*"\s*/g, "")
+            .replace(`<row r="${gtRow}"`, `<row r="${gtRow}" ht="22" customHeight="1"`);
+
+          if (rowXml.includes(`r="T${gtRow}"`)) {
+            rowXml = replaceExactCell(rowXml, `T${gtRow}`, tCell);
+          } else {
+            rowXml = rowXml.replace("</row>", `${tCell}</row>`);
+          }
+          if (rowXml.includes(`r="U${gtRow}"`)) {
+            rowXml = replaceExactCell(rowXml, `U${gtRow}`, uCell);
+          } else {
+            rowXml = rowXml.replace("</row>", `${uCell}</row>`);
+          }
+          sheet1Xml = sheet1Xml.replace(gtRowMatch[0], rowXml);
+        } else {
+          const prevRow = gtRow - 1;
+          const prevRowMatch = sheet1Xml.match(new RegExp(`<row r="${prevRow}"[^>]*>.*?<\\/row>`, "s"));
+          if (prevRowMatch) {
+            const newRowXml = `<row r="${gtRow}" ht="22" customHeight="1">${tCell}${uCell}</row>`;
+            sheet1Xml = sheet1Xml.replace(prevRowMatch[0], prevRowMatch[0] + newRowXml);
+          }
+        }
+
+        sheet1Xml = ensureMergeCellRange(sheet1Xml, `T${gtRow}:U${gtRow}`);
+      }
+
+      if (sheet1Xml) {
         originalZip.file("xl/worksheets/sheet1.xml", sheet1Xml);
       }
     } else if (templateName === "UNLOADING_LOADING_TEMPLATE.xlsm") {
@@ -861,6 +1386,16 @@ export async function generateXlsxBlob(
       originalZip.file("xl/media/image2.png", loadingBuffer);
       originalZip.file("xl/media/image3.png", unloadingBuffer);
 
+      // Ensure [Content_Types].xml has PNG and JPEG image content types
+      let contentTypesXml = originalZip.file("[Content_Types].xml")?.asText() || "";
+      if (contentTypesXml && !contentTypesXml.includes('Extension="png"')) {
+        contentTypesXml = contentTypesXml.replace(
+          '</Types>',
+          '  <Default Extension="png" ContentType="image/png"/>\n  <Default Extension="jpeg" ContentType="image/jpeg"/>\n  <Default Extension="jpg" ContentType="image/jpeg"/>\n</Types>'
+        );
+        originalZip.file("[Content_Types].xml", contentTypesXml);
+      }
+
       // 3. Inject relationships to xl/drawings/_rels/drawing1.xml.rels
       let drawingRelsXml = originalZip.file("xl/drawings/_rels/drawing1.xml.rels")?.asText() || "";
       if (drawingRelsXml && !drawingRelsXml.includes("rIdImg1")) {
@@ -870,28 +1405,52 @@ export async function generateXlsxBlob(
         originalZip.file("xl/drawings/_rels/drawing1.xml.rels", drawingRelsXml);
       }
 
-      // 4. Inject picture elements to xl/drawings/drawing1.xml
+      // 4. Set picture anchors matching exact updated frame boundaries to completely fill the frame:
+      // Rectangle 1 (Loading photo frame): D29 to H41 (col 3 row 28 to col 7 row 40)
+      const lAnchor = {
+        fromCol: 3, fromColOff: 39329,
+        fromRow: 28, fromRowOff: 35007,
+        toCol: 7, toColOff: 607219,
+        toRow: 40, toRowOff: 154780,
+      };
+
+      // Rectangle 4 (Unloading photo frame): D58 to H71 (col 3 row 57 to col 7 row 70)
+      const uAnchor = {
+        fromCol: 3, fromColOff: 41132,
+        fromRow: 57, fromRowOff: 17859,
+        toCol: 7, toColOff: 609022,
+        toRow: 70, toRowOff: 6663,
+      };
+
+      // Inject picture elements to xl/drawings/drawing1.xml
       let drawingXml = originalZip.file("xl/drawings/drawing1.xml")?.asText() || "";
       if (drawingXml && !drawingXml.includes("LoadingPhoto")) {
+        if (!drawingXml.includes("xmlns:r=")) {
+          drawingXml = drawingXml.replace(
+            '<xdr:wsDr ',
+            '<xdr:wsDr xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships" '
+          );
+        }
+
         const loadingPicAnchor = `
           <xdr:twoCellAnchor editAs="oneCell">
             <xdr:from>
-              <xdr:col>3</xdr:col>
-              <xdr:colOff>0</xdr:colOff>
-              <xdr:row>30</xdr:row>
-              <xdr:rowOff>0</xdr:rowOff>
+              <xdr:col>${lAnchor.fromCol}</xdr:col>
+              <xdr:colOff>${lAnchor.fromColOff}</xdr:colOff>
+              <xdr:row>${lAnchor.fromRow}</xdr:row>
+              <xdr:rowOff>${lAnchor.fromRowOff}</xdr:rowOff>
             </xdr:from>
             <xdr:to>
-              <xdr:col>8</xdr:col>
-              <xdr:colOff>0</xdr:colOff>
-              <xdr:row>44</xdr:row>
-              <xdr:rowOff>0</xdr:rowOff>
+              <xdr:col>${lAnchor.toCol}</xdr:col>
+              <xdr:colOff>${lAnchor.toColOff}</xdr:colOff>
+              <xdr:row>${lAnchor.toRow}</xdr:row>
+              <xdr:rowOff>${lAnchor.toRowOff}</xdr:rowOff>
             </xdr:to>
             <xdr:pic>
               <xdr:nvPicPr>
                 <xdr:cNvPr id="1001" name="LoadingPhoto"/>
                 <xdr:cNvPicPr>
-                  <a:picLocks noChangeAspect="1"/>
+                  <a:picLocks noChangeAspect="0"/>
                 </xdr:cNvPicPr>
               </xdr:nvPicPr>
               <xdr:blipFill>
@@ -917,22 +1476,22 @@ export async function generateXlsxBlob(
         const unloadingPicAnchor = `
           <xdr:twoCellAnchor editAs="oneCell">
             <xdr:from>
-              <xdr:col>3</xdr:col>
-              <xdr:colOff>0</xdr:colOff>
-              <xdr:row>59</xdr:row>
-              <xdr:rowOff>0</xdr:rowOff>
+              <xdr:col>${uAnchor.fromCol}</xdr:col>
+              <xdr:colOff>${uAnchor.fromColOff}</xdr:colOff>
+              <xdr:row>${uAnchor.fromRow}</xdr:row>
+              <xdr:rowOff>${uAnchor.fromRowOff}</xdr:rowOff>
             </xdr:from>
             <xdr:to>
-              <xdr:col>8</xdr:col>
-              <xdr:colOff>0</xdr:colOff>
-              <xdr:row>73</xdr:row>
-              <xdr:rowOff>0</xdr:rowOff>
+              <xdr:col>${uAnchor.toCol}</xdr:col>
+              <xdr:colOff>${uAnchor.toColOff}</xdr:colOff>
+              <xdr:row>${uAnchor.toRow}</xdr:row>
+              <xdr:rowOff>${uAnchor.toRowOff}</xdr:rowOff>
             </xdr:to>
             <xdr:pic>
               <xdr:nvPicPr>
                 <xdr:cNvPr id="1002" name="UnloadingPhoto"/>
                 <xdr:cNvPicPr>
-                  <a:picLocks noChangeAspect="1"/>
+                  <a:picLocks noChangeAspect="0"/>
                 </xdr:cNvPicPr>
               </xdr:nvPicPr>
               <xdr:blipFill>
@@ -959,14 +1518,10 @@ export async function generateXlsxBlob(
         originalZip.file("xl/drawings/drawing1.xml", drawingXml);
       }
     } else if (templateName === "HAZWASTE_TEMPLATE.xlsm") {
-      const firstItem = items[0] || {};
-      
-      // Replace general placeholders (CLIENT, MANIFEST, QUANTITY, DATE, MRR_NO, PREPARED_BY, etc.)
-      sharedStringsXml = replacePlaceholdersInSharedStrings(sharedStringsXml, data);
-      
-      let sheet13Xml = originalZip.file("xl/worksheets/sheet13.xml")?.asText() || "";
-      
-      // Helper to ensure numeric values are written as true Excel numbers (not text) with no unnecessary decimal formatting
+      let baseSheetXml = originalZip.file("xl/worksheets/sheet13.xml")?.asText() || originalZip.file("xl/worksheets/sheet1.xml")?.asText() || "";
+      let baseSheetRels = originalZip.file("xl/worksheets/_rels/sheet13.xml.rels")?.asText() || originalZip.file("xl/worksheets/_rels/sheet1.xml.rels")?.asText() || "";
+
+      // Helper to ensure numeric values are written as true Excel numbers (not text)
       const cleanNumeric = (val: any): any => {
         if (val === undefined || val === null || val === "" || isNaN(Number(val))) {
           return "";
@@ -974,62 +1529,167 @@ export async function generateXlsxBlob(
         return Number(val);
       };
 
-      // Inject Item 1 in sheet13.xml (Row 7)
-      const firstClass = firstItem.classification || "104";
-      const firstDesc = firstItem.description || "";
-      const firstQty = firstItem.qty !== undefined ? cleanNumeric(firstItem.qty) : "";
-      const firstPct = firstItem.percentage !== undefined ? cleanNumeric(firstItem.percentage) / 100 : "";
-      const firstHw = firstItem.haz_waste !== undefined ? cleanNumeric(firstItem.haz_waste) : "";
-      const firstLt = firstItem.local_tsd !== undefined ? cleanNumeric(firstItem.local_tsd) : "";
-      const firstNh = firstItem.non_haz !== undefined ? cleanNumeric(firstItem.non_haz) : "";
-      const firstRem = firstItem.remarks || "";
+      const hazwasteGroupsToProcess = (data._hazwasteGroups && Array.isArray(data._hazwasteGroups) && data._hazwasteGroups.length > 0)
+        ? data._hazwasteGroups
+        : [
+            {
+              sheetName: data.SHEET_NAME || getHazwasteSheetName(data.CLIENT || "COMPANY", data.DATE),
+              client: data.CLIENT || "",
+              manifestNo: data.MANIFEST || "",
+              date: data.DATE || "",
+              quantityKg: data.QUANTITY || 0,
+              mrrNo: data.MRR_NO || "",
+              recycle: data.RECYCLE || "N/A",
+              preparedBy: data.PREPARED_BY || "",
+              preparedPosition: data.PREPARED_POSITION || "",
+              checkedApprovedBy: data.CHECKED_APPROVED_BY || "",
+              checkedApprovedPosition: data.CHECKED_APPROVED_POSITION || "",
+              items: (items && items.length > 0) ? items : (data.items || []),
+              totalQty: data.TOTAL_QTY,
+              totalHaz: data.TOTAL_HAZ_WASTE,
+              totalTsd: data.TOTAL_LOCAL_TSD,
+              totalNonHaz: data.TOTAL_NON_HAZ
+            }
+          ];
 
-      sheet13Xml = injectCellValue(sheet13Xml, "A7", firstClass, true); // Classification
-      sheet13Xml = injectCellValue(sheet13Xml, "B7", firstDesc, true); // Description
-      sheet13Xml = injectCellValue(sheet13Xml, "C7", firstQty, false); // Qty
-      sheet13Xml = injectCellValue(sheet13Xml, "D7", firstPct, false); // Percentage
-      sheet13Xml = injectCellValue(sheet13Xml, "E7", firstHw, false); // Haz Waste
-      sheet13Xml = injectCellValue(sheet13Xml, "F7", firstLt, false); // Local TSD
-      sheet13Xml = injectCellValue(sheet13Xml, "G7", firstNh, false); // Non Haz
-      sheet13Xml = injectCellValue(sheet13Xml, "H7", firstRem, true); // Remarks
+      let workbookXml = originalZip.file("xl/workbook.xml")?.asText() || "";
+      let workbookRelsXml = originalZip.file("xl/_rels/workbook.xml.rels")?.asText() || "";
+      let contentTypesXml = originalZip.file("[Content_Types].xml")?.asText() || "";
 
-      // Inject Item 2 to 11 in sheet13.xml (Rows 8 to 17)
-      for (let i = 1; i < 11; i++) {
-        const rowNum = 7 + i;
-        const item = items[i];
-        
-        const itemClass = item ? (item.classification || "104") : "";
-        const desc = item ? (item.description || "") : "";
-        const qty = item ? cleanNumeric(item.qty) : "";
-        const pct = item ? (item.percentage !== undefined ? cleanNumeric(item.percentage) / 100 : "") : "";
-        const hw = item ? cleanNumeric(item.haz_waste) : "";
-        const lt = item ? cleanNumeric(item.local_tsd) : "";
-        const nh = item ? cleanNumeric(item.non_haz) : "";
-        const rem = item ? (item.remarks || "") : "";
+      let sheetsXmlStr = "<sheets>";
+      let definedNamesStr = "<definedNames>";
 
-        sheet13Xml = injectCellValue(sheet13Xml, `A${rowNum}`, itemClass, true); // Classification
-        sheet13Xml = injectCellValue(sheet13Xml, `B${rowNum}`, desc, true); // Description
-        sheet13Xml = injectCellValue(sheet13Xml, `C${rowNum}`, qty, false); // Qty
-        sheet13Xml = injectCellValue(sheet13Xml, `D${rowNum}`, pct, false); // Percentage
-        sheet13Xml = injectCellValue(sheet13Xml, `E${rowNum}`, hw, false); // Haz Waste
-        sheet13Xml = injectCellValue(sheet13Xml, `F${rowNum}`, lt, false); // Local TSD
-        sheet13Xml = injectCellValue(sheet13Xml, `G${rowNum}`, nh, false); // Non Haz
-        sheet13Xml = injectCellValue(sheet13Xml, `H${rowNum}`, rem, true); // Remarks
+      hazwasteGroupsToProcess.forEach((group: any, i: number) => {
+        const sheetIndex = i + 1;
+        const sheetFileName = `xl/worksheets/sheet${sheetIndex}.xml`;
+        const sheetRelsFileName = `xl/worksheets/_rels/sheet${sheetIndex}.xml.rels`;
+        const rId = i === 0 ? "rId1" : `rId${20 + i}`;
+
+        let sheetXml = baseSheetXml;
+        const groupItems = group.items || [];
+
+        // Compute items totals if not precomputed
+        let sumQty = 0;
+        let sumHaz = 0;
+        let sumTsd = 0;
+        let sumNonHaz = 0;
+        groupItems.forEach((it: any) => {
+          if (it.qty !== undefined && it.qty !== null && !isNaN(Number(it.qty))) sumQty += Number(it.qty);
+          if (it.haz_waste !== undefined && it.haz_waste !== null && !isNaN(Number(it.haz_waste))) sumHaz += Number(it.haz_waste);
+          if (it.local_tsd !== undefined && it.local_tsd !== null && !isNaN(Number(it.local_tsd))) sumTsd += Number(it.local_tsd);
+          if (it.non_haz !== undefined && it.non_haz !== null && !isNaN(Number(it.non_haz))) sumNonHaz += Number(it.non_haz);
+        });
+
+        const gTotalQty = group.totalQty !== undefined ? group.totalQty : sumQty;
+        const gTotalHaz = group.totalHaz !== undefined ? group.totalHaz : sumHaz;
+        const gTotalTsd = group.totalTsd !== undefined ? group.totalTsd : sumTsd;
+        const gTotalNonHaz = group.totalNonHaz !== undefined ? group.totalNonHaz : sumNonHaz;
+
+        // Header injections
+        sheetXml = injectCellValue(sheetXml, "C2", group.client || "", true);
+        sheetXml = injectCellValue(sheetXml, "G2", group.date || "", true);
+        sheetXml = injectCellValue(sheetXml, "C3", group.manifestNo || "", true);
+        sheetXml = injectCellValue(sheetXml, "G3", group.recycle || "N/A", true);
+        sheetXml = injectCellValue(sheetXml, "C4", group.quantityKg !== undefined ? cleanNumeric(group.quantityKg) : "", false);
+        sheetXml = injectCellValue(sheetXml, "G4", group.mrrNo || "", true);
+
+        sheetXml = injectCellValue(sheetXml, "A23", group.preparedBy || "", true);
+        sheetXml = injectCellValue(sheetXml, "A24", group.preparedPosition ? ` ${group.preparedPosition}` : "", true);
+        sheetXml = injectCellValue(sheetXml, "D23", group.checkedApprovedBy || "", true);
+        sheetXml = injectCellValue(sheetXml, "D24", group.checkedApprovedPosition || "", true);
+
+        // Extract reference styles from Row 7 (the first entry in the table)
+        const refStyles: { [col: string]: string } = {};
+        ["A", "B", "C", "D", "E", "F", "G", "H"].forEach((col) => {
+          const m = baseSheetXml.match(new RegExp(`<c\\s+[^>]*?\\br="${col}7"[^>]*?\\bs="(\\d+)"`, "i"));
+          if (m) {
+            refStyles[col] = m[1];
+          }
+        });
+
+        // Inject Items 1 to 11 in rows 7 to 17
+        for (let j = 0; j < 11; j++) {
+          const rowNum = 7 + j;
+          const item = groupItems[j];
+
+          const itemClass = item ? (item.classification || "104") : "";
+          const desc = item ? (item.description || "") : "";
+          const qty = item ? cleanNumeric(item.qty) : "";
+          const pct = item ? (item.percentage !== undefined ? cleanNumeric(item.percentage) / 100 : "") : "";
+          const hw = item ? cleanNumeric(item.haz_waste) : "";
+          const lt = item ? cleanNumeric(item.local_tsd) : "";
+          const nh = item ? cleanNumeric(item.non_haz) : "";
+          const rem = item ? (item.remarks || "") : "";
+
+          sheetXml = injectCellValue(sheetXml, `A${rowNum}`, itemClass, true, false, refStyles["A"]);
+          sheetXml = injectCellValue(sheetXml, `B${rowNum}`, desc, true, false, refStyles["B"]);
+          sheetXml = injectCellValue(sheetXml, `C${rowNum}`, qty, false, false, refStyles["C"]);
+          sheetXml = injectCellValue(sheetXml, `D${rowNum}`, pct, false, false, refStyles["D"]);
+          sheetXml = injectCellValue(sheetXml, `E${rowNum}`, hw, false, false, refStyles["E"]);
+          sheetXml = injectCellValue(sheetXml, `F${rowNum}`, lt, false, false, refStyles["F"]);
+          sheetXml = injectCellValue(sheetXml, `G${rowNum}`, nh, false, false, refStyles["G"]);
+          sheetXml = injectCellValue(sheetXml, `H${rowNum}`, rem, true, false, refStyles["H"]);
+        }
+
+        // Inject Totals into row 18
+        sheetXml = injectCellValue(sheetXml, "C18", cleanNumeric(gTotalQty), false);
+        sheetXml = injectCellValue(sheetXml, "E18", cleanNumeric(gTotalHaz), false);
+        sheetXml = injectCellValue(sheetXml, "F18", cleanNumeric(gTotalTsd), false);
+        sheetXml = injectCellValue(sheetXml, "G18", cleanNumeric(gTotalNonHaz), false);
+
+        originalZip.file(sheetFileName, sheetXml);
+        if (baseSheetRels) {
+          originalZip.file(sheetRelsFileName, baseSheetRels);
+        }
+
+        const cleanSheetName = escapeXml(group.sheetName || `Sheet${sheetIndex}`);
+        sheetsXmlStr += `<sheet name="${cleanSheetName}" sheetId="${sheetIndex}" r:id="${rId}"/>`;
+        definedNamesStr += `<definedName name="_xlnm.Print_Area" localSheetId="${i}">${cleanSheetName.includes(' ') ? `'${cleanSheetName}'` : cleanSheetName}!$A$1:$H$52</definedName>`;
+
+        if (!workbookRelsXml.includes(`Id="${rId}"`)) {
+          workbookRelsXml = workbookRelsXml.replace(
+            '</Relationships>',
+            `<Relationship Id="${rId}" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet${sheetIndex}.xml"/></Relationships>`
+          );
+        } else {
+          workbookRelsXml = workbookRelsXml.replace(
+            new RegExp(`<Relationship\\s+[^>]*?Id="${rId}"[^>]*?/>`),
+            `<Relationship Id="${rId}" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet${sheetIndex}.xml"/>`
+          );
+        }
+
+        if (!contentTypesXml.includes(`PartName="/${sheetFileName}"`)) {
+          contentTypesXml = contentTypesXml.replace(
+            '</Types>',
+            `<Override PartName="/${sheetFileName}" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/></Types>`
+          );
+        }
+      });
+
+      // Remove unused template worksheets (original template had up to sheet13)
+      for (let s = hazwasteGroupsToProcess.length + 1; s <= 20; s++) {
+        originalZip.remove(`xl/worksheets/sheet${s}.xml`);
+        originalZip.remove(`xl/worksheets/_rels/sheet${s}.xml.rels`);
       }
 
-      // Inject Totals directly as numeric values into sheet13.xml to avoid string formatting issues
-      sheet13Xml = injectCellValue(sheet13Xml, "C18", cleanNumeric(data.TOTAL_QTY), false);
-      sheet13Xml = injectCellValue(sheet13Xml, "E18", cleanNumeric(data.TOTAL_HAZ_WASTE), false);
-      sheet13Xml = injectCellValue(sheet13Xml, "F18", cleanNumeric(data.TOTAL_LOCAL_TSD), false);
-      sheet13Xml = injectCellValue(sheet13Xml, "G18", cleanNumeric(data.TOTAL_NON_HAZ), false);
+      sheetsXmlStr += "</sheets>";
+      definedNamesStr += "</definedNames>";
 
-      originalZip.file("xl/worksheets/sheet13.xml", sheet13Xml);
+      workbookXml = workbookXml.replace(/<sheets>[\s\S]*?<\/sheets>/, sheetsXmlStr);
+      workbookXml = workbookXml.replace(/activeTab="\d+"/, 'activeTab="0"').replace(/firstSheet="\d+"/, 'firstSheet="0"');
+      if (workbookXml.includes("<definedNames>")) {
+        workbookXml = workbookXml.replace(/<definedNames>[\s\S]*?<\/definedNames>/, definedNamesStr);
+      } else {
+        workbookXml = workbookXml.replace("</workbook>", `${definedNamesStr}</workbook>`);
+      }
 
       // Remove calculation chain to prevent corrupt formula chain repair warning in Excel
       originalZip.remove("xl/calcChain.xml");
-      let workbookRelsXml = originalZip.file("xl/_rels/workbook.xml.rels")?.asText() || "";
       workbookRelsXml = workbookRelsXml.replace(/<Relationship[^>]+Type="[^"]+calcChain"[^>]*\/>/g, "");
+
+      originalZip.file("xl/workbook.xml", workbookXml);
       originalZip.file("xl/_rels/workbook.xml.rels", workbookRelsXml);
+      originalZip.file("[Content_Types].xml", contentTypesXml);
     } else if (templateName === "TIME_STAMP_TEMPLATE.xlsm") {
       // 1. Leave worksheet sheet1.xml clean without injecting metadata into lower cells (rows 41-50)
 
@@ -1136,6 +1796,216 @@ export async function generateXlsxBlob(
       originalZip.file("xl/_rels/workbook.xml.rels", workbookRelsXml);
     } else if (templateName === "PO_TEMPLATE.xlsm") {
       sharedStringsXml = replacePlaceholdersInSharedStrings(sharedStringsXml, data);
+
+      let sheet1Xml = originalZip.file("xl/worksheets/sheet1.xml")?.asText() || "";
+      if (sheet1Xml) {
+        // Clean cached placeholder values inside sheet1.xml formula cells
+        sheet1Xml = sheet1Xml.replace(/<v>\{\{[^}]+\}\}<\/v>/g, "<v/>");
+
+        // Helper to get description for item index
+        const getDescForIdx = (idx: number): string => {
+          if (data[`DESCRIPTION${idx}`] !== undefined && data[`DESCRIPTION${idx}`] !== null) return String(data[`DESCRIPTION${idx}`] || "");
+          if (data[`DESCRIPTION_${idx}`] !== undefined && data[`DESCRIPTION_${idx}`] !== null) return String(data[`DESCRIPTION_${idx}`] || "");
+          if (items && items[idx - 1] && items[idx - 1].description !== undefined) return String(items[idx - 1].description || "");
+          return "";
+        };
+
+        // Helper to count wrapped lines based on capacity and explicit newlines
+        const countWrappedLines = (text: string, capacity = 50): number => {
+          if (!text || !text.trim()) return 1;
+          const rawLines = text.split(/\r?\n/);
+          let totalLines = 0;
+          for (const rawLine of rawLines) {
+            if (!rawLine.trim()) {
+              totalLines += 1;
+              continue;
+            }
+            const words = rawLine.split(/\s+/);
+            let currentLineLen = 0;
+            let lineCount = 1;
+            for (const word of words) {
+              if (word.length === 0) continue;
+              if (currentLineLen === 0) {
+                if (word.length > capacity) {
+                  lineCount += Math.floor((word.length - 1) / capacity);
+                  currentLineLen = word.length % capacity;
+                } else {
+                  currentLineLen = word.length;
+                }
+              } else {
+                if (currentLineLen + 1 + word.length <= capacity) {
+                  currentLineLen += 1 + word.length;
+                } else {
+                  lineCount += 1;
+                  if (word.length > capacity) {
+                    lineCount += Math.floor((word.length - 1) / capacity);
+                    currentLineLen = word.length % capacity;
+                  } else {
+                    currentLineLen = word.length;
+                  }
+                }
+              }
+            }
+            totalLines += lineCount;
+          }
+          return totalLines;
+        };
+
+        // Helper to calculate required row height based on description text length and wrapping
+        const calcRowHeight = (descText: string): number => {
+          if (!descText || !descText.trim()) return 14.25;
+          if (descText === "*****NOTHING FOLLOWS*****") return 14.25;
+          const totalLines = countWrappedLines(descText, 50);
+          return Math.max(14.25, totalLines * 14.25);
+        };
+
+        // Standard 8 item rows in template are rows 26 through 33
+        for (let idx = 1; idx <= 8; idx++) {
+          const r = 25 + idx; // row 26 to 33
+          const desc = getDescForIdx(idx);
+          const ht = calcRowHeight(desc);
+
+          // Update height on row r while preserving existing row attributes
+          const rowTagRegex = new RegExp(`<row r="${r}"([^>]*)>`, "g");
+          sheet1Xml = sheet1Xml.replace(rowTagRegex, (m, p1) => {
+            const cleanP1 = p1.replace(/\s*ht="[^"]*"/g, "").replace(/\s*customHeight="[^"]*"/g, "");
+            return `<row r="${r}"${cleanP1} ht="${ht}" customHeight="1">`;
+          });
+        }
+
+        // Ensure row 33 C33 uses style 201 (matching C26..C32) instead of style 206
+        sheet1Xml = sheet1Xml.replace(/<c r="C33" s="206"/g, '<c r="C33" s="201"');
+
+        // Check for extra items beyond 8 items
+        const rawItemsCount = items ? items.length : 0;
+        let activeItemsCount = Math.max(8, rawItemsCount);
+        let checkIdx = 9;
+        while (getDescForIdx(checkIdx) !== "" || checkIdx <= rawItemsCount) {
+          activeItemsCount = Math.max(activeItemsCount, checkIdx);
+          checkIdx++;
+        }
+
+        if (activeItemsCount > 8) {
+          const extraRows = activeItemsCount - 8;
+
+          const addSharedString = (text: string, isDesc: boolean = false): number => {
+            const matches = sharedStringsXml.match(/<si>/g);
+            const currIdx = matches ? matches.length : 0;
+            const escapedText = escapeXml(text || "");
+            let newSi = "";
+            if (isDesc) {
+              const totalLines = countWrappedLines(text, 50);
+              const fontSize = totalLines >= 5 ? 9 : 10;
+              newSi = `<si><r><rPr><sz val="${fontSize}"/><rFont val="Verdana"/><color rgb="FF000000"/></rPr><t>${escapedText}</t></r></si>`;
+            } else {
+              newSi = `<si><t>${escapedText}</t></si>`;
+            }
+            sharedStringsXml = sharedStringsXml.replace("</sst>", `${newSi}</sst>`);
+            const countMatch = sharedStringsXml.match(/count="(\d+)"/);
+            const uniqueMatch = sharedStringsXml.match(/uniqueCount="(\d+)"/);
+            if (countMatch) {
+              const count = parseInt(countMatch[1], 10);
+              sharedStringsXml = sharedStringsXml.replace(`count="${count}"`, `count="${count + 1}"`);
+            }
+            if (uniqueMatch) {
+              const ucount = parseInt(uniqueMatch[1], 10);
+              sharedStringsXml = sharedStringsXml.replace(`uniqueCount="${ucount}"`, `uniqueCount="${ucount + 1}"`);
+            }
+            return currIdx;
+          };
+
+          // Shift merged cells starting at or after row 34 down by extraRows
+          sheet1Xml = sheet1Xml.replace(/<mergeCell ref="([A-Z]+)(\d+):([A-Z]+)(\d+)"\/>/g, (m, col1, r1Str, col2, r2Str) => {
+            let r1 = parseInt(r1Str, 10);
+            let r2 = parseInt(r2Str, 10);
+            if (r1 >= 34) r1 += extraRows;
+            if (r2 >= 34) r2 += extraRows;
+            return `<mergeCell ref="${col1}${r1}:${col2}${r2}"/>`;
+          });
+
+          // Shift row tags and cells >= 34 down
+          const existingRowMatches: Array<{ r: number; full: string }> = [];
+          const rowTagRegex = /<row r="(\d+)"[^>]*>[\s\S]*?<\/row>/g;
+          let rm: RegExpExecArray | null;
+          while ((rm = rowTagRegex.exec(sheet1Xml)) !== null) {
+            const rNum = parseInt(rm[1], 10);
+            existingRowMatches.push({ r: rNum, full: rm[0] });
+          }
+
+          existingRowMatches.sort((a, b) => b.r - a.r);
+          for (const rowObj of existingRowMatches) {
+            if (rowObj.r >= 34) {
+              const oldR = rowObj.r;
+              const newR = oldR + extraRows;
+              let newRowXml = rowObj.full;
+              newRowXml = newRowXml.replace(new RegExp(`r="${oldR}"`, "g"), `r="${newR}"`);
+              newRowXml = newRowXml.replace(new RegExp(`r="([A-Z]+)${oldR}"`, "g"), `r="$1${newR}"`);
+              sheet1Xml = sheet1Xml.replace(rowObj.full, newRowXml);
+            }
+          }
+
+          // Extract template for extra item row from Row 32
+          const row32Match = sheet1Xml.match(/<row r="32"[^>]*>[\s\S]*?<\/row>/);
+          const row32Xml = row32Match ? row32Match[0] : "";
+
+          let newRowsXml = "";
+          for (let k = 8; k < activeItemsCount; k++) {
+            const idx = k + 1; // 9, 10, ...
+            const newR = 25 + idx; // 34, 35, ...
+            const itemObj = items ? items[k] : null;
+
+            const qtyVal = data[`QUANTITY${idx}`] !== undefined ? String(data[`QUANTITY${idx}`]) : (itemObj ? String(itemObj.quantity || "") : "");
+            const unitVal = data[`UNIT${idx}`] !== undefined ? String(data[`UNIT${idx}`]) : (itemObj ? String(itemObj.unit || "") : "");
+            const descVal = getDescForIdx(idx);
+            const priceVal = data[`UNIT_PRICE${idx}`] !== undefined ? String(data[`UNIT_PRICE${idx}`]) : (itemObj ? String(itemObj.unitPrice || "") : "");
+            const amountVal = data[`AMOUNT${idx}`] !== undefined ? String(data[`AMOUNT${idx}`]) : (itemObj ? String(itemObj.amount || "") : "");
+
+            const ht = calcRowHeight(descVal);
+
+            const qtyIdx = qtyVal ? addSharedString(qtyVal) : -1;
+            const unitIdx = unitVal ? addSharedString(unitVal) : -1;
+            const descIdx = descVal ? addSharedString(descVal, true) : -1;
+            const priceIdx = priceVal ? addSharedString(priceVal) : -1;
+            const amountIdx = amountVal ? addSharedString(amountVal) : -1;
+
+            let rowXml = row32Xml || `<row r="${newR}" spans="1:18" ht="${ht}" customHeight="1" x14ac:dyDescent="0.2"/>`;
+            rowXml = rowXml.replace(/r="32"/g, `r="${newR}"`);
+            rowXml = rowXml.replace(/r="([A-Z]+)32"/g, `r="$1${newR}"`);
+            rowXml = rowXml.replace(/ht="[^"]*"/, `ht="${ht}"`);
+
+            // Replace cell contents
+            rowXml = replaceExactCell(rowXml, `A${newR}`, qtyIdx >= 0 ? `<c r="A${newR}" s="101" t="s"><v>${qtyIdx}</v></c>` : `<c r="A${newR}" s="101"/>`);
+            rowXml = replaceExactCell(rowXml, `B${newR}`, unitIdx >= 0 ? `<c r="B${newR}" s="102" t="s"><v>${unitIdx}</v></c>` : `<c r="B${newR}" s="102"/>`);
+            rowXml = replaceExactCell(rowXml, `C${newR}`, descIdx >= 0 ? `<c r="C${newR}" s="201" t="s"><v>${descIdx}</v></c>` : `<c r="C${newR}" s="201"/>`);
+            rowXml = replaceExactCell(rowXml, `D${newR}`, `<c r="D${newR}" s="202"/>`);
+            rowXml = replaceExactCell(rowXml, `E${newR}`, `<c r="E${newR}" s="203"/>`);
+            rowXml = replaceExactCell(rowXml, `F${newR}`, priceIdx >= 0 ? `<c r="F${newR}" s="107" t="s"><v>${priceIdx}</v></c>` : `<c r="F${newR}" s="107"/>`);
+            rowXml = replaceExactCell(rowXml, `G${newR}`, amountIdx >= 0 ? `<c r="G${newR}" s="114" t="s"><v>${amountIdx}</v></c>` : `<c r="G${newR}" s="114"/>`);
+
+            newRowsXml += rowXml;
+
+            // Ensure merge cells for C:E and G:H on new row
+            sheet1Xml = ensureMergeCellRange(sheet1Xml, `C${newR}:E${newR}`);
+            sheet1Xml = ensureMergeCellRange(sheet1Xml, `G${newR}:H${newR}`);
+          }
+
+          // Insert new rows immediately after row 33
+          const row33Match = sheet1Xml.match(/<row r="33"[^>]*>[\s\S]*?<\/row>/);
+          if (row33Match) {
+            sheet1Xml = sheet1Xml.replace(row33Match[0], `${row33Match[0]}${newRowsXml}`);
+          }
+        }
+
+        originalZip.file("xl/worksheets/sheet1.xml", sheet1Xml);
+      }
+
+      // Remove calculation chain to prevent corrupt formula chain repair warning in Excel
+      originalZip.remove("xl/calcChain.xml");
+      let workbookRelsXml = originalZip.file("xl/_rels/workbook.xml.rels")?.asText() || "";
+      if (workbookRelsXml) {
+        workbookRelsXml = workbookRelsXml.replace(/<Relationship[^>]+Type="[^"]+calcChain"[^>]*\/>/g, "");
+        originalZip.file("xl/_rels/workbook.xml.rels", workbookRelsXml);
+      }
     } else if (templateName === "WEEKLY_MANIFEST_TEMPLATE.xlsm") {
       const recordsForSum = (items && items.length > 0) ? items : (data._records || []);
       if (data.TOTAL_QTY === undefined || data.TOTAL_QTY === null || data.TOTAL_QTY === "") {
@@ -1158,8 +2028,8 @@ export async function generateXlsxBlob(
       let stylesXml = originalZip.file("xl/styles.xml")?.asText() || "";
       if (stylesXml) {
         stylesXml = stylesXml.replace(
-          `<xf numFmtId="43" fontId="14" fillId="0" borderId="0" xfId="1" applyFont="1" applyBorder="1" applyAlignment="1"><alignment vertical="center"/></xf>`,
-          `<xf numFmtId="43" fontId="14" fillId="0" borderId="0" xfId="1" applyFont="1" applyBorder="1" applyAlignment="1"><alignment horizontal="right" vertical="center"/></xf>`
+          `<xf numFmtId="43" fontId="9" fillId="2" borderId="1" xfId="1" applyFont="1" applyFill="1" applyBorder="1" applyAlignment="1"><alignment horizontal="left" vertical="center" wrapText="1"/></xf>`,
+          `<xf numFmtId="43" fontId="9" fillId="2" borderId="1" xfId="1" applyFont="1" applyFill="1" applyBorder="1" applyAlignment="1"><alignment horizontal="right" vertical="center" wrapText="1"/></xf>`
         );
         originalZip.file("xl/styles.xml", stylesXml);
       }
@@ -1187,50 +2057,113 @@ export async function generateXlsxBlob(
         return str;
       };
 
-      // 2. Process records in sheet1.xml
-      let sheet1Xml = originalZip.file("xl/worksheets/sheet1.xml")?.asText() || "";
-      if (sheet1Xml) {
-        const records = (items && items.length > 0) ? items : (data._records || []);
+      let baseSheetXml = originalZip.file("xl/worksheets/sheet1.xml")?.asText() || "";
+      let baseSheetRels = originalZip.file("xl/worksheets/_rels/sheet1.xml.rels")?.asText() || "";
+
+      // Strip tableParts from baseSheetXml to prevent duplicate table object conflicts across worksheets
+      baseSheetXml = baseSheetXml.replace(/<tableParts[^>]*>[\s\S]*?<\/tableParts>/g, "");
+
+      const weeklyGroupsToProcess = (data._weeklyGroups && Array.isArray(data._weeklyGroups) && data._weeklyGroups.length > 0)
+        ? data._weeklyGroups
+        : [
+            {
+              sheetName: data.SHEET_NAME || "JAN 1ST",
+              haulingDate: data.DATE_COMPLETED || data.HAULING_DATE || "",
+              signatoryName: data.SIGNED_BY || data.SIGNATORY_NAME || "",
+              signatoryPosition: data.POSITION || data.SIGNATORY_POSITION || "",
+              totalQty: data.TOTAL_QTY || data.TOTAL_QUANTITY || "",
+              records: (items && items.length > 0) ? items : (data._records || []),
+            }
+          ];
+
+      let workbookXml = originalZip.file("xl/workbook.xml")?.asText() || "";
+      let workbookRelsXml = originalZip.file("xl/_rels/workbook.xml.rels")?.asText() || "";
+      let contentTypesXml = originalZip.file("[Content_Types].xml")?.asText() || "";
+
+      let sheetsXmlStr = "<sheets>";
+      let definedNamesStr = "<definedNames>";
+
+      weeklyGroupsToProcess.forEach((group: any, i: number) => {
+        const sheetIndex = i + 1;
+        const sheetFileName = `xl/worksheets/sheet${sheetIndex}.xml`;
+        const sheetRelsFileName = `xl/worksheets/_rels/sheet${sheetIndex}.xml.rels`;
+        const rId = i === 0 ? "rId1" : `rId${10 + i}`;
+
+        let sheetXml = baseSheetXml;
+        const records = group.records || [];
         const totalRecords = records.length;
         const maxRow = 27 + Math.max(6, totalRecords);
         const overflow = totalRecords > 21 ? totalRecords - 21 : 0;
 
         if (overflow > 0) {
           // Shift rows 49+ down by overflow
-          sheet1Xml = sheet1Xml.replace(/<row r="(\d+)"([^>]*)>/g, (match, rNumStr, rest) => {
+          sheetXml = sheetXml.replace(/<row r="(\d+)"([^>]*)>/g, (match, rNumStr, rest) => {
             const rNum = parseInt(rNumStr);
-            if (rNum >= 49) {
-              return `<row r="${rNum + overflow}"${rest}>`;
-            }
-            return match;
+            return rNum >= 49 ? `<row r="${rNum + overflow}"${rest}>` : match;
           });
-
           // Shift cell references in rows 49+
-          sheet1Xml = sheet1Xml.replace(/<c r="([A-Z]+)(\d+)"/g, (match, col, rNumStr) => {
+          sheetXml = sheetXml.replace(/<c r="([A-Z]+)(\d+)"/g, (match, col, rNumStr) => {
             const rNum = parseInt(rNumStr);
-            if (rNum >= 49) {
-              return `<c r="${col}${rNum + overflow}"`;
-            }
-            return match;
+            return rNum >= 49 ? `<c r="${col}${rNum + overflow}"` : match;
           });
-
-          // Update SUM formula range
-          sheet1Xml = sheet1Xml.replace(/SUM\(G28:G50\)/g, `SUM(G28:G${27 + totalRecords})`);
-
-          // Update print area in workbook.xml
-          let wbXml = originalZip.file("xl/workbook.xml")?.asText() || "";
-          if (wbXml) {
-            wbXml = wbXml.replace(/\$B\$1:\$J\$60/g, `$B$1:$J$${60 + overflow}`);
-            originalZip.file("xl/workbook.xml", wbXml);
-          }
+          // Shift mergeCells in rows 49+
+          sheetXml = sheetXml.replace(/<mergeCell ref="([^"]+)"\/>/g, (match, ref) => {
+            const newRef = ref.replace(/([A-Z]+)(\d+)/g, (cellMatch, col, rNumStr) => {
+              const rNum = parseInt(rNumStr);
+              return rNum >= 49 ? `${col}${rNum + overflow}` : cellMatch;
+            });
+            return `<mergeCell ref="${newRef}"/>`;
+          });
         }
 
+        // Calculate sumKg
+        let sumKg = 0;
+        records.forEach((rec: any) => {
+          if (rec && rec.quantity !== undefined && rec.quantity !== null && rec.quantity !== "" && !isNaN(Number(rec.quantity))) {
+            sumKg += Number(rec.quantity) * 1000;
+          }
+        });
+        const formattedTotalQty = group.totalQty || (Number.isInteger(sumKg)
+          ? sumKg.toLocaleString("en-US")
+          : sumKg.toLocaleString("en-US", { maximumFractionDigits: 3 }));
+
+        const haulingDateStr = group.haulingDate || data.DATE_COMPLETED || data.HAULING_DATE || "";
+        const sigNameStr = group.signatoryName || data.SIGNED_BY || data.SIGNATORY_NAME || "";
+        const sigPosStr = group.signatoryPosition || data.POSITION || data.SIGNATORY_POSITION || "";
+
+        // Replace header placeholders (C9: hauling date)
+        sheetXml = sheetXml.replace(
+          /<c r="C9"[^>]*t="s"[^>]*><v>142<\/v><\/c>/,
+          `<c r="C9" s="48" t="inlineStr"><is><t>${escapeXml(haulingDateStr)}</t></is></c>`
+        );
+
+        // Replace footer placeholders
+        const rowTotal = 51 + overflow;
+        const rowSigned = 59 + overflow;
+        const rowPos = 60 + overflow;
+
+        const totalRegex = new RegExp(`<c r="G${rowTotal}"[^>]*t="s"[^>]*><v>181<\\/v><\\/c>`);
+        sheetXml = sheetXml.replace(
+          totalRegex,
+          `<c r="G${rowTotal}" s="29" t="inlineStr"><is><t>${escapeXml(formattedTotalQty)}</t></is></c>`
+        );
+
+        const signedRegex = new RegExp(`<c r="C${rowSigned}"[^>]*t="s"[^>]*><v>179<\\/v><\\/c>`);
+        sheetXml = sheetXml.replace(
+          signedRegex,
+          `<c r="C${rowSigned}" s="9" t="inlineStr"><is><t>${escapeXml(sigNameStr)}</t></is></c>`
+        );
+
+        const posRegex = new RegExp(`<c r="C${rowPos}"[^>]*t="s"[^>]*><v>180<\\/v><\\/c>`);
+        sheetXml = sheetXml.replace(
+          posRegex,
+          `<c r="C${rowPos}" s="7" t="inlineStr"><is><t>${escapeXml(sigPosStr)}</t></is></c>`
+        );
+
+        // Insert or replace record rows 28..maxRow
         for (let r = 28; r <= maxRow; r++) {
           const idx = r - 28;
           const rec = records[idx];
-
-          const rowRegex = new RegExp(`<row r="${r}"[^>]*>[\\s\\S]*?<\\/row>`);
-          const rowMatch = sheet1Xml.match(rowRegex);
 
           const comp = rec ? escapeXml(rec.companyName || "") : "";
           const dateStr = rec ? escapeXml(formatWeeklyDate(rec.deliveryDate || rec.haulingDate || rec.transportDate)) : "";
@@ -1255,44 +2188,82 @@ export async function generateXlsxBlob(
             `<c r="L${r}" s="2"/><c r="M${r}" s="2"/><c r="N${r}" s="2"/>` +
             `</row>`;
 
+          const rowRegex = new RegExp(`<row r="${r}"[^>]*>[\\s\\S]*?<\\/row>`);
+          const rowMatch = sheetXml.match(rowRegex);
+
           if (rowMatch) {
-            sheet1Xml = sheet1Xml.replace(rowRegex, newRowXml);
+            sheetXml = sheetXml.replace(rowRegex, newRowXml);
           } else {
             const prevRowRegex = new RegExp(`<row r="${r - 1}"[^>]*>[\\s\\S]*?<\\/row>`);
-            const prevMatch = sheet1Xml.match(prevRowRegex);
+            const prevMatch = sheetXml.match(prevRowRegex);
             if (prevMatch) {
-              sheet1Xml = sheet1Xml.replace(prevRowRegex, `${prevMatch[0]}\n${newRowXml}`);
+              sheetXml = sheetXml.replace(prevRowRegex, `${prevMatch[0]}\n${newRowXml}`);
             }
           }
         }
 
-        originalZip.file("xl/worksheets/sheet1.xml", sheet1Xml);
+        originalZip.file(sheetFileName, sheetXml);
+        if (baseSheetRels) {
+          originalZip.file(sheetRelsFileName, baseSheetRels);
+        }
+
+        const cleanSheetName = escapeXml(group.sheetName || `Sheet${sheetIndex}`);
+        sheetsXmlStr += `<sheet name="${cleanSheetName}" sheetId="${sheetIndex}" r:id="${rId}"/>`;
+        definedNamesStr += `<definedName name="_xlnm.Print_Area" localSheetId="${i}">${cleanSheetName.includes(' ') ? `'${cleanSheetName}'` : cleanSheetName}!$B$1:$J$${60 + overflow}</definedName>`;
+
+        if (i > 0) {
+          workbookRelsXml = workbookRelsXml.replace(
+            '</Relationships>',
+            `<Relationship Id="${rId}" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet${sheetIndex}.xml"/></Relationships>`
+          );
+          contentTypesXml = contentTypesXml.replace(
+            '</Types>',
+            `<Override PartName="/${sheetFileName}" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/></Types>`
+          );
+        }
+      });
+
+      sheetsXmlStr += "</sheets>";
+      definedNamesStr += "</definedNames>";
+
+      workbookXml = workbookXml.replace(/<sheets>[\s\S]*?<\/sheets>/, sheetsXmlStr);
+      if (workbookXml.includes("<definedNames>")) {
+        workbookXml = workbookXml.replace(/<definedNames>[\s\S]*?<\/definedNames>/, definedNamesStr);
+      } else {
+        workbookXml = workbookXml.replace("</workbook>", `${definedNamesStr}</workbook>`);
       }
+
+      originalZip.file("xl/workbook.xml", workbookXml);
+      originalZip.file("xl/_rels/workbook.xml.rels", workbookRelsXml);
+      originalZip.file("[Content_Types].xml", contentTypesXml);
+
     } else {
       // RFS_TEMPLATE.xlsm
       // We substitute Item 1 in shared strings
       const item1 = items[0] || {};
-      const item1Desc = item1.description || item1.item || "";
-      const isItem1Italic = item1.isItalic || item1Desc === "*****NOTHING FOLLOWS*****";
-
-      const rfsData = {
+      const rfsData: Record<string, any> = {
         ...data,
         QTY: item1.quantity !== undefined ? item1.quantity : "",
         UNIT: item1.unit || "",
-        ITEM_DESCRIPTION: item1Desc,
-        REMARKS: item1.remarks || ""
+        ITEM_DESCRIPTION: item1.description || item1.item || "",
+        REMARKS: item1.remarks || "",
+        // Override indicator placeholders so no text ('x') is written to sharedStrings
+        complete: "",
+        on_time: "",
+        late: "",
+        incomplete: "",
+        emergency: "",
+        urgent: "",
+        regular: "",
+        irregular: ""
       };
-
-      if (isItem1Italic && item1Desc) {
-        sharedStringsXml = sharedStringsXml.replace(
-          /<si><t>\{\{ITEM_DESCRIPTION\}\}<\/t><\/si>/g,
-          `<si><r><rPr><i/></rPr><t>${escapeXml(item1Desc)}</t></r></si>`
-        );
-      }
       sharedStringsXml = replacePlaceholdersInSharedStrings(sharedStringsXml, rfsData);
       
       // Inject Item 2 to 12 in sheet1.xml
       let sheet1Xml = originalZip.file("xl/worksheets/sheet1.xml")?.asText() || "";
+      if (rfsData.DUE_DATE) {
+        sheet1Xml = injectCellValue(sheet1Xml, "AW8", rfsData.DUE_DATE, true);
+      }
       for (let i = 1; i < 12; i++) {
         const rowNum = 13 + i;
         const item = items[i];
@@ -1300,13 +2271,142 @@ export async function generateXlsxBlob(
         const unit = item ? (item.unit ?? "") : "";
         const desc = item ? (item.description || item.item || "") : "";
         const rem = item ? (item.remarks ?? "") : "";
-        const isItalic = item ? (item.isItalic || desc === "*****NOTHING FOLLOWS*****") : false;
 
         sheet1Xml = injectCellValue(sheet1Xml, `I${rowNum}`, qty, false); // Qty
         sheet1Xml = injectCellValue(sheet1Xml, `K${rowNum}`, unit, true); // Unit
-        sheet1Xml = injectCellValue(sheet1Xml, `M${rowNum}`, desc, true, isItalic); // Desc
+        sheet1Xml = injectCellValue(sheet1Xml, `M${rowNum}`, desc, true, desc === "*****NOTHING FOLLOWS*****"); // Desc
         sheet1Xml = injectCellValue(sheet1Xml, `BB${rowNum}`, rem, true); // Remarks
       }
+
+      // Handle RFS selection indicator black fill styling
+      let stylesXml = originalZip.file("xl/styles.xml")?.asText() || "";
+      if (stylesXml && sheet1Xml) {
+        // 1. Ensure solid black fill pattern exists in stylesXml
+        let fillsCountMatch = stylesXml.match(/<fills count="(\d+)">([\s\S]*?)<\/fills>/);
+        let blackFillIndex = -1;
+        if (fillsCountMatch) {
+          let fillsCount = parseInt(fillsCountMatch[1], 10);
+          const fillsContent = fillsCountMatch[2];
+          blackFillIndex = fillsCount;
+          fillsCount += 1;
+          const blackFillXml = '<fill><patternFill patternType="solid"><fgColor rgb="FF000000"/><bgColor indexed="64"/></patternFill></fill>';
+          stylesXml = stylesXml.replace(
+            /<fills count="\d+">[\s\S]*?<\/fills>/,
+            `<fills count="${fillsCount}">${fillsContent}${blackFillXml}</fills>`
+          );
+        }
+
+        // 2. Parse cellXfs to enable style cloning with black fill
+        let cellXfsMatch = stylesXml.match(/<cellXfs count="(\d+)">([\s\S]*?)<\/cellXfs>/);
+        if (cellXfsMatch && blackFillIndex >= 0) {
+          let xfsCount = parseInt(cellXfsMatch[1], 10);
+          let xfsContent = cellXfsMatch[2];
+
+          // Parse individual <xf .../> tags from xfsContent
+          const xfsList: string[] = [];
+          const xfRegex = /<xf\b[^>]*?(?:\/>|>[\s\S]*?<\/xf>)/g;
+          let xfMatch;
+          while ((xfMatch = xfRegex.exec(xfsContent)) !== null) {
+            xfsList.push(xfMatch[0]);
+          }
+
+          const blackStyleCache: Record<number, number> = {};
+          const getBlackStyleId = (origStyleId: number): number => {
+            if (blackStyleCache[origStyleId] !== undefined) return blackStyleCache[origStyleId];
+            const origXf = xfsList[origStyleId];
+            if (!origXf) return origStyleId;
+
+            let newXf = origXf;
+            if (/fillId="\d+"/.test(newXf)) {
+              newXf = newXf.replace(/fillId="\d+"/, `fillId="${blackFillIndex}"`);
+            } else {
+              newXf = newXf.replace('<xf ', `<xf fillId="${blackFillIndex}" `);
+            }
+            if (/applyFill="\d+"/.test(newXf)) {
+              newXf = newXf.replace(/applyFill="\d+"/, 'applyFill="1"');
+            } else {
+              newXf = newXf.replace('<xf ', '<xf applyFill="1" ');
+            }
+
+            const newStyleId = xfsCount;
+            xfsCount += 1;
+            xfsList.push(newXf);
+            xfsContent += newXf;
+            blackStyleCache[origStyleId] = newStyleId;
+            return newStyleId;
+          };
+
+          // Determine selected status and mode
+          const statusVal = String(data.STATUS || data.status || "").trim().toLowerCase();
+          const modeVal = String(data.MODE || data.modeOfRequest || data.mode || "").trim().toLowerCase();
+
+          const indicators: { key: string; cellRefFallback: string; isSelected: boolean }[] = [
+            {
+              key: "complete",
+              cellRefFallback: "L26",
+              isSelected: data.complete === "x" || data.complete === true || statusVal === "complete"
+            },
+            {
+              key: "on_time",
+              cellRefFallback: "T26",
+              isSelected: data.on_time === "x" || data.on_time === true || statusVal === "on time" || statusVal === "on_time" || statusVal === "ontime"
+            },
+            {
+              key: "late",
+              cellRefFallback: "AD26",
+              isSelected: data.late === "x" || data.late === true || statusVal === "late"
+            },
+            {
+              key: "incomplete",
+              cellRefFallback: "L28",
+              isSelected: data.incomplete === "x" || data.incomplete === true || statusVal === "incomplete"
+            },
+            {
+              key: "emergency",
+              cellRefFallback: "AP32",
+              isSelected: data.emergency === "x" || data.emergency === true || modeVal === "emergency"
+            },
+            {
+              key: "urgent",
+              cellRefFallback: "AP34",
+              isSelected: data.urgent === "x" || data.urgent === true || modeVal === "urgent"
+            },
+            {
+              key: "regular",
+              cellRefFallback: "AP36",
+              isSelected: data.regular === "x" || data.regular === true || modeVal === "regular"
+            },
+            {
+              key: "irregular",
+              cellRefFallback: "AP38",
+              isSelected: data.irregular === "x" || data.irregular === true || modeVal === "irregular"
+            }
+          ];
+
+          indicators.forEach((ind) => {
+            const cellRef = ind.cellRefFallback;
+            const cellRegex = new RegExp(`<c\\s+[^>]*?\\br="${cellRef}"[^>]*?(?:\\/>|>([\\s\\S]*?)<\\/c>)`);
+            const match = sheet1Xml.match(cellRegex);
+            if (match) {
+              const fullTag = match[0];
+              const styleMatch = fullTag.match(/s="(\d+)"/);
+              const origStyleId = styleMatch ? parseInt(styleMatch[1], 10) : 0;
+
+              const styleToApply = ind.isSelected ? getBlackStyleId(origStyleId) : origStyleId;
+              const replacement = `<c r="${cellRef}" s="${styleToApply}"/>`;
+              sheet1Xml = sheet1Xml.replace(fullTag, replacement);
+            }
+          });
+
+          // Write updated cellXfs back into stylesXml
+          stylesXml = stylesXml.replace(
+            /<cellXfs count="\d+">[\s\S]*?<\/cellXfs>/,
+            `<cellXfs count="${xfsCount}">${xfsContent}</cellXfs>`
+          );
+          originalZip.file("xl/styles.xml", stylesXml);
+        }
+      }
+
       originalZip.file("xl/worksheets/sheet1.xml", sheet1Xml);
     }
     
@@ -2071,6 +3171,47 @@ function convertExcelToHtml(workbook: ExcelJS.Workbook): string {
 // PizZip Layout-Preserving Helper Functions
 // ==========================================
 
+// Helper to count wrapped lines based on capacity and explicit newlines
+export function countWrappedLines(text: string, capacity = 50): number {
+  if (!text || !text.trim()) return 1;
+  const rawLines = text.split(/\r?\n/);
+  let totalLines = 0;
+  for (const rawLine of rawLines) {
+    if (!rawLine.trim()) {
+      totalLines += 1;
+      continue;
+    }
+    const words = rawLine.split(/\s+/);
+    let currentLineLen = 0;
+    let lineCount = 1;
+    for (const word of words) {
+      if (word.length === 0) continue;
+      if (currentLineLen === 0) {
+        if (word.length > capacity) {
+          lineCount += Math.floor((word.length - 1) / capacity);
+          currentLineLen = word.length % capacity;
+        } else {
+          currentLineLen = word.length;
+        }
+      } else {
+        if (currentLineLen + 1 + word.length <= capacity) {
+          currentLineLen += 1 + word.length;
+        } else {
+          lineCount += 1;
+          if (word.length > capacity) {
+            lineCount += Math.floor((word.length - 1) / capacity);
+            currentLineLen = word.length % capacity;
+          } else {
+            currentLineLen = word.length;
+          }
+        }
+      }
+    }
+    totalLines += lineCount;
+  }
+  return totalLines;
+}
+
 function replacePlaceholdersInSharedStrings(sharedStringsXml: string, data: Record<string, any>): string {
   const getValue = (key: string) => {
     const trimmedKey = key.trim();
@@ -2102,62 +3243,108 @@ function replacePlaceholdersInSharedStrings(sharedStringsXml: string, data: Reco
     return undefined;
   };
 
-  const replacer = (match: string, key: string) => {
-    const val = getValue(key);
-    if (val === undefined || val === null) {
-      return "";
-    }
-    return escapeXml(String(val));
-  };
+  // Process each <si>...</si> block independently to preserve existing template styling (<rPr>, <color>, etc.)
+  return sharedStringsXml.replace(/<si\b[^>]*>([\s\S]*?)<\/si>/gi, (match, innerXml) => {
+    const placeholderRegex = /\{\{([^{}]+)\}\}|\{([^{}]+)\}/g;
+    const matches = Array.from(innerXml.matchAll(placeholderRegex));
 
-  let result = sharedStringsXml.replace(/\{\{([^{}]+)\}\}/g, replacer);
-  result = result.replace(/\{([^{}]+)\}/g, replacer);
-  return result;
+    if (matches.length === 0) {
+      return match; // No placeholders, leave unchanged
+    }
+
+    let updatedInner = innerXml;
+    let isPurpose = false;
+    let targetFontSize: number | null = null;
+    let isNothingFollows = false;
+
+    for (const m of matches) {
+      const placeholderText = m[0];
+      const rawKey = m[1] || m[2];
+      const upperKey = rawKey.trim().toUpperCase();
+      const rawVal = getValue(rawKey);
+      let strVal = rawVal !== undefined && rawVal !== null ? String(rawVal) : "";
+
+      if (upperKey.includes("PURPOSE")) {
+        isPurpose = true;
+        strVal = strVal.toUpperCase();
+        const fit = computePurposeFit(strVal);
+        targetFontSize = fit.fontSize;
+      } else if (upperKey.includes("PO_NO")) {
+        strVal = strVal.slice(0, 40);
+        const fit = computePoFit(strVal);
+        targetFontSize = fit.fontSize;
+      } else if (upperKey.includes("DESCRIPTION")) {
+        if (strVal === "*****NOTHING FOLLOWS*****") {
+          isNothingFollows = true;
+          targetFontSize = 10;
+        } else {
+          const totalLines = countWrappedLines(strVal, 50);
+          targetFontSize = totalLines >= 5 ? 9 : 10;
+        }
+      }
+
+      if (strVal === "*****NOTHING FOLLOWS*****") {
+        isNothingFollows = true;
+      }
+
+      const escapedVal = escapeXml(strVal);
+      updatedInner = updatedInner.replace(placeholderText, escapedVal);
+    }
+
+    // Apply targetFontSize styling (Case A: existing <rPr>; Case B: plain <t> transformed to rich text when targetFontSize < 11)
+    if (targetFontSize !== null) {
+      if (/<rPr\b[^>]*>/i.test(updatedInner)) {
+        // Case A: Update or insert <sz val="..."/> inside existing <rPr> blocks without touching <color>, <rFont>, etc.
+        updatedInner = updatedInner.replace(/<rPr\b([^>]*)>([\s\S]*?)<\/rPr>/gi, (rPrMatch, rPrAttrs, rPrContent) => {
+          if (/<sz\b[^>]*\/>/i.test(rPrContent)) {
+            const newContent = rPrContent.replace(/<sz\s+val=["']\d+["']\s*\/?>/gi, `<sz val="${targetFontSize}"/>`);
+            return `<rPr${rPrAttrs}>${newContent}</rPr>`;
+          } else {
+            return `<rPr${rPrAttrs}><sz val="${targetFontSize}"/>${rPrContent}</rPr>`;
+          }
+        });
+      } else if (targetFontSize < 11) {
+        // Case B: Plain <t> without <rPr>, wrap in rich text run with font properties
+        if (/<t\b[^>]*>([\s\S]*?)<\/t>/i.test(updatedInner)) {
+          updatedInner = updatedInner.replace(/<t\b([^>]*)>([\s\S]*?)<\/t>/gi, (tMatch, tAttrs, tContent) => {
+            return `<r><rPr><rFont val="Tahoma"/><sz val="${targetFontSize}"/><color rgb="FF0000FF"/></rPr><t${tAttrs}>${tContent}</t></r>`;
+          });
+        } else {
+          updatedInner = `<r><rPr><rFont val="Tahoma"/><sz val="${targetFontSize}"/><color rgb="FF0000FF"/></rPr><t>${updatedInner}</t></r>`;
+        }
+      }
+    }
+
+    if (isNothingFollows && !/<i\b/i.test(updatedInner)) {
+      if (/<rPr\b[^>]*>/i.test(updatedInner)) {
+        updatedInner = updatedInner.replace(/<rPr\b([^>]*)>/gi, `<rPr$1><i/>`);
+      } else {
+        updatedInner = `<r><rPr><i/></rPr>${updatedInner}</r>`;
+      }
+    }
+
+    return `<si>${updatedInner}</si>`;
+  });
 }
 
-function injectCellValue(sheetXml: string, cellRef: string, val: any, isString: boolean = false, isItalic: boolean = false): string {
-  const selfClosingRegex = new RegExp('<c(?:\\s+[^>]*?)?\\s+r="' + cellRef + '"(?:\\s+[^>]*?)?\\/>', 'i');
-  const fullCellRegex = new RegExp('<c(?:\\s+[^>]*?)?\\s+r="' + cellRef + '"(?:\\s+[^>]*?)?>[\\s\\S]*?<\\/c>', 'i');
-
-  const selfMatch = sheetXml.match(selfClosingRegex);
-  if (selfMatch) {
-    const fullTag = selfMatch[0];
-    const styleMatch = fullTag.match(/\bs="(\d+)"/i);
-    const styleId = styleMatch ? styleMatch[1] : "2";
-    let newCell = "";
-    if (val === undefined || val === null || val === "") {
-      newCell = `<c r="${cellRef}" s="${styleId}"/>`;
-    } else if (isString) {
-      if (isItalic) {
-        newCell = `<c r="${cellRef}" s="${styleId}" t="inlineStr"><is><r><rPr><i/></rPr><t>${escapeXml(String(val))}</t></r></is></c>`;
-      } else {
-        newCell = `<c r="${cellRef}" s="${styleId}" t="inlineStr"><is><t>${escapeXml(String(val))}</t></is></c>`;
-      }
-    } else {
-      newCell = `<c r="${cellRef}" s="${styleId}"><v>${val}</v></c>`;
-    }
-    return sheetXml.replace(fullTag, newCell);
+function injectCellValue(sheetXml: string, cellRef: string, val: any, isString: boolean = false, isItalic: boolean = false, overrideStyleId?: string): string {
+  const cellRegex = new RegExp('<c\\s+[^>]*?\\br="' + cellRef + '"[^>]*?\\bs="(\\d+)"[^>]*?(?:\\/>|>([\\s\\S]*?)<\\/c>)', 'i');
+  const match = sheetXml.match(cellRegex);
+  if (!match) {
+    return sheetXml;
   }
-
-  const fullMatch = sheetXml.match(fullCellRegex);
-  if (fullMatch) {
-    const fullTag = fullMatch[0];
-    const styleMatch = fullTag.match(/\bs="(\d+)"/i);
-    const styleId = styleMatch ? styleMatch[1] : "2";
-    let newCell = "";
-    if (val === undefined || val === null || val === "") {
-      newCell = `<c r="${cellRef}" s="${styleId}"/>`;
-    } else if (isString) {
-      if (isItalic) {
-        newCell = `<c r="${cellRef}" s="${styleId}" t="inlineStr"><is><r><rPr><i/></rPr><t>${escapeXml(String(val))}</t></r></is></c>`;
-      } else {
-        newCell = `<c r="${cellRef}" s="${styleId}" t="inlineStr"><is><t>${escapeXml(String(val))}</t></is></c>`;
-      }
+  const styleId = overrideStyleId || match[1];
+  let newCell = "";
+  if (val === undefined || val === null || val === "") {
+    newCell = `<c r="${cellRef}" s="${styleId}"/>`;
+  } else if (isString) {
+    if (isItalic || val === "*****NOTHING FOLLOWS*****") {
+      newCell = `<c r="${cellRef}" s="${styleId}" t="inlineStr"><is><r><rPr><i/></rPr><t>${escapeXml(val)}</t></r></is></c>`;
     } else {
-      newCell = `<c r="${cellRef}" s="${styleId}"><v>${val}</v></c>`;
+      newCell = `<c r="${cellRef}" s="${styleId}" t="inlineStr"><is><t>${escapeXml(val)}</t></is></c>`;
     }
-    return sheetXml.replace(fullTag, newCell);
+  } else {
+    newCell = `<c r="${cellRef}" s="${styleId}"><v>${val}</v></c>`;
   }
-
-  return sheetXml;
+  return sheetXml.replace(match[0], newCell);
 }

@@ -157,11 +157,13 @@ export default function SuppliersList({
 
   const handleSubmit = (e: React.FormEvent) => {
     e.preventDefault();
+    const upperName = name.toUpperCase();
+    const upperAttention = attention.toUpperCase();
     if (editingSupplier) {
       onEditSupplier({
         ...editingSupplier,
-        name,
-        attention,
+        name: upperName,
+        attention: upperAttention,
         phone,
         fax,
         address,
@@ -170,8 +172,8 @@ export default function SuppliersList({
       });
     } else {
       onAddSupplier({
-        name,
-        attention,
+        name: upperName,
+        attention: upperAttention,
         phone,
         fax,
         address,
@@ -191,6 +193,7 @@ export default function SuppliersList({
     try {
       await api.updateSupplier(supplier.id, { status: newStatus });
       onRefreshData();
+      window.dispatchEvent(new Event("smei_suppliers_updated"));
     } catch (err) {
       alert("Failed to update status. Please try again.");
     }
@@ -228,6 +231,7 @@ export default function SuppliersList({
       setSupplierForMerge(null);
       setTargetMergeId("");
       onRefreshData();
+      window.dispatchEvent(new Event("smei_suppliers_updated"));
     } catch (err) {
       alert("Merge operation failed. Please verify records and try again.");
     } finally {
@@ -792,8 +796,8 @@ export default function SuppliersList({
                       type="text"
                       required
                       value={name}
-                      onChange={(e) => setName(e.target.value)}
-                      placeholder="e.g. ABC Cavite Industrial Corporation"
+                      onChange={(e) => setName(e.target.value.toUpperCase())}
+                      placeholder="e.g. ABC CAVITE INDUSTRIAL CORPORATION"
                       className="w-full px-3.5 py-2 bg-gray-50 border border-gray-200 rounded-xl focus:outline-none focus:ring-2 focus:ring-smei-crimson"
                     />
                   </div>
@@ -807,8 +811,8 @@ export default function SuppliersList({
                       type="text"
                       required
                       value={attention}
-                      onChange={(e) => setAttention(e.target.value)}
-                      placeholder="e.g. Engr. Arthur Santos"
+                      onChange={(e) => setAttention(e.target.value.toUpperCase())}
+                      placeholder="e.g. ENGR. ARTHUR SANTOS"
                       className="w-full px-3.5 py-2 bg-gray-50 border border-gray-200 rounded-xl focus:outline-none focus:ring-2 focus:ring-smei-crimson"
                     />
                   </div>

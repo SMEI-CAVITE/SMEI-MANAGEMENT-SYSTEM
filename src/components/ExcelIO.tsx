@@ -52,8 +52,8 @@ export const exportPOToExcel = (po: PurchaseOrder) => {
     ["Delivery Date:", po.deliveryDate, "", "Category:", po.category],
     [""],
     ["SUPPLIER DETAILS"],
-    ["Supplier:", po.supplierName, "", "Attention:", po.attention],
-    ["Tel / Fax No:", `${po.telNo} / ${po.faxNo}`, "", "Purpose:", po.purpose],
+    ["Supplier:", (po.supplierName ?? "").toUpperCase(), "", "Attention:", (po.attention ?? "").toUpperCase()],
+    ["Tel / Fax No:", `${po.telNo} / ${po.faxNo}`, "", "Purpose:", (po.purpose ?? "").toUpperCase()],
     [""],
     ["ITEM DETAILS TABLE"],
     ["Quantity", "Unit", "Name / Description of Item", "Unit Price (PHP)", "Amount (PHP)"]

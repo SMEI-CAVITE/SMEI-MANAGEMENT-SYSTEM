@@ -70,6 +70,69 @@ export type POStatus =
   | "Cancelled"
   | "Closed";
 
+export type ApprovalStatus =
+  | "Draft"
+  | "Pending Approval"
+  | "Approved"
+  | "Rejected"
+  | "Cancelled";
+
+export interface DocumentApprovalSignature {
+  id: string;
+  userId?: string;
+  userName: string;
+  position?: string;
+  note?: string;
+  signedAt: string;
+  signatureType: "APPROVAL" | "NOTE" | "SIGNATURE";
+}
+
+export interface ApprovalHistoryEntry {
+  id: string;
+  documentType: "PO" | "PIS" | "RFS" | "CANVASS";
+  documentId: string;
+  documentNumber: string;
+  action: "Submitted for Approval" | "Approved" | "Rejected" | "Cancelled" | "EXPORTED" | "SIGNED" | "NOTE_ADDED";
+  performedBy: string;
+  performedByName: string;
+  performedByRole?: string;
+  performedByPosition?: string;
+  timestamp: string;
+  reason?: string;
+  note?: string;
+  details?: string;
+}
+
+export interface UnifiedProcurementDocument {
+  id: string;
+  documentType: "PO" | "PIS" | "RFS" | "CANVASS";
+  documentNumber: string;
+  controlNumber?: string;
+  requestedBy: string;
+  department: string;
+  date: string;
+  amount: number | null;
+  operationalStatus: string;
+  approvalStatus: ApprovalStatus;
+  rawDocument: PurchaseOrder | PaymentInstructionSlip | RequestForSupply | CanvassSheet;
+  submittedBy?: string;
+  submittedAt?: string;
+  approvedBy?: string;
+  approvedByName?: string;
+  approvedAt?: string;
+  rejectedBy?: string;
+  rejectedByName?: string;
+  rejectedAt?: string;
+  rejectionReason?: string;
+  exportStatus?: "NOT_EXPORTED" | "EXPORTED";
+  exportedAt?: string;
+  exportedBy?: string;
+  exportedByName?: string;
+  exportedByPosition?: string;
+  signatureHistory?: DocumentApprovalSignature[];
+  approvalHistory?: ApprovalHistoryEntry[];
+}
+
 export interface Signatory {
   id: string;
   name: string;
@@ -97,6 +160,7 @@ export interface PurchaseOrder {
   items: POItem[];
   
   // Tax & VAT Calculations
+  overrideVat?: boolean;
   vatableAmount: number;
   vat12: number;
   vatExemptAmount: number;
@@ -142,8 +206,19 @@ export interface PurchaseOrder {
   signature?: string;
   dateApproved?: string;
   status: POStatus;
+  approvalStatus?: ApprovalStatus;
+  approvalHistory?: ApprovalHistoryEntry[];
+  submittedBy?: string;
+  submittedAt?: string;
+  approvedByName?: string;
+  approvedAt?: string;
+  rejectedBy?: string;
+  rejectedByName?: string;
+  rejectedAt?: string;
+  rejectionReason?: string;
   currencySymbol?: string;
   rfsNumber?: string;
+  rfsId?: string;
   created_by?: string;
   createdAt?: string;
   
@@ -167,20 +242,39 @@ export interface AuditLog {
   details?: string;
 }
 
+export type ProcurementDocumentType = "PO" | "PIS" | "RFS" | "CANVASS";
+export type NotificationStatus = "ACTIVE" | "RESOLVED" | "EXPIRED";
+export type NotificationEventType = "SUBMITTED" | "APPROVED" | "REJECTED" | "RETURNED" | "VERIFIED" | "INFO";
+
 export interface Notification {
   id: string;
+  portal?: PortalType | "po" | "tsd" | string;
+  module?: string;
+  priority?: "HIGH" | "MEDIUM" | "LOW" | string;
+  workflowId?: string;
   userId: string;
-  role: UserRole;
+  role: UserRole | string;
   title: string;
   message: string;
   date: string;
   time: string;
   isRead: boolean;
   poId?: string;
+  documentType?: ProcurementDocumentType | string;
+  documentId?: string;
+  documentNumber?: string;
+  status?: NotificationStatus | string;
+  eventType?: NotificationEventType | string;
+  createdAt?: string;
+  readAt?: string;
+  createdBy?: string;
 }
 
 export interface PaymentEntry {
   id: string;
+  completedPOId?: string;
+  completedPONumber?: string;
+  poNumber?: string;
   paymentPurpose: string;
   gross: number;
   ewt: number;
@@ -190,6 +284,9 @@ export interface PaymentEntry {
 export interface PaymentInstructionSlip {
   id: string;
   pisNumber: string;
+  completedPOId?: string;
+  completedPONumber?: string;
+  poNumber?: string;
   scheduleDate: string;
   scheduleTime: string;
   ampm: "AM" | "PM";
@@ -217,7 +314,17 @@ export interface PaymentInstructionSlip {
   acceptedByPosition?: string;
   acceptedByDate?: string;
   
-  status: "Draft" | "Pending" | "Approved" | "Released" | "Cancelled";
+  status: "Draft" | "Pending" | "Approved" | "Released" | "Cancelled" | "Rejected";
+  approvalStatus?: ApprovalStatus;
+  approvalHistory?: ApprovalHistoryEntry[];
+  submittedBy?: string;
+  submittedAt?: string;
+  approvedByName?: string;
+  approvedAt?: string;
+  rejectedBy?: string;
+  rejectedByName?: string;
+  rejectedAt?: string;
+  rejectionReason?: string;
   created_by: string;
   created_department?: string;
   createdAt: string;
@@ -247,11 +354,21 @@ export interface RequestForSupply {
   departmentOthers?: string;
   controlNumber: string;
   purchaseOrderNumber: string;
-  addNothingFollows?: boolean;
   items: RFSItem[];
   status: "Complete" | "Incomplete" | "On Time" | "Late";
+  approvalStatus?: ApprovalStatus;
+  approvalHistory?: ApprovalHistoryEntry[];
+  submittedBy?: string;
+  submittedAt?: string;
+  approvedByName?: string;
+  approvedAt?: string;
+  rejectedBy?: string;
+  rejectedByName?: string;
+  rejectedAt?: string;
+  rejectionReason?: string;
   modeOfRequest: "Emergency" | "Urgent" | "Regular" | "Irregular";
   purpose: string;
+  addNothingFollows?: boolean;
   
   // Signatories
   requestedBy: string;
@@ -290,6 +407,17 @@ export interface CanvassSheet {
   lowestPrice: number;
   recommendedSupplier: string;
   totalCost: number;
+  status?: string;
+  approvalStatus?: ApprovalStatus;
+  approvalHistory?: ApprovalHistoryEntry[];
+  submittedBy?: string;
+  submittedAt?: string;
+  approvedByName?: string;
+  approvedAt?: string;
+  rejectedBy?: string;
+  rejectedByName?: string;
+  rejectedAt?: string;
+  rejectionReason?: string;
   
   // New input fields for the Canvass Sheet template
   category?: string;
@@ -330,3 +458,118 @@ export interface CanvassSheet {
   createdAt: string;
   updatedAt: string;
 }
+
+// ==========================================
+// SYSTEM RESOURCE & STORAGE MONITORING TYPES
+// ==========================================
+
+export type PortalType = "SMEI_MANAGEMENT_SYSTEM" | "TSD_PORTAL" | "PURCHASE" | "TSD" | "po" | "tsd";
+
+export type FileStatusType = "ACTIVE" | "TEMPORARY" | "DELETED" | "ARCHIVED";
+
+export type SystemHealthStatus = "NORMAL" | "WARNING" | "CRITICAL" | "EXTREME" | "LIMIT_REACHED";
+
+export interface MonitoringFileRecord {
+  id: string;
+  portal: PortalType;
+  documentType: string;
+  fileName: string;
+  mimeType: string;
+  sizeBytes: number;
+  storagePath: string;
+  relatedRecordId?: string;
+  uploadedBy?: string;
+  createdAt: string;
+  updatedAt?: string;
+  status: FileStatusType;
+  metadata?: {
+    controlNo?: string;
+    manifestYear?: number;
+    sheetCount?: number;
+    sourceFileId?: string;
+    generatedFileId?: string;
+    mergedFileId?: string;
+    [key: string]: any;
+  };
+}
+
+export interface MonitoringOperationLog {
+  id: string;
+  timestamp: string;
+  date: string;
+  portal: PortalType;
+  module: string;
+  operation: "READ" | "CREATE" | "UPDATE" | "DELETE";
+  count?: number;
+}
+
+export interface MonitoringSnapshot {
+  id: string;
+  date: string;
+  timestamp: string;
+  totalStorageBytes: number;
+  totalFilesCount: number;
+  smeiStorageBytes: number;
+  smeiFilesCount: number;
+  tsdStorageBytes: number;
+  tsdFilesCount: number;
+  dbReads: number;
+  dbCreates: number;
+  dbUpdates: number;
+  dbDeletes: number;
+}
+
+export interface MonitoringSettings {
+  storageLimitBytes: number; // Default 5GB (5368709120 bytes)
+  warningThresholdPct: number; // Default 70%
+  criticalThresholdPct: number; // Default 85%
+  extremeThresholdPct: number; // Default 95%
+}
+
+export interface DocumentTypeStorageStat {
+  documentType: string;
+  displayName: string;
+  portal: PortalType;
+  fileCount: number;
+  sizeBytes: number;
+  percentageOfTotal: number;
+}
+
+export interface DatabaseOperationStat {
+  module: string;
+  portal: PortalType;
+  reads: number;
+  creates: number;
+  updates: number;
+  deletes: number;
+  totalOperations: number;
+}
+
+export interface MonitoringOverviewData {
+  totalStorageBytes: number;
+  storageLimitBytes: number;
+  storagePercentageUsed: number;
+  totalFilesCount: number;
+  activeFilesCount: number;
+  dbReadsToday: number;
+  dbWritesToday: number;
+  dbUpdatesToday: number;
+  dbDeletesToday: number;
+  healthStatus: SystemHealthStatus;
+  portalStats: {
+    smei: {
+      storageBytes: number;
+      filesCount: number;
+      percentage: number;
+    };
+    tsd: {
+      storageBytes: number;
+      filesCount: number;
+      percentage: number;
+    };
+  };
+  docTypeStats: DocumentTypeStorageStat[];
+  dbOperationStats: DatabaseOperationStat[];
+  thresholds: MonitoringSettings;
+}
+

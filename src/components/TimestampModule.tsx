@@ -13,9 +13,17 @@ import {
   RefreshCw
 } from "lucide-react";
 import { exportExcelWithTemplate } from "../utils/templateExport";
+import { getTsdExportFilename } from "../utils/tsdFilename";
+import { normalizeControlNo } from "../utils/controlNumber";
+import { attachRecordToWorkflow, setActiveWorkflow, getActiveWorkflow, getAllWorkflows, WorkflowRecord } from "../utils/workflowManager";
+import { getHeavyPayload, saveHeavyPayload, deleteHeavyPayload, safeSetLocalStorage } from "../utils/heavyStorage";
+import { notificationRepository } from "../services/notificationRepository";
 
 interface TimestampRecord {
   id: string;
+  workflowId?: string;
+  controlNo?: string;
+  caNumber?: string;
   photoData: string; // base64 placeholder
   fileName: string;
   createdAt: string; // YYYY-MM-DD HH:MM:SS
@@ -48,6 +56,30 @@ export default function TimestampModule() {
 
   const [activePhoto, setActivePhoto] = useState<string | null>(null);
 
+  const handleRecordSelect = (rec: TimestampRecord) => {
+    setSelectedRecordId(rec.id);
+    const activeWf = getActiveWorkflow();
+    const allWorkflows = getAllWorkflows();
+    const code = rec.controlNo || rec.caNumber;
+
+    let targetWf = rec.workflowId ? allWorkflows.find((w) => w.id === rec.workflowId) : null;
+    if (!targetWf && code) {
+      targetWf = allWorkflows.find((w) => w.controlNo && normalizeControlNo(w.controlNo) === normalizeControlNo(code)) || null;
+    }
+
+    if (!targetWf) {
+      targetWf = attachRecordToWorkflow("timestamp", rec, code);
+    }
+
+    if (targetWf && targetWf.id) {
+      if (!activeWf || targetWf.id !== activeWf.id) {
+        setActiveWorkflow(targetWf.id, targetWf.controlNo);
+        window.dispatchEvent(new Event("tsd_data_changed"));
+        window.dispatchEvent(new Event("tsd_workflows_updated"));
+      }
+    }
+  };
+
   // Load from local storage with self-healing migration of legacy Base64 payloads
   useEffect(() => {
     const saved = localStorage.getItem("tsd_timestamp_records");
@@ -59,7 +91,7 @@ export default function TimestampModule() {
         // Perform self-healing migration of any inline Base64 data to separate keys
         parsed = parsed.map(rec => {
           if (rec.photoData && rec.photoData !== PLACEHOLDER_GIF) {
-            localStorage.setItem(`tsd_photo_${rec.id}`, rec.photoData);
+            saveHeavyPayload(`tsd_photo_${rec.id}`, rec.photoData);
             migrated = true;
             return { ...rec, photoData: PLACEHOLDER_GIF };
           }
@@ -67,12 +99,22 @@ export default function TimestampModule() {
         });
 
         if (migrated) {
-          localStorage.setItem("tsd_timestamp_records", JSON.stringify(parsed));
+          safeSetLocalStorage("tsd_timestamp_records", JSON.stringify(parsed));
         }
 
         setRecords(parsed);
         if (parsed.length > 0) {
-          setSelectedRecordId(parsed[0].id);
+          const activeWf = getActiveWorkflow();
+          const match = activeWf
+            ? parsed.find(
+                (r: any) =>
+                  r.workflowId === activeWf.id ||
+                  (activeWf.controlNo &&
+                    (r.controlNo || r.caNumber) &&
+                    normalizeControlNo(r.controlNo || r.caNumber) === normalizeControlNo(activeWf.controlNo))
+              )
+            : null;
+          setSelectedRecordId(match ? match.id : parsed[0].id);
         }
       } catch (e) {
         console.error("Failed to parse saved timestamp records", e);
@@ -99,18 +141,18 @@ export default function TimestampModule() {
       ];
       setRecords(initial);
       setSelectedRecordId(initial[0].id);
-      localStorage.setItem("tsd_timestamp_records", JSON.stringify(initial));
+      safeSetLocalStorage("tsd_timestamp_records", JSON.stringify(initial));
     }
   }, []);
 
   // Lazy-load photo on demand for the selected record
   useEffect(() => {
     if (selectedRecordId) {
-      const savedPhoto = localStorage.getItem(`tsd_photo_${selectedRecordId}`);
+      const savedPhoto = getHeavyPayload(`tsd_photo_${selectedRecordId}`);
+      const rec = records.find(r => r.id === selectedRecordId);
       if (savedPhoto) {
         setActivePhoto(savedPhoto);
       } else {
-        const rec = records.find(r => r.id === selectedRecordId);
         setActivePhoto(rec?.photoData || PLACEHOLDER_GIF);
       }
     } else {
@@ -120,7 +162,11 @@ export default function TimestampModule() {
 
   const saveToStorage = (updated: TimestampRecord[]) => {
     setRecords(updated);
-    localStorage.setItem("tsd_timestamp_records", JSON.stringify(updated));
+    safeSetLocalStorage("tsd_timestamp_records", JSON.stringify(updated));
+
+    window.dispatchEvent(new Event("tsd_data_changed"));
+    window.dispatchEvent(new Event("tsd_workflows_updated"));
+    window.dispatchEvent(new Event("tsd_storage_updated"));
   };
 
   const handleTriggerUpload = () => {
@@ -213,7 +259,7 @@ export default function TimestampModule() {
         setTempFileSize(sizeStr);
       } else if (selectedRecordId) {
         // Replace existing record photo immediately
-        localStorage.setItem(`tsd_photo_${selectedRecordId}`, base64Data);
+        saveHeavyPayload(`tsd_photo_${selectedRecordId}`, base64Data);
         setActivePhoto(base64Data);
 
         const updated = records.map(r => {
@@ -239,11 +285,15 @@ export default function TimestampModule() {
 
     const newRecordId = `TR-${Date.now().toString().substring(7)}`;
     
-    // Save photo separately to keep registry search and list load instant
-    localStorage.setItem(`tsd_photo_${newRecordId}`, tempPhoto);
+    // Save photo separately in heavy storage
+    saveHeavyPayload(`tsd_photo_${newRecordId}`, tempPhoto);
+
+    const activeCa = localStorage.getItem("tsd_active_control_no") || "";
 
     const newRecord: TimestampRecord = {
       id: newRecordId,
+      controlNo: activeCa,
+      caNumber: activeCa,
       photoData: PLACEHOLDER_GIF,
       fileName: tempFileName,
       createdAt: customDate || new Date().toISOString().replace("T", " ").substring(0, 19),
@@ -251,9 +301,29 @@ export default function TimestampModule() {
       fileSize: tempFileSize
     };
 
+    let targetWf: WorkflowRecord;
+    try {
+      targetWf = attachRecordToWorkflow("timestamp", newRecord, activeCa);
+    } catch (err: any) {
+      alert(err.message || "No active workflow is selected. Please select or create a workflow before saving this document.");
+      return;
+    }
+
     const updated = [newRecord, ...records];
     saveToStorage(updated);
     setSelectedRecordId(newRecord.id);
+
+    notificationRepository.createNotification({
+      portal: "TSD",
+      module: "timestamp",
+      workflowId: targetWf.id,
+      documentId: newRecord.id,
+      documentNumber: activeCa,
+      title: "Compliance Timestamp Recorded",
+      message: `Compliance validation timestamp photo logged for Workflow ${targetWf.workflowCode || targetWf.id}${activeCa ? ` (Control No: ${activeCa})` : ''}.`,
+      priority: "LOW"
+    }).catch(() => {});
+
     setIsModalOpen(false);
     setTempPhoto(null);
   };
@@ -263,7 +333,7 @@ export default function TimestampModule() {
     if (confirm("Are you sure you want to permanently delete this timestamp record from the compliance registry?")) {
       const updated = records.filter(r => r.id !== id);
       saveToStorage(updated);
-      localStorage.removeItem(`tsd_photo_${id}`);
+      deleteHeavyPayload(`tsd_photo_${id}`);
       if (selectedRecordId === id) {
         setSelectedRecordId(updated.length > 0 ? updated[0].id : null);
       }
@@ -289,10 +359,9 @@ export default function TimestampModule() {
       setIsExportingId(record.id);
       
       // On-demand resolution of the active photo
-      const activePhotoData = localStorage.getItem(`tsd_photo_${record.id}`) || record.photoData || PLACEHOLDER_GIF;
+      const activePhotoData = getHeavyPayload(`tsd_photo_${record.id}`) || record.photoData || PLACEHOLDER_GIF;
 
-      const exportDateStr = formatExportDate(record.createdAt);
-      const exportFileName = `COPY OF TIMESTAMP ${exportDateStr}.xlsm`;
+      const exportFileName = getTsdExportFilename("timestamp", record.createdAt, "xlsm");
 
       await exportExcelWithTemplate(
         "TIME_STAMP_TEMPLATE.xlsm",
@@ -451,7 +520,7 @@ export default function TimestampModule() {
                     filteredRecords.map((rec, index) => (
                       <tr
                         key={rec.id}
-                        onClick={() => setSelectedRecordId(rec.id)}
+                        onClick={() => handleRecordSelect(rec)}
                         className={`cursor-pointer transition-colors ${
                           selectedRecordId === rec.id
                             ? "bg-red-500/10 border-l-4 border-l-smei-crimson font-medium dark:bg-red-950/30"

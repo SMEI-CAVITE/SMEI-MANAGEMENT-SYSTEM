@@ -11,10 +11,10 @@ export const CA_NO_Y = 980;
  * Attaches user-provided CA No. to the uploaded PDF using Times New Roman Bold 14pt.
  */
 export async function attachCaNoToPdf(
-  file: File,
+  file: File | Blob | ArrayBuffer,
   caNo: string
 ): Promise<{ blob: Blob; dataUrl: string }> {
-  const arrayBuffer = await file.arrayBuffer();
+  const arrayBuffer = file instanceof ArrayBuffer ? file : await file.arrayBuffer();
   const pdfDoc = await PDFDocument.load(arrayBuffer);
 
   // Load standard Times New Roman Bold font
@@ -23,6 +23,15 @@ export async function attachCaNoToPdf(
   const pages = pdfDoc.getPages();
   if (pages.length > 0) {
     const page = pages[0];
+
+    // Clear top-right corner area before drawing stamp to remove any old stamp
+    page.drawRectangle({
+      x: CA_NO_X - 10,
+      y: CA_NO_Y - 5,
+      width: 250,
+      height: 30,
+      color: rgb(1, 1, 1),
+    });
 
     page.drawText(`CA No. ${caNo}`, {
       x: CA_NO_X,

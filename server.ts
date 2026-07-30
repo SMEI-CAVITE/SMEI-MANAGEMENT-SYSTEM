@@ -9,6 +9,19 @@ import { createServer as createViteServer } from "vite";
 import jwt from "jsonwebtoken";
 import crypto from "crypto";
 import { db, hashPassword, UserDB, PurchaseOrderDB, AuditLogDB } from "./src/server/db.js";
+import {
+  getAllowedPendingDocumentTypes,
+  normalizeDocumentType,
+  isPOPending,
+  isPISPending,
+  isRFSPending,
+  isCanvassPending,
+  ProcurementDocumentType
+} from "./src/utils/pendingDocumentUtils.js";
+
+
+import xlsx from "xlsx";
+import fs from "fs";
 
 const app = express();
 const PORT = 3000;
@@ -16,6 +29,136 @@ const JWT_SECRET = process.env.JWT_SECRET || "smei-enterprise-secret-key-2026-se
 
 app.use(express.json({ limit: "50mb" }));
 app.use(express.static(path.join(process.cwd(), "public")));
+
+/**
+ * Reconciles and resolves previous active notifications for a specific document
+ */
+function resolveNotificationsForDocument(docType: string, docId: string) {
+  const normType = normalizeDocumentType(docType);
+  const notifs = db.getNotifications();
+  let updated = false;
+
+  notifs.forEach((n) => {
+    const isSameDoc =
+      (n.documentId === docId) ||
+      (n.poId === docId) ||
+      (normType === "PO" && n.poId === docId);
+
+    if (isSameDoc && (n.status === "ACTIVE" || !n.status)) {
+      n.status = "RESOLVED";
+      updated = true;
+      db.saveNotification(n);
+    }
+  });
+
+  return updated;
+}
+
+/**
+ * Creates a structured event notification with lifecycle tracking
+ */
+function createDocumentNotification(params: {
+  userId?: string;
+  role: string;
+  title: string;
+  message: string;
+  documentType: ProcurementDocumentType;
+  documentId: string;
+  documentNumber: string;
+  eventType: "SUBMITTED" | "APPROVED" | "REJECTED" | "RETURNED" | "VERIFIED" | "INFO";
+}) {
+  // Resolve previous active alerts for this document
+  resolveNotificationsForDocument(params.documentType, params.documentId);
+
+  const now = new Date();
+  const notif = {
+    id: `n_${Date.now()}_${Math.random().toString(36).substring(2, 6)}`,
+    portal: "PURCHASE",
+    userId: params.userId || "",
+    role: params.role,
+    title: params.title,
+    message: params.message,
+    date: now.toISOString().split("T")[0],
+    time: now.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
+    isRead: false,
+    poId: params.documentType === "PO" ? params.documentId : undefined,
+    documentType: params.documentType,
+    documentId: params.documentId,
+    documentNumber: params.documentNumber,
+    status: "ACTIVE",
+    eventType: params.eventType,
+    createdAt: now.toISOString()
+  };
+
+  db.saveNotification(notif);
+  return notif;
+}
+
+function inferNotificationPortalServer(notif: any): "PURCHASE" | "TSD" {
+  if (!notif) return "PURCHASE";
+  if (notif.portal) {
+    const p = String(notif.portal).toUpperCase().trim();
+    if (p === "TSD" || p === "ENVIRONMENTAL") return "TSD";
+    if (p === "PURCHASE" || p === "PROCUREMENT" || p === "PO") return "PURCHASE";
+  }
+
+  const title = String(notif.title || "").toLowerCase();
+  const msg = String(notif.message || "").toLowerCase();
+  const mod = String(notif.module || "").toLowerCase();
+  const docType = String(notif.documentType || "").toUpperCase();
+
+  if (
+    notif.workflowId ||
+    ["control-no", "unloading-loading", "hazardous-waste", "waste-movement", "timestamp", "manifest-summary", "coa workflow", "tsd", "control number", "unloading / loading", "hazardous waste", "waste movement"].includes(mod) ||
+    title.includes("control number") ||
+    title.includes("unloading") ||
+    title.includes("hazardous waste") ||
+    title.includes("waste movement") ||
+    title.includes("timestamp") ||
+    title.includes("manifest summary") ||
+    title.includes("coa workflow") ||
+    msg.includes("control no") ||
+    msg.includes("ca-") ||
+    msg.includes("hazardous waste") ||
+    msg.includes("waste movement")
+  ) {
+    return "TSD";
+  }
+
+  return "PURCHASE";
+}
+
+function createTsdNotification(params: {
+  userId?: string;
+  role?: string;
+  title: string;
+  message: string;
+  module?: string;
+  workflowId?: string;
+  priority?: "HIGH" | "MEDIUM" | "LOW";
+}) {
+  const now = new Date();
+  const notif = {
+    id: `tsd_n_${Date.now()}_${Math.random().toString(36).substring(2, 6)}`,
+    portal: "TSD",
+    module: params.module || "COA Workflow",
+    priority: params.priority || "MEDIUM",
+    workflowId: params.workflowId,
+    userId: params.userId || "",
+    role: params.role || "Administrator",
+    title: params.title,
+    message: params.message,
+    date: now.toISOString().split("T")[0],
+    time: now.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
+    isRead: false,
+    status: "ACTIVE",
+    eventType: "INFO",
+    createdAt: now.toISOString()
+  };
+
+  db.saveNotification(notif);
+  return notif;
+}
 
 // Helper to log audit trails
 function logAudit(
@@ -233,6 +376,8 @@ app.post("/api/auth/login", (req, res) => {
 });
 
 // Get and verify invitation
+
+
 app.get("/api/auth/invitation/:token", (req, res) => {
   const { token } = req.params;
   const invite = db.getInvitations().find((i) => i.token === token);
@@ -265,15 +410,18 @@ app.post("/api/auth/register-public", (req, res) => {
   }
 
   const userId = `u_${Date.now()}`;
+  const employeeId = db.getNextEmployeeId();
   const newUser: UserDB = {
     id: userId,
     username,
     passwordHash: hashPassword(password),
+    password,
     fullName,
     email: `${username}@smei-enterprise.com`,
     role: "Viewer", // Default role, Admin can change later
     department,
-    status: "Pending" // Awaiting admin approval
+    status: "Pending", // Awaiting admin approval
+    employeeId
   };
 
   db.saveUser(newUser);
@@ -310,15 +458,18 @@ app.post("/api/auth/register", (req, res) => {
   }
 
   const userId = `u_${Date.now()}`;
+  const employeeId = db.getNextEmployeeId();
   const newUser: UserDB = {
     id: userId,
     username,
     passwordHash: hashPassword(password),
+    password,
     fullName,
     email: `${username}@smei-enterprise.com`,
     role: invite.role,
     department: invite.department,
-    status: "Active"
+    status: "Active",
+    employeeId
   };
 
   db.saveUser(newUser);
@@ -540,31 +691,51 @@ app.get("/api/users", authenticateToken, requireAdmin, (req, res) => {
   res.json(users);
 });
 
+app.get("/api/users/next-employee-id", authenticateToken, requireAdmin, (req, res) => {
+  const nextId = db.previewNextEmployeeId();
+  res.json({ nextEmployeeId: nextId });
+});
+
 app.post("/api/users", authenticateToken, requireAdmin, (req: AuthRequest, res) => {
-  const { username, password, fullName, email, role, department } = req.body;
+  const { username, password, fullName, email, role, department, employeeId: requestedEmpId } = req.body;
   if (!username || !password || !fullName || !email || !role || !department) {
     return res.status(400).json({ error: "All fields are required" });
   }
 
   // Check if username already exists
-  const existing = db.getUsers().find((u) => u.username.toLowerCase() === username.toLowerCase());
-  if (existing) {
+  const existingUsername = db.getUsers().find((u) => u.username.toLowerCase() === username.toLowerCase());
+  if (existingUsername) {
     return res.status(400).json({ error: "Username already exists" });
+  }
+
+  let finalEmpId = "";
+  if (requestedEmpId && requestedEmpId.trim()) {
+    const trimmed = requestedEmpId.trim();
+    // Verify uniqueness
+    const existingEmpId = db.getUsers().find((u) => u.employeeId && u.employeeId.toLowerCase() === trimmed.toLowerCase());
+    if (existingEmpId) {
+      return res.status(400).json({ error: `Employee ID ${trimmed} already exists.` });
+    }
+    finalEmpId = trimmed;
+  } else {
+    finalEmpId = db.getNextEmployeeId();
   }
 
   const newUser: UserDB = {
     id: `u_${Date.now()}`,
     username,
     passwordHash: hashPassword(password),
+    password,
     fullName,
     email,
     role,
     department,
-    status: "Active"
+    status: "Active",
+    employeeId: finalEmpId
   };
 
   db.saveUser(newUser);
-  logAudit(req.user!.id, req.user!.username, req.user!.role, "Create User", "Users", newUser.id, "-", `Created user: ${username}`, req);
+  logAudit(req.user!.id, req.user!.username, req.user!.role, "Create User", "Users", newUser.id, "-", `Created user: ${username} (${finalEmpId})`, req);
   
   const { passwordHash, ...safeUser } = newUser;
   res.status(201).json(safeUser);
@@ -649,6 +820,7 @@ app.post("/api/users/:id/reset-password", authenticateToken, requireAdmin, (req:
   }
 
   user.passwordHash = hashPassword(newPassword);
+  user.password = newPassword;
   user.loginAttempts = 0;
   if (user.status === "Locked") {
     user.status = "Active";
@@ -658,6 +830,71 @@ app.post("/api/users/:id/reset-password", authenticateToken, requireAdmin, (req:
   logAudit(req.user!.id, req.user!.username, req.user!.role, "Reset User Password", "Users", user.id, "-", "Password Reset Successful", req);
 
   res.json({ success: true, message: "Password reset successful" });
+});
+
+app.post("/api/users/:id/reveal-password", authenticateToken, requireAdmin, (req: AuthRequest, res) => {
+  const targetId = req.params.id;
+  const user = db.getUsers().find((u) => u.id === targetId);
+  if (!user) {
+    return res.status(404).json({ error: "User not found" });
+  }
+
+  const isFirebaseAuth = process.env.FIREBASE_AUTH_ENABLED === "true" || process.env.USE_FIREBASE_AUTH === "true";
+  if (isFirebaseAuth) {
+    logAudit(
+      req.user!.id,
+      req.user!.username,
+      req.user!.role,
+      "Reveal User Password Attempt",
+      "Users",
+      user.id,
+      "-",
+      `Attempted reveal on Firebase account: ${user.username}`,
+      req
+    );
+    return res.json({
+      success: false,
+      isFirebase: true,
+      password: "Password unavailable",
+      message: "Passwords managed via Firebase Authentication cannot be retrieved."
+    });
+  }
+
+  logAudit(
+    req.user!.id,
+    req.user!.username,
+    req.user!.role,
+    "Reveal User Password",
+    "Users",
+    user.id,
+    "-",
+    `Revealed password for user: ${user.username} (${user.employeeId || user.id})`,
+    req
+  );
+
+  res.json({
+    success: true,
+    isFirebase: false,
+    password: user.password || "Password unavailable"
+  });
+});
+
+app.delete("/api/users/:id", authenticateToken, requireAdmin, (req: AuthRequest, res) => {
+  const targetId = req.params.id;
+
+  if (targetId === req.user!.id) {
+    return res.status(400).json({ error: "You cannot delete your own account" });
+  }
+
+  const user = db.getUsers().find((u) => u.id === targetId);
+  if (!user) {
+    return res.status(404).json({ error: "User not found" });
+  }
+
+  db.deleteUser(targetId);
+  logAudit(req.user!.id, req.user!.username, req.user!.role, "Delete User", "Users", targetId, user.username, "Deleted Account", req);
+
+  res.json({ success: true, message: "User deleted successfully" });
 });
 
 
@@ -920,6 +1157,7 @@ app.get("/api/pos/next-number", authenticateToken, (req: AuthRequest, res) => {
 });
 
 app.get("/api/pos", authenticateToken, (req: AuthRequest, res) => {
+  db.logDatabaseOperation("SMEI_MANAGEMENT_SYSTEM", "PurchaseOrder", "READ");
   const user = req.user!;
   let pos = db.getPurchaseOrders();
 
@@ -1128,6 +1366,7 @@ app.delete("/api/pos/:id", authenticateToken, (req: AuthRequest, res) => {
     return res.status(400).json({ error: "Cannot delete an Approved Purchase Order." });
   }
 
+  resolveNotificationsForDocument("PO", poId);
   db.deletePurchaseOrder(poId);
   logAudit(user.id, user.username, user.role, "Delete PO", "Purchase Orders", poId, po.poNumber, "-", req);
 
@@ -1164,16 +1403,14 @@ app.post("/api/pos/:id/workflow", authenticateToken, (req: AuthRequest, res) => 
       newStatus = "Pending Review"; // Submitted for Department Head Review
       
       // Create notification for Department Head
-      db.saveNotification({
-        id: `n_${Date.now()}`,
-        userId: "", // broadcast to role
+      createDocumentNotification({
         role: "Department Head",
         title: "PO Submitted for Review",
         message: `PO ${po.poNumber} submitted by ${user.fullName} requires your department head review.`,
-        date: new Date().toISOString().split("T")[0],
-        time: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
-        isRead: false,
-        poId: po.id
+        documentType: "PO",
+        documentId: po.id,
+        documentNumber: po.poNumber,
+        eventType: "SUBMITTED"
       });
       break;
 
@@ -1195,16 +1432,14 @@ app.post("/api/pos/:id/workflow", authenticateToken, (req: AuthRequest, res) => 
       po.checkedByTitle = user.position || "Department Head";
 
       // Notify Accounting
-      db.saveNotification({
-        id: `n_${Date.now()}`,
-        userId: "",
+      createDocumentNotification({
         role: "Accounting Staff",
         title: "PO Pending Verification",
         message: `PO ${po.poNumber} has been approved by ${user.fullName} and is ready for Accounting Verification.`,
-        date: new Date().toISOString().split("T")[0],
-        time: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
-        isRead: false,
-        poId: po.id
+        documentType: "PO",
+        documentId: po.id,
+        documentNumber: po.poNumber,
+        eventType: "APPROVED"
       });
       break;
 
@@ -1222,16 +1457,14 @@ app.post("/api/pos/:id/workflow", authenticateToken, (req: AuthRequest, res) => 
       po.verifiedByTitle = user.position || "Accounting Staff";
 
       // Notify Director
-      db.saveNotification({
-        id: `n_${Date.now()}`,
-        userId: "",
+      createDocumentNotification({
         role: "Director",
         title: "PO Pending Final Approval",
         message: `PO ${po.poNumber} has been verified by Accounting and is ready for final Director authorization.`,
-        date: new Date().toISOString().split("T")[0],
-        time: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
-        isRead: false,
-        poId: po.id
+        documentType: "PO",
+        documentId: po.id,
+        documentNumber: po.poNumber,
+        eventType: "VERIFIED"
       });
       break;
 
@@ -1251,16 +1484,15 @@ app.post("/api/pos/:id/workflow", authenticateToken, (req: AuthRequest, res) => 
       po.signature = `${user.fullName} Digital Signature`;
 
       // Notify Purchasing Staff (creator)
-      db.saveNotification({
-        id: `n_${Date.now()}`,
+      createDocumentNotification({
         userId: po.created_by,
         role: "Purchasing Staff",
         title: "Purchase Order APPROVED",
         message: `Your PO ${po.poNumber} has been given final approval by Director ${user.fullName}.`,
-        date: new Date().toISOString().split("T")[0],
-        time: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
-        isRead: false,
-        poId: po.id
+        documentType: "PO",
+        documentId: po.id,
+        documentNumber: po.poNumber,
+        eventType: "APPROVED"
       });
       break;
 
@@ -1289,16 +1521,15 @@ app.post("/api/pos/:id/workflow", authenticateToken, (req: AuthRequest, res) => 
       });
 
       // Notify Purchasing Staff (creator)
-      db.saveNotification({
-        id: `n_${Date.now()}`,
+      createDocumentNotification({
         userId: po.created_by,
         role: "Purchasing Staff",
         title: "PO Returned/Rejected",
         message: `PO ${po.poNumber} was returned by ${user.fullName} for correction. Reason: ${remarks || "No remarks provided"}`,
-        date: new Date().toISOString().split("T")[0],
-        time: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
-        isRead: false,
-        poId: po.id
+        documentType: "PO",
+        documentId: po.id,
+        documentNumber: po.poNumber,
+        eventType: "RETURNED"
       });
       break;
 
@@ -1360,19 +1591,89 @@ app.post("/api/audit-logs", authenticateToken, (req: AuthRequest, res) => {
 });
 
 
-// 7. NOTIFICATIONS
+// 7. NOTIFICATIONS & PENDING APPROVALS
 app.get("/api/notifications", authenticateToken, (req: AuthRequest, res) => {
   const user = req.user!;
+  const portalQuery = req.query.portal ? String(req.query.portal).toUpperCase().trim() : undefined;
+  const allowedDocTypes = getAllowedPendingDocumentTypes(user.role);
   let notifs = db.getNotifications();
 
-  // Filter based on role or specific user ID
+  // Filter based on role or specific user ID and allowed document types
   notifs = notifs.filter((n) => {
-    if (n.userId && n.userId === user.id) return true;
-    if (!n.userId && n.role === user.role) return true;
-    return false;
+    const matchesUser =
+      (n.userId && n.userId === user.id) ||
+      (!n.userId && n.role === user.role) ||
+      user.role === "Administrator";
+
+    if (!matchesUser) return false;
+
+    // Strict Portal Isolation Query Filter
+    if (portalQuery) {
+      const nPortal = inferNotificationPortalServer(n);
+      if (nPortal !== portalQuery) return false;
+    }
+
+    // Strict role-based document authorization check
+    if (portalQuery !== "TSD" && n.documentType) {
+      const normType = normalizeDocumentType(n.documentType);
+      if (normType && !allowedDocTypes.includes(normType)) {
+        return false;
+      }
+    }
+
+    return true;
   });
 
   res.json(notifs);
+});
+
+app.post("/api/notifications", authenticateToken, (req: AuthRequest, res) => {
+  const notifData = req.body;
+  const now = new Date();
+  const portal = inferNotificationPortalServer(notifData);
+  const notif = {
+    id: notifData.id || `notif_${Date.now()}_${Math.random().toString(36).substring(2, 6)}`,
+    portal,
+    module: notifData.module || (portal === "TSD" ? "COA Workflow" : "Procurement"),
+    priority: notifData.priority || "MEDIUM",
+    workflowId: notifData.workflowId,
+    userId: notifData.userId || "",
+    role: notifData.role || "Administrator",
+    title: notifData.title || "System Alert",
+    message: notifData.message || "",
+    date: notifData.date || now.toISOString().split("T")[0],
+    time: notifData.time || now.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
+    isRead: false,
+    poId: notifData.poId,
+    documentType: notifData.documentType,
+    documentId: notifData.documentId,
+    documentNumber: notifData.documentNumber,
+    status: "ACTIVE",
+    eventType: notifData.eventType || "INFO",
+    createdAt: notifData.createdAt || now.toISOString()
+  };
+
+  db.saveNotification(notif);
+  res.json(notif);
+});
+
+app.get("/api/procurement-approvals/pending", authenticateToken, (req: AuthRequest, res) => {
+  const user = req.user!;
+  const allowedTypes = getAllowedPendingDocumentTypes(user.role);
+
+  const pendingPOs = allowedTypes.includes("PO") ? db.getPurchaseOrders().filter(isPOPending) : [];
+  const pendingPIS = allowedTypes.includes("PIS") ? db.getPaymentInstructionSlips().filter(isPISPending) : [];
+  const pendingRFS = allowedTypes.includes("RFS") ? db.getRequestsForSupply().filter(isRFSPending) : [];
+  const pendingCanvasses = allowedTypes.includes("CANVASS") ? db.getCanvassSheets().filter(isCanvassPending) : [];
+
+  res.json({
+    allowedTypes,
+    pendingPOs,
+    pendingPIS,
+    pendingRFS,
+    pendingCanvasses,
+    totalPending: pendingPOs.length + pendingPIS.length + pendingRFS.length + pendingCanvasses.length
+  });
 });
 
 app.put("/api/notifications/:id/read", authenticateToken, (req, res) => {
@@ -1398,6 +1699,23 @@ app.put("/api/notifications/read-all", authenticateToken, (req: AuthRequest, res
   });
 
   res.json({ success: true });
+});
+
+app.delete("/api/notifications/clear-read", authenticateToken, (req: AuthRequest, res) => {
+  const user = req.user!;
+  const notifs = db.getNotifications().filter(n => {
+    const matchesUser =
+      (n.userId && n.userId === user.id) ||
+      (!n.userId && n.role === user.role) ||
+      user.role === "Administrator";
+    return matchesUser && (n.isRead === true || n.status === "READ");
+  });
+
+  notifs.forEach(n => {
+    db.deleteNotification(n.id);
+  });
+
+  res.json({ success: true, count: notifs.length });
 });
 
 
@@ -1463,6 +1781,7 @@ function getNextCanvassNumber(): string {
 
 // 1. PAYMENT INSTRUCTION SLIP (PIS) ROUTES
 app.get("/api/pis", authenticateToken, (req: AuthRequest, res) => {
+  db.logDatabaseOperation("SMEI_MANAGEMENT_SYSTEM", "PIS", "READ");
   res.json(db.getPaymentInstructionSlips());
 });
 
@@ -1524,8 +1843,8 @@ app.post("/api/pis", authenticateToken, (req: AuthRequest, res) => {
 
 app.put("/api/pis/:id", authenticateToken, (req: AuthRequest, res) => {
   const user = req.user!;
-  if (user.role !== "Administrator" && user.role !== "Purchasing Staff") {
-    return res.status(403).json({ error: "Access Denied: Only Purchasing Staff or Admin can edit Payment Instruction Slips." });
+  if (user.role === "Viewer") {
+    return res.status(403).json({ error: "Access Denied: Viewers cannot edit or approve Payment Instruction Slips." });
   }
 
   const existing = db.getPaymentInstructionSlips().find(p => p.id === req.params.id);
@@ -1569,6 +1888,7 @@ app.delete("/api/pis/:id", authenticateToken, (req: AuthRequest, res) => {
   const existing = db.getPaymentInstructionSlips().find(p => p.id === req.params.id);
   if (!existing) return res.status(404).json({ error: "Payment Instruction Slip not found" });
 
+  resolveNotificationsForDocument("PIS", req.params.id);
   db.deletePaymentInstructionSlip(req.params.id);
   logAudit(user.id, user.username, user.role, "Delete Payment Instruction Slip", "PIS", req.params.id, existing.pisNumber, "-", req);
   res.json({ success: true });
@@ -1704,6 +2024,7 @@ app.delete("/api/rfs/:id", authenticateToken, (req: AuthRequest, res) => {
   const existing = db.getRequestsForSupply().find(r => r.id === req.params.id);
   if (!existing) return res.status(404).json({ error: "Request for Supply not found" });
 
+  resolveNotificationsForDocument("RFS", req.params.id);
   db.deleteRequestForSupply(req.params.id);
   logAudit(user.id, user.username, user.role, "Delete Request for Supply", "RFS", req.params.id, existing.rfsNumber, "-", req);
   res.json({ success: true });
@@ -1777,8 +2098,8 @@ app.post("/api/canvass", authenticateToken, (req: AuthRequest, res) => {
 
 app.put("/api/canvass/:id", authenticateToken, (req: AuthRequest, res) => {
   const user = req.user!;
-  if (user.role !== "Administrator" && user.role !== "Purchasing Staff") {
-    return res.status(403).json({ error: "Access Denied: Only Purchasing Staff or Admin can edit Canvass Sheets." });
+  if (user.role === "Viewer") {
+    return res.status(403).json({ error: "Access Denied: Viewers cannot edit or approve Canvass Sheets." });
   }
 
   const existing = db.getCanvassSheets().find(c => c.id === req.params.id);
@@ -1834,9 +2155,885 @@ app.delete("/api/canvass/:id", authenticateToken, (req: AuthRequest, res) => {
   const existing = db.getCanvassSheets().find(c => c.id === req.params.id);
   if (!existing) return res.status(404).json({ error: "Canvass Sheet not found" });
 
+  resolveNotificationsForDocument("CANVASS", req.params.id);
   db.deleteCanvassSheet(req.params.id);
   logAudit(user.id, user.username, user.role, "Delete Canvass Sheet", "Canvass", req.params.id, existing.canvassNumber, "-", req);
   res.json({ success: true });
+});
+
+
+// 4. CENTRALIZED PROCUREMENT APPROVAL ROUTES
+app.post("/api/procurement-approvals/:docType/:docId/approve", authenticateToken, (req: AuthRequest, res) => {
+  const user = req.user!;
+  if (user.role === "Viewer") {
+    return res.status(403).json({ error: "Access Denied: Viewers cannot approve documents." });
+  }
+
+  const { docType, docId } = req.params;
+  const upperDocType = docType.toUpperCase();
+  const timestamp = new Date().toISOString();
+
+  let docNumber = "";
+  let targetDoc: any = null;
+
+  if (upperDocType === "PO") {
+    targetDoc = db.getPurchaseOrders().find(p => p.id === docId);
+    if (!targetDoc) return res.status(404).json({ error: "Purchase Order not found" });
+    docNumber = targetDoc.poNumber;
+    targetDoc.status = "Approved";
+    targetDoc.approvalStatus = "Approved";
+    targetDoc.approvedBy = user.fullName;
+    targetDoc.approvedByName = user.fullName;
+    targetDoc.approvedByTitle = user.position || user.role;
+    targetDoc.approvedAt = timestamp;
+    targetDoc.dateApproved = timestamp.split("T")[0];
+    targetDoc.signature = `${user.fullName} Digital Signature`;
+    if (!targetDoc.approvalHistory) targetDoc.approvalHistory = [];
+    targetDoc.approvalHistory.push({
+      id: `hist_${Date.now()}_${Math.random().toString(36).substring(2, 6)}`,
+      documentType: "PO",
+      documentId: docId,
+      documentNumber: docNumber,
+      action: "Approved",
+      performedBy: user.id,
+      performedByName: user.fullName,
+      performedByRole: user.role,
+      performedByPosition: user.position || user.role,
+      timestamp,
+      details: "Approved via Procurement Approval Module"
+    });
+    db.savePurchaseOrder(targetDoc);
+
+  } else if (upperDocType === "PIS") {
+    targetDoc = db.getPaymentInstructionSlips().find(p => p.id === docId);
+    if (!targetDoc) return res.status(404).json({ error: "Payment Instruction Slip not found" });
+    docNumber = targetDoc.pisNumber;
+    targetDoc.status = "Approved";
+    targetDoc.approvalStatus = "Approved";
+    targetDoc.approvedBy = user.fullName;
+    targetDoc.approvedByName = user.fullName;
+    targetDoc.acceptedBy = user.fullName;
+    targetDoc.acceptedByPosition = user.position || user.role;
+    targetDoc.acceptedByDate = timestamp.split("T")[0];
+    targetDoc.approvedAt = timestamp;
+    if (!targetDoc.approvalHistory) targetDoc.approvalHistory = [];
+    targetDoc.approvalHistory.push({
+      id: `hist_${Date.now()}_${Math.random().toString(36).substring(2, 6)}`,
+      documentType: "PIS",
+      documentId: docId,
+      documentNumber: docNumber,
+      action: "Approved",
+      performedBy: user.id,
+      performedByName: user.fullName,
+      performedByRole: user.role,
+      performedByPosition: user.position || user.role,
+      timestamp,
+      details: "Approved via Procurement Approval Module"
+    });
+    db.savePaymentInstructionSlip(targetDoc);
+
+  } else if (upperDocType === "RFS") {
+    targetDoc = db.getRequestsForSupply().find(r => r.id === docId);
+    if (!targetDoc) return res.status(404).json({ error: "Request for Supply not found" });
+    docNumber = targetDoc.rfsNumber;
+    targetDoc.approvalStatus = "Approved";
+
+    if (req.body.dueDate) {
+      targetDoc.dueDate = req.body.dueDate;
+    } else if (!targetDoc.dueDate) {
+      targetDoc.dueDate = new Date().toISOString().split("T")[0];
+    }
+
+    if (req.body.status) {
+      targetDoc.status = req.body.status;
+    } else if (!targetDoc.status || targetDoc.status === "Incomplete") {
+      targetDoc.status = "Complete";
+    }
+
+    targetDoc.approvedBy = user.fullName;
+    targetDoc.approvedByName = user.fullName;
+    targetDoc.approvedAt = timestamp;
+    if (!targetDoc.approvalHistory) targetDoc.approvalHistory = [];
+    targetDoc.approvalHistory.push({
+      id: `hist_${Date.now()}_${Math.random().toString(36).substring(2, 6)}`,
+      documentType: "RFS",
+      documentId: docId,
+      documentNumber: docNumber,
+      action: "Approved",
+      performedBy: user.id,
+      performedByName: user.fullName,
+      performedByRole: user.role,
+      performedByPosition: user.position || user.role,
+      timestamp,
+      details: "Approved via Procurement Approval Module"
+    });
+    db.saveRequestForSupply(targetDoc);
+
+  } else if (upperDocType === "CANVASS") {
+    targetDoc = db.getCanvassSheets().find(c => c.id === docId);
+    if (!targetDoc) return res.status(404).json({ error: "Canvass Sheet not found" });
+    docNumber = targetDoc.canvassNumber;
+    targetDoc.status = "Approved";
+    targetDoc.approvalStatus = "Approved";
+    targetDoc.approvedBy = user.fullName;
+    targetDoc.approvedByName = user.fullName;
+    targetDoc.approvedByPosition = user.position || user.role;
+    targetDoc.approvedAt = timestamp;
+    if (!targetDoc.approvalHistory) targetDoc.approvalHistory = [];
+    targetDoc.approvalHistory.push({
+      id: `hist_${Date.now()}_${Math.random().toString(36).substring(2, 6)}`,
+      documentType: "CANVASS",
+      documentId: docId,
+      documentNumber: docNumber,
+      action: "Approved",
+      performedBy: user.id,
+      performedByName: user.fullName,
+      performedByRole: user.role,
+      performedByPosition: user.position || user.role,
+      timestamp,
+      details: "Approved via Procurement Approval Module"
+    });
+    db.saveCanvassSheet(targetDoc);
+
+  } else {
+    return res.status(400).json({ error: "Unsupported document type" });
+  }
+
+  logAudit(
+    user.id,
+    user.username,
+    user.role,
+    "PROCUREMENT_DOCUMENT_APPROVED",
+    upperDocType,
+    docId,
+    "Pending Approval",
+    "Approved",
+    req
+  );
+
+  const normType = normalizeDocumentType(upperDocType) || (upperDocType as ProcurementDocumentType);
+
+  if (targetDoc.created_by) {
+    createDocumentNotification({
+      userId: targetDoc.created_by,
+      role: "Purchasing Staff",
+      title: `${upperDocType} Approved`,
+      message: `${upperDocType} (${docNumber}) has been approved by ${user.fullName}.`,
+      documentType: normType,
+      documentId: docId,
+      documentNumber: docNumber,
+      eventType: "APPROVED"
+    });
+  } else {
+    resolveNotificationsForDocument(normType, docId);
+  }
+
+  res.json({ success: true, document: targetDoc });
+});
+
+app.post("/api/procurement-approvals/:docType/:docId/reject", authenticateToken, (req: AuthRequest, res) => {
+  const user = req.user!;
+  if (user.role === "Viewer") {
+    return res.status(403).json({ error: "Access Denied: Viewers cannot reject documents." });
+  }
+
+  const { docType, docId } = req.params;
+  const { reason } = req.body;
+  if (!reason || !reason.trim()) {
+    return res.status(400).json({ error: "Reason for rejection is required." });
+  }
+
+  const upperDocType = docType.toUpperCase();
+  const timestamp = new Date().toISOString();
+  let docNumber = "";
+  let targetDoc: any = null;
+
+  if (upperDocType === "PO") {
+    targetDoc = db.getPurchaseOrders().find(p => p.id === docId);
+    if (!targetDoc) return res.status(404).json({ error: "Purchase Order not found" });
+    docNumber = targetDoc.poNumber;
+    targetDoc.status = "Rejected";
+    targetDoc.approvalStatus = "Rejected";
+    targetDoc.rejectedBy = user.id;
+    targetDoc.rejectedByName = user.fullName;
+    targetDoc.rejectedAt = timestamp;
+    targetDoc.rejectionReason = reason.trim();
+    if (!targetDoc.approvalHistory) targetDoc.approvalHistory = [];
+    targetDoc.approvalHistory.push({
+      id: `hist_${Date.now()}_${Math.random().toString(36).substring(2, 6)}`,
+      documentType: "PO",
+      documentId: docId,
+      documentNumber: docNumber,
+      action: "Rejected",
+      performedBy: user.id,
+      performedByName: user.fullName,
+      performedByRole: user.role,
+      performedByPosition: user.position || user.role,
+      timestamp,
+      reason: reason.trim(),
+      details: `Rejected: ${reason.trim()}`
+    });
+    db.savePurchaseOrder(targetDoc);
+
+  } else if (upperDocType === "PIS") {
+    targetDoc = db.getPaymentInstructionSlips().find(p => p.id === docId);
+    if (!targetDoc) return res.status(404).json({ error: "Payment Instruction Slip not found" });
+    docNumber = targetDoc.pisNumber;
+    targetDoc.status = "Rejected";
+    targetDoc.approvalStatus = "Rejected";
+    targetDoc.rejectedBy = user.id;
+    targetDoc.rejectedByName = user.fullName;
+    targetDoc.rejectedAt = timestamp;
+    targetDoc.rejectionReason = reason.trim();
+    if (!targetDoc.approvalHistory) targetDoc.approvalHistory = [];
+    targetDoc.approvalHistory.push({
+      id: `hist_${Date.now()}_${Math.random().toString(36).substring(2, 6)}`,
+      documentType: "PIS",
+      documentId: docId,
+      documentNumber: docNumber,
+      action: "Rejected",
+      performedBy: user.id,
+      performedByName: user.fullName,
+      performedByRole: user.role,
+      performedByPosition: user.position || user.role,
+      timestamp,
+      reason: reason.trim(),
+      details: `Rejected: ${reason.trim()}`
+    });
+    db.savePaymentInstructionSlip(targetDoc);
+
+  } else if (upperDocType === "RFS") {
+    targetDoc = db.getRequestsForSupply().find(r => r.id === docId);
+    if (!targetDoc) return res.status(404).json({ error: "Request for Supply not found" });
+    docNumber = targetDoc.rfsNumber;
+    targetDoc.approvalStatus = "Rejected";
+    targetDoc.rejectedBy = user.id;
+    targetDoc.rejectedByName = user.fullName;
+    targetDoc.rejectedAt = timestamp;
+    targetDoc.rejectionReason = reason.trim();
+    if (!targetDoc.approvalHistory) targetDoc.approvalHistory = [];
+    targetDoc.approvalHistory.push({
+      id: `hist_${Date.now()}_${Math.random().toString(36).substring(2, 6)}`,
+      documentType: "RFS",
+      documentId: docId,
+      documentNumber: docNumber,
+      action: "Rejected",
+      performedBy: user.id,
+      performedByName: user.fullName,
+      performedByRole: user.role,
+      performedByPosition: user.position || user.role,
+      timestamp,
+      reason: reason.trim(),
+      details: `Rejected: ${reason.trim()}`
+    });
+    db.saveRequestForSupply(targetDoc);
+
+  } else if (upperDocType === "CANVASS") {
+    targetDoc = db.getCanvassSheets().find(c => c.id === docId);
+    if (!targetDoc) return res.status(404).json({ error: "Canvass Sheet not found" });
+    docNumber = targetDoc.canvassNumber;
+    targetDoc.status = "Rejected";
+    targetDoc.approvalStatus = "Rejected";
+    targetDoc.rejectedBy = user.id;
+    targetDoc.rejectedByName = user.fullName;
+    targetDoc.rejectedAt = timestamp;
+    targetDoc.rejectionReason = reason.trim();
+    if (!targetDoc.approvalHistory) targetDoc.approvalHistory = [];
+    targetDoc.approvalHistory.push({
+      id: `hist_${Date.now()}_${Math.random().toString(36).substring(2, 6)}`,
+      documentType: "CANVASS",
+      documentId: docId,
+      documentNumber: docNumber,
+      action: "Rejected",
+      performedBy: user.id,
+      performedByName: user.fullName,
+      performedByRole: user.role,
+      performedByPosition: user.position || user.role,
+      timestamp,
+      reason: reason.trim(),
+      details: `Rejected: ${reason.trim()}`
+    });
+    db.saveCanvassSheet(targetDoc);
+
+  } else {
+    return res.status(400).json({ error: "Unsupported document type" });
+  }
+
+  logAudit(
+    user.id,
+    user.username,
+    user.role,
+    "PROCUREMENT_DOCUMENT_REJECTED",
+    upperDocType,
+    docId,
+    "Pending Approval",
+    `Rejected: ${reason.trim()}`,
+    req
+  );
+
+  const normType = normalizeDocumentType(upperDocType) || (upperDocType as ProcurementDocumentType);
+
+  if (targetDoc.created_by) {
+    createDocumentNotification({
+      userId: targetDoc.created_by,
+      role: "Purchasing Staff",
+      title: `${upperDocType} Rejected`,
+      message: `${upperDocType} (${docNumber}) was rejected by ${user.fullName}. Reason: ${reason.trim()}`,
+      documentType: normType,
+      documentId: docId,
+      documentNumber: docNumber,
+      eventType: "REJECTED"
+    });
+  } else {
+    resolveNotificationsForDocument(normType, docId);
+  }
+
+  res.json({ success: true, document: targetDoc });
+});
+
+app.post("/api/procurement-approvals/:docType/:docId/log-view", authenticateToken, (req: AuthRequest, res) => {
+  const user = req.user!;
+  const { docType, docId } = req.params;
+  logAudit(
+    user.id,
+    user.username,
+    user.role,
+    "PROCUREMENT_APPROVAL_VIEWED",
+    docType.toUpperCase(),
+    docId,
+    "-",
+    "-",
+    req
+  );
+  res.json({ success: true });
+});
+
+app.post("/api/procurement-approvals/:docType/:docId/export", authenticateToken, (req: AuthRequest, res) => {
+  const user = req.user!;
+  if (user.role === "Viewer") {
+    return res.status(403).json({ error: "Access Denied: Viewers cannot record export." });
+  }
+
+  const { docType, docId } = req.params;
+  const upperDocType = docType.toUpperCase();
+  const timestamp = new Date().toISOString();
+
+  let targetDoc: any = null;
+  let docNumber = "";
+
+  if (upperDocType === "PO") {
+    targetDoc = db.getPurchaseOrders().find(p => p.id === docId);
+    if (!targetDoc) return res.status(404).json({ error: "Purchase Order not found" });
+    docNumber = targetDoc.poNumber;
+    if (targetDoc.approvalStatus !== "Approved" && targetDoc.status !== "Approved" && targetDoc.status !== "Closed" && user.role !== "Administrator") {
+      return res.status(400).json({ error: "Document must be Approved or Completed before export." });
+    }
+    targetDoc.exportStatus = "EXPORTED";
+    targetDoc.exportedAt = timestamp;
+    targetDoc.exportedBy = user.id;
+    targetDoc.exportedByName = user.fullName;
+    targetDoc.exportedByPosition = user.position || user.role;
+    if (!targetDoc.approvalHistory) targetDoc.approvalHistory = [];
+    targetDoc.approvalHistory.push({
+      id: `hist_${Date.now()}_${Math.random().toString(36).substring(2, 6)}`,
+      documentType: "PO",
+      documentId: docId,
+      documentNumber: docNumber,
+      action: "EXPORTED",
+      performedBy: user.id,
+      performedByName: user.fullName,
+      performedByRole: user.role,
+      performedByPosition: user.position || user.role,
+      timestamp,
+      details: "Exported via Procurement Approval Module"
+    });
+    db.savePurchaseOrder(targetDoc);
+
+  } else if (upperDocType === "PIS") {
+    targetDoc = db.getPaymentInstructionSlips().find(p => p.id === docId);
+    if (!targetDoc) return res.status(404).json({ error: "Payment Instruction Slip not found" });
+    docNumber = targetDoc.pisNumber;
+    if (targetDoc.approvalStatus !== "Approved" && targetDoc.status !== "Approved" && user.role !== "Administrator") {
+      return res.status(400).json({ error: "Document must be Approved before export." });
+    }
+    targetDoc.exportStatus = "EXPORTED";
+    targetDoc.exportedAt = timestamp;
+    targetDoc.exportedBy = user.id;
+    targetDoc.exportedByName = user.fullName;
+    targetDoc.exportedByPosition = user.position || user.role;
+    if (!targetDoc.approvalHistory) targetDoc.approvalHistory = [];
+    targetDoc.approvalHistory.push({
+      id: `hist_${Date.now()}_${Math.random().toString(36).substring(2, 6)}`,
+      documentType: "PIS",
+      documentId: docId,
+      documentNumber: docNumber,
+      action: "EXPORTED",
+      performedBy: user.id,
+      performedByName: user.fullName,
+      performedByRole: user.role,
+      performedByPosition: user.position || user.role,
+      timestamp,
+      details: "Exported via Procurement Approval Module"
+    });
+    db.savePaymentInstructionSlip(targetDoc);
+
+  } else if (upperDocType === "RFS") {
+    targetDoc = db.getRequestsForSupply().find(r => r.id === docId);
+    if (!targetDoc) return res.status(404).json({ error: "Request for Supply not found" });
+    docNumber = targetDoc.rfsNumber;
+    if (targetDoc.approvalStatus !== "Approved" && targetDoc.status !== "Complete" && user.role !== "Administrator") {
+      return res.status(400).json({ error: "RFS must be Approved and Complete before export." });
+    }
+    targetDoc.exportStatus = "EXPORTED";
+    targetDoc.exportedAt = timestamp;
+    targetDoc.exportedBy = user.id;
+    targetDoc.exportedByName = user.fullName;
+    targetDoc.exportedByPosition = user.position || user.role;
+    if (!targetDoc.approvalHistory) targetDoc.approvalHistory = [];
+    targetDoc.approvalHistory.push({
+      id: `hist_${Date.now()}_${Math.random().toString(36).substring(2, 6)}`,
+      documentType: "RFS",
+      documentId: docId,
+      documentNumber: docNumber,
+      action: "EXPORTED",
+      performedBy: user.id,
+      performedByName: user.fullName,
+      performedByRole: user.role,
+      performedByPosition: user.position || user.role,
+      timestamp,
+      details: "Exported via Procurement Approval Module"
+    });
+    db.saveRequestForSupply(targetDoc);
+
+  } else if (upperDocType === "CANVASS") {
+    targetDoc = db.getCanvassSheets().find(c => c.id === docId);
+    if (!targetDoc) return res.status(404).json({ error: "Canvass Sheet not found" });
+    docNumber = targetDoc.canvassNumber;
+    if (targetDoc.approvalStatus !== "Approved" && targetDoc.status !== "Approved" && user.role !== "Administrator") {
+      return res.status(400).json({ error: "Document must be Approved before export." });
+    }
+    targetDoc.exportStatus = "EXPORTED";
+    targetDoc.exportedAt = timestamp;
+    targetDoc.exportedBy = user.id;
+    targetDoc.exportedByName = user.fullName;
+    targetDoc.exportedByPosition = user.position || user.role;
+    if (!targetDoc.approvalHistory) targetDoc.approvalHistory = [];
+    targetDoc.approvalHistory.push({
+      id: `hist_${Date.now()}_${Math.random().toString(36).substring(2, 6)}`,
+      documentType: "CANVASS",
+      documentId: docId,
+      documentNumber: docNumber,
+      action: "EXPORTED",
+      performedBy: user.id,
+      performedByName: user.fullName,
+      performedByRole: user.role,
+      performedByPosition: user.position || user.role,
+      timestamp,
+      details: "Exported via Procurement Approval Module"
+    });
+    db.saveCanvassSheet(targetDoc);
+
+  } else {
+    return res.status(400).json({ error: "Unsupported document type" });
+  }
+
+  logAudit(user.id, user.username, user.role, "PROCUREMENT_DOCUMENT_EXPORTED", upperDocType, docId, "-", "EXPORTED", req);
+  res.json({ success: true, document: targetDoc });
+});
+
+app.post("/api/procurement-approvals/:docType/:docId/signature-note", authenticateToken, (req: AuthRequest, res) => {
+  const user = req.user!;
+  if (user.role === "Viewer") {
+    return res.status(403).json({ error: "Access Denied: Viewers cannot add notes or signatures." });
+  }
+
+  const { docType, docId } = req.params;
+  const { note, signatureType } = req.body;
+  if (!note || !note.trim()) {
+    return res.status(400).json({ error: "Note or signature content is required." });
+  }
+
+  const upperDocType = docType.toUpperCase();
+  const timestamp = new Date().toISOString();
+
+  let targetDoc: any = null;
+  let docNumber = "";
+
+  const sigEntry = {
+    id: `sig_${Date.now()}_${Math.random().toString(36).substring(2, 6)}`,
+    userId: user.id,
+    userName: user.fullName,
+    position: user.position || user.role,
+    note: note.trim(),
+    signedAt: timestamp,
+    signatureType: (signatureType || "NOTE") as "APPROVAL" | "NOTE" | "SIGNATURE"
+  };
+
+  const getUpdatedHistory = (doc: any, typeName: string, num: string) => {
+    if (!doc.approvalHistory) doc.approvalHistory = [];
+    doc.approvalHistory.push({
+      id: `hist_${Date.now()}_${Math.random().toString(36).substring(2, 6)}`,
+      documentType: typeName,
+      documentId: docId,
+      documentNumber: num,
+      action: signatureType === "SIGNATURE" ? "SIGNED" : "NOTE_ADDED",
+      performedBy: user.id,
+      performedByName: user.fullName,
+      performedByRole: user.role,
+      performedByPosition: user.position || user.role,
+      timestamp,
+      note: note.trim(),
+      details: `${signatureType === "SIGNATURE" ? "Signature attached" : "Note added"}: ${note.trim()}`
+    });
+    if (!doc.signatureHistory) doc.signatureHistory = [];
+    doc.signatureHistory.push(sigEntry);
+  };
+
+  if (upperDocType === "PO") {
+    targetDoc = db.getPurchaseOrders().find(p => p.id === docId);
+    if (!targetDoc) return res.status(404).json({ error: "Purchase Order not found" });
+    docNumber = targetDoc.poNumber;
+    getUpdatedHistory(targetDoc, "PO", docNumber);
+    db.savePurchaseOrder(targetDoc);
+
+  } else if (upperDocType === "PIS") {
+    targetDoc = db.getPaymentInstructionSlips().find(p => p.id === docId);
+    if (!targetDoc) return res.status(404).json({ error: "Payment Instruction Slip not found" });
+    docNumber = targetDoc.pisNumber;
+    getUpdatedHistory(targetDoc, "PIS", docNumber);
+    db.savePaymentInstructionSlip(targetDoc);
+
+  } else if (upperDocType === "RFS") {
+    targetDoc = db.getRequestsForSupply().find(r => r.id === docId);
+    if (!targetDoc) return res.status(404).json({ error: "Request for Supply not found" });
+    docNumber = targetDoc.rfsNumber;
+    getUpdatedHistory(targetDoc, "RFS", docNumber);
+    db.saveRequestForSupply(targetDoc);
+
+  } else if (upperDocType === "CANVASS") {
+    targetDoc = db.getCanvassSheets().find(c => c.id === docId);
+    if (!targetDoc) return res.status(404).json({ error: "Canvass Sheet not found" });
+    docNumber = targetDoc.canvassNumber;
+    getUpdatedHistory(targetDoc, "CANVASS", docNumber);
+    db.saveCanvassSheet(targetDoc);
+
+  } else {
+    return res.status(400).json({ error: "Unsupported document type" });
+  }
+
+  logAudit(user.id, user.username, user.role, "PROCUREMENT_DOCUMENT_NOTE_ADDED", upperDocType, docId, "-", note.trim(), req);
+  res.json({ success: true, document: targetDoc });
+});
+
+// ==========================================
+// SYSTEM RESOURCE & STORAGE MONITORING ROUTES
+// ==========================================
+
+// Helper: Calculate Document Type & Portal Statistics
+function computeMonitoringOverview() {
+  const settings = db.getMonitoringSettings();
+  const allFiles = db.getMonitoringFiles();
+  const activeFiles = allFiles.filter((f) => f.status === "ACTIVE" || !f.status);
+
+  let totalStorageBytes = 0;
+  let smeiStorageBytes = 0;
+  let smeiFilesCount = 0;
+  let tsdStorageBytes = 0;
+  let tsdFilesCount = 0;
+
+  const docTypeMap: Record<string, { displayName: string; portal: string; count: number; bytes: number }> = {
+    // SMEI
+    "PURCHASE_ORDER": { displayName: "Purchase Orders", portal: "SMEI_MANAGEMENT_SYSTEM", count: 0, bytes: 0 },
+    "PIS": { displayName: "Payment Instruction Slips", portal: "SMEI_MANAGEMENT_SYSTEM", count: 0, bytes: 0 },
+    "RFS": { displayName: "Requests for Supply", portal: "SMEI_MANAGEMENT_SYSTEM", count: 0, bytes: 0 },
+    "CANVASS_SHEET": { displayName: "Canvass Sheets", portal: "SMEI_MANAGEMENT_SYSTEM", count: 0, bytes: 0 },
+    "ATTACHMENT": { displayName: "System Attachments", portal: "SMEI_MANAGEMENT_SYSTEM", count: 0, bytes: 0 },
+    "OTHER_SYSTEM_FILE": { displayName: "Other System Files", portal: "SMEI_MANAGEMENT_SYSTEM", count: 0, bytes: 0 },
+    
+    // TSD
+    "TSD_CONTROL_NUMBER": { displayName: "Control No. Documents", portal: "TSD_PORTAL", count: 0, bytes: 0 },
+    "TSD_LOADING": { displayName: "Loading Terminal Documents", portal: "TSD_PORTAL", count: 0, bytes: 0 },
+    "TSD_UNLOADING": { displayName: "Unloading Terminal Documents", portal: "TSD_PORTAL", count: 0, bytes: 0 },
+    "TSD_HAZARDOUS_WASTE": { displayName: "Hazardous Waste Catalog Files", portal: "TSD_PORTAL", count: 0, bytes: 0 },
+    "TSD_WASTE_MOVEMENT_SOURCE_PDF": { displayName: "Waste Movement Source PDFs", portal: "TSD_PORTAL", count: 0, bytes: 0 },
+    "TSD_WASTE_MOVEMENT_GENERATED_FILE": { displayName: "Waste Movement Generated Files", portal: "TSD_PORTAL", count: 0, bytes: 0 },
+    "TSD_WASTE_MOVEMENT_MERGED_FILE": { displayName: "Waste Movement Merged Files", portal: "TSD_PORTAL", count: 0, bytes: 0 },
+    "TSD_TIMESTAMP_IMAGE": { displayName: "Timestamp Photos", portal: "TSD_PORTAL", count: 0, bytes: 0 },
+    "TSD_MANIFEST_SUMMARY": { displayName: "Manifest Summary Workbooks", portal: "TSD_PORTAL", count: 0, bytes: 0 }
+  };
+
+  activeFiles.forEach((file) => {
+    const bytes = Number(file.sizeBytes) || 0;
+    totalStorageBytes += bytes;
+
+    const portal = file.portal || "SMEI_MANAGEMENT_SYSTEM";
+    if (portal === "TSD_PORTAL") {
+      tsdStorageBytes += bytes;
+      tsdFilesCount++;
+    } else {
+      smeiStorageBytes += bytes;
+      smeiFilesCount++;
+    }
+
+    const docType = file.documentType || "OTHER_SYSTEM_FILE";
+    if (!docTypeMap[docType]) {
+      docTypeMap[docType] = {
+        displayName: docType.replace(/_/g, " "),
+        portal: portal,
+        count: 0,
+        bytes: 0
+      };
+    }
+    docTypeMap[docType].count++;
+    docTypeMap[docType].bytes += bytes;
+  });
+
+  const docTypeStats = Object.keys(docTypeMap).map((dt) => {
+    const item = docTypeMap[dt];
+    return {
+      documentType: dt,
+      displayName: item.displayName,
+      portal: item.portal as "SMEI_MANAGEMENT_SYSTEM" | "TSD_PORTAL",
+      fileCount: item.count,
+      sizeBytes: item.bytes,
+      percentageOfTotal: totalStorageBytes > 0 ? (item.bytes / totalStorageBytes) * 100 : 0
+    };
+  });
+
+  // DB Operation Logs for Today
+  const today = new Date().toISOString().split("T")[0];
+  const todayOperations = db.getMonitoringOperations(today);
+
+  let dbReadsToday = 0;
+  let dbWritesToday = 0; // Creates
+  let dbUpdatesToday = 0;
+  let dbDeletesToday = 0;
+
+  const moduleOpMap: Record<string, { module: string; portal: "SMEI_MANAGEMENT_SYSTEM" | "TSD_PORTAL"; reads: number; creates: number; updates: number; deletes: number }> = {};
+
+  todayOperations.forEach((op) => {
+    const count = op.count || 1;
+    if (op.operation === "READ") dbReadsToday += count;
+    if (op.operation === "CREATE") dbWritesToday += count;
+    if (op.operation === "UPDATE") dbUpdatesToday += count;
+    if (op.operation === "DELETE") dbDeletesToday += count;
+
+    const modKey = `${op.portal}:${op.module}`;
+    if (!moduleOpMap[modKey]) {
+      moduleOpMap[modKey] = {
+        module: op.module,
+        portal: op.portal,
+        reads: 0,
+        creates: 0,
+        updates: 0,
+        deletes: 0
+      };
+    }
+    if (op.operation === "READ") moduleOpMap[modKey].reads += count;
+    if (op.operation === "CREATE") moduleOpMap[modKey].creates += count;
+    if (op.operation === "UPDATE") moduleOpMap[modKey].updates += count;
+    if (op.operation === "DELETE") moduleOpMap[modKey].deletes += count;
+  });
+
+  const dbOperationStats = Object.values(moduleOpMap).map((m) => ({
+    ...m,
+    totalOperations: m.reads + m.creates + m.updates + m.deletes
+  }));
+
+  const storageLimitBytes = settings.storageLimitBytes || 5368709120; // 5GB default
+  const storagePercentageUsed = storageLimitBytes > 0 ? (totalStorageBytes / storageLimitBytes) * 100 : 0;
+
+  let healthStatus: "NORMAL" | "WARNING" | "CRITICAL" | "EXTREME" | "LIMIT_REACHED" = "NORMAL";
+  if (storagePercentageUsed >= 100) {
+    healthStatus = "LIMIT_REACHED";
+  } else if (storagePercentageUsed >= (settings.extremeThresholdPct || 95)) {
+    healthStatus = "EXTREME";
+  } else if (storagePercentageUsed >= (settings.criticalThresholdPct || 85)) {
+    healthStatus = "CRITICAL";
+  } else if (storagePercentageUsed >= (settings.warningThresholdPct || 70)) {
+    healthStatus = "WARNING";
+  }
+
+  // Create or update today's snapshot
+  db.createMonitoringSnapshot({
+    date: today,
+    totalStorageBytes,
+    totalFilesCount: activeFiles.length,
+    smeiStorageBytes,
+    smeiFilesCount,
+    tsdStorageBytes,
+    tsdFilesCount,
+    dbReads: dbReadsToday,
+    dbCreates: dbWritesToday,
+    dbUpdates: dbUpdatesToday,
+    dbDeletes: dbDeletesToday
+  });
+
+  return {
+    totalStorageBytes,
+    storageLimitBytes,
+    storagePercentageUsed,
+    totalFilesCount: allFiles.length,
+    activeFilesCount: activeFiles.length,
+    dbReadsToday,
+    dbWritesToday,
+    dbUpdatesToday,
+    dbDeletesToday,
+    healthStatus,
+    portalStats: {
+      smei: {
+        storageBytes: smeiStorageBytes,
+        filesCount: smeiFilesCount,
+        percentage: totalStorageBytes > 0 ? (smeiStorageBytes / totalStorageBytes) * 100 : 0
+      },
+      tsd: {
+        storageBytes: tsdStorageBytes,
+        filesCount: tsdFilesCount,
+        percentage: totalStorageBytes > 0 ? (tsdStorageBytes / totalStorageBytes) * 100 : 0
+      }
+    },
+    docTypeStats,
+    dbOperationStats,
+    thresholds: settings
+  };
+}
+
+app.get("/api/monitoring/overview", authenticateToken, (req, res) => {
+  db.logDatabaseOperation("SMEI_MANAGEMENT_SYSTEM", "SystemMonitoring", "READ");
+  const overview = computeMonitoringOverview();
+  res.json(overview);
+});
+
+app.get("/api/monitoring/files", authenticateToken, (req, res) => {
+  db.logDatabaseOperation("SMEI_MANAGEMENT_SYSTEM", "SystemMonitoring", "READ");
+  let files = db.getMonitoringFiles();
+
+  const { portal, documentType, status, search, sortBy, sortOrder } = req.query;
+
+  if (portal && typeof portal === "string") {
+    files = files.filter((f) => f.portal === portal);
+  }
+
+  if (documentType && typeof documentType === "string") {
+    files = files.filter((f) => f.documentType === documentType);
+  }
+
+  if (status && typeof status === "string") {
+    files = files.filter((f) => (f.status || "ACTIVE") === status);
+  }
+
+  if (search && typeof search === "string") {
+    const q = search.toLowerCase();
+    files = files.filter((f) =>
+      (f.fileName && f.fileName.toLowerCase().includes(q)) ||
+      (f.documentType && f.documentType.toLowerCase().includes(q)) ||
+      (f.relatedRecordId && f.relatedRecordId.toLowerCase().includes(q))
+    );
+  }
+
+  if (sortBy && typeof sortBy === "string") {
+    files.sort((a, b) => {
+      let valA = a[sortBy] ?? "";
+      let valB = b[sortBy] ?? "";
+
+      if (sortBy === "sizeBytes") {
+        valA = Number(valA) || 0;
+        valB = Number(valB) || 0;
+      }
+
+      if (valA < valB) return sortOrder === "asc" ? -1 : 1;
+      if (valA > valB) return sortOrder === "asc" ? 1 : -1;
+      return 0;
+    });
+  } else {
+    // Default newest first
+    files.sort((a, b) => new Date(b.createdAt || 0).getTime() - new Date(a.createdAt || 0).getTime());
+  }
+
+  res.json(files);
+});
+
+app.post("/api/monitoring/files/sync", authenticateToken, (req: AuthRequest, res) => {
+  db.logDatabaseOperation("SMEI_MANAGEMENT_SYSTEM", "SystemMonitoring", "CREATE");
+  const { files } = req.body;
+  if (Array.isArray(files)) {
+    db.bulkSyncMonitoringFiles(files);
+  }
+  res.json({ success: true, count: files ? files.length : 0 });
+});
+
+app.post("/api/monitoring/files", authenticateToken, (req: AuthRequest, res) => {
+  db.logDatabaseOperation("SMEI_MANAGEMENT_SYSTEM", "SystemMonitoring", "CREATE");
+  const fileRecord = req.body;
+  if (!fileRecord || !fileRecord.id) {
+    return res.status(400).json({ error: "File record ID is required" });
+  }
+  db.saveMonitoringFile(fileRecord);
+  res.json({ success: true, file: fileRecord });
+});
+
+app.delete("/api/monitoring/files/:id", authenticateToken, (req: AuthRequest, res) => {
+  db.logDatabaseOperation("SMEI_MANAGEMENT_SYSTEM", "SystemMonitoring", "DELETE");
+  const { id } = req.params;
+  db.deleteMonitoringFile(id);
+  res.json({ success: true, message: "File status marked as DELETED" });
+});
+
+app.get("/api/monitoring/history", authenticateToken, (req, res) => {
+  db.logDatabaseOperation("SMEI_MANAGEMENT_SYSTEM", "SystemMonitoring", "READ");
+  const snapshots = db.getMonitoringSnapshots();
+  const operationsLog = db.getMonitoringOperations();
+  res.json({ snapshots, operationsLog });
+});
+
+app.get("/api/monitoring/forecast", authenticateToken, (req, res) => {
+  db.logDatabaseOperation("SMEI_MANAGEMENT_SYSTEM", "SystemMonitoring", "READ");
+  const snapshots = db.getMonitoringSnapshots();
+  
+  if (!snapshots || snapshots.length < 2) {
+    return res.json({
+      hasSufficientData: false,
+      message: "Insufficient historical snapshot data for trend calculation (requires at least 2 days of records)."
+    });
+  }
+
+  // Sort by date ascending
+  const sorted = [...snapshots].sort((a, b) => new Date(a.date).getTime() - new Date(a.date).getTime());
+  const first = sorted[0];
+  const last = sorted[sorted.length - 1];
+
+  const daysDiff = Math.max(1, Math.round((new Date(last.date).getTime() - new Date(first.date).getTime()) / (1000 * 60 * 60 * 24)));
+  const bytesGrowth = (last.totalStorageBytes || 0) - (first.totalStorageBytes || 0);
+  const avgDailyGrowthBytes = Math.max(0, bytesGrowth / daysDiff);
+
+  const currentStorage = last.totalStorageBytes || 0;
+  const settings = db.getMonitoringSettings();
+  const limit = settings.storageLimitBytes || 5368709120;
+  const remainingBytes = Math.max(0, limit - currentStorage);
+
+  const estimatedDaysToLimit = avgDailyGrowthBytes > 0 ? Math.round(remainingBytes / avgDailyGrowthBytes) : null;
+
+  res.json({
+    hasSufficientData: true,
+    observedDays: daysDiff,
+    currentStorageBytes: currentStorage,
+    avgDailyGrowthBytes,
+    estimatedGrowth30DaysBytes: currentStorage + (avgDailyGrowthBytes * 30),
+    estimatedGrowth90DaysBytes: currentStorage + (avgDailyGrowthBytes * 90),
+    estimatedDaysToLimit,
+    disclaimer: "Estimated values are calculated based on historical local usage trends and do not guarantee future exact storage consumption."
+  });
+});
+
+app.get("/api/monitoring/settings", authenticateToken, (req, res) => {
+  db.logDatabaseOperation("SMEI_MANAGEMENT_SYSTEM", "SystemMonitoring", "READ");
+  res.json(db.getMonitoringSettings());
+});
+
+app.put("/api/monitoring/settings", authenticateToken, (req: AuthRequest, res) => {
+  db.logDatabaseOperation("SMEI_MANAGEMENT_SYSTEM", "SystemMonitoring", "UPDATE");
+  db.saveMonitoringSettings(req.body);
+  res.json({ success: true, settings: db.getMonitoringSettings() });
 });
 
 

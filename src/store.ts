@@ -31,32 +31,29 @@ export function calculatePOFinancials(
     vatExemptAmount = totalAmount;
   }
 
-  // Calculate EWT
-  // Parts EWT (1%): Applied on parts item totals
-  // Labor EWT (2%): Applied on labor item totals
+  // Calculate EWT based on item UNIT value:
+  // UNIT = "pcs" (or any non-lot unit) -> PARTS -> partsRate (default 1%)
+  // UNIT = "lot" (or "lots") -> LABOR -> laborRate (default 2%)
   let partsTotal = 0;
   let laborTotal = 0;
 
   items.forEach(item => {
-    const desc = item.description.toLowerCase();
-    const isLabor = desc.includes("labor") || desc.includes("service") || desc.includes("repair") || desc.includes("install") || desc.includes("work");
-    if (isLabor) {
-      laborTotal += (item.quantity * item.unitPrice);
+    const unitRaw = (item.unit || "").toString().trim().toLowerCase();
+    const itemAmount = (Number(item.quantity) || 0) * (Number(item.unitPrice) || 0);
+
+    if (unitRaw === "lot" || unitRaw === "lots" || unitRaw.includes("lot")) {
+      laborTotal += itemAmount;
     } else {
-      partsTotal += (item.quantity * item.unitPrice);
+      partsTotal += itemAmount;
     }
   });
 
-  // For EWT, if vatable, compute on VAT-exclusive basis; otherwise compute on full amount
-  const partsBase = catLower.includes("vatable") ? (partsTotal / 1.12) : partsTotal;
-  const laborBase = catLower.includes("vatable") ? (laborTotal / 1.12) : laborTotal;
-
-  const partsEwt1 = Math.round((partsBase * partsRate) * 100) / 100;
-  const laborEwt2 = Math.round((laborBase * laborRate) * 100) / 100;
+  const partsEwt1 = Math.round((partsTotal * partsRate) * 100) / 100;
+  const laborEwt2 = Math.round((laborTotal * laborRate) * 100) / 100;
   const ewtAdjustments = partsEwt1 + laborEwt2;
 
-  // Gross Amount = Total Amount + EWT Adjustments
-  const grossAmount = Math.round((totalAmount + ewtAdjustments) * 100) / 100;
+  // Gross Amount = Items Subtotal (Total purchase price before EWT and discounts)
+  const grossAmount = Math.round(totalAmount * 100) / 100;
 
   // TOTAL = Final Computed Amount
   const total = Math.round((totalAmount - partsEwt1 - laborEwt2 - discountVatAmount) * 100) / 100;

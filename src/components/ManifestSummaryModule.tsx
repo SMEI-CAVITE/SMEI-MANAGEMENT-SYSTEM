@@ -14,10 +14,14 @@ import {
   ChevronLeft,
   ChevronRight,
   ShieldCheck,
-  FileCheck
+  FileCheck,
+  Loader2,
+  UserCheck,
+  FileText
 } from "lucide-react";
 import { 
   getWeeklyManifestGroups, 
+  getWeeklySheetName,
   saveManifestRecord, 
   deleteManifestRecord, 
   ManifestRecord, 
@@ -35,6 +39,16 @@ export default function ManifestSummaryModule() {
 
   // Edit / Review Modal state
   const [editingRecord, setEditingRecord] = useState<ManifestRecord | null>(null);
+
+  // Export Weekly Manifest Dialog State
+  const [isExportDialogOpen, setIsExportDialogOpen] = useState<boolean>(false);
+  const [exportGroup, setExportGroup] = useState<WeeklyManifestGroup | null>(null);
+  const [haulingDate, setHaulingDate] = useState<string>("");
+  const [haulingDateError, setHaulingDateError] = useState<string>("");
+  const [signatoryName, setSignatoryName] = useState<string>("Aprilyn J. Rogador");
+  const [signatoryPosition, setSignatoryPosition] = useState<string>("Technical Supervisor");
+  const [signatoryError, setSignatoryError] = useState<string>("");
+  const [exportError, setExportError] = useState<string>("");
   const [isExporting, setIsExporting] = useState<boolean>(false);
 
   useEffect(() => {
@@ -44,9 +58,18 @@ export default function ManifestSummaryModule() {
   const refreshGroups = () => {
     const groups = getWeeklyManifestGroups();
     setWeeklyGroups(groups);
+    console.log(`[FORENSIC STAGE 10] ManifestSummary refreshGroups: Loaded ${groups.length} weekly groups.`);
   };
 
   const currentGroup = weeklyGroups[selectedGroupIndex] || null;
+
+  useEffect(() => {
+    if (currentGroup) {
+      console.log(`[FORENSIC STAGE 10 UI Audit] Selected Week Index=${selectedGroupIndex}, Week ID=${currentGroup.weekId}, Records in group=${currentGroup.records.length}`);
+    } else {
+      console.log(`[FORENSIC STAGE 10 UI Audit] Selected Week Index=${selectedGroupIndex}, No current group active.`);
+    }
+  }, [selectedGroupIndex, currentGroup]);
 
   // Handle Record Edit Submit
   const handleSaveEdit = (e: React.FormEvent) => {
@@ -86,13 +109,47 @@ export default function ManifestSummaryModule() {
     }
   };
 
-  // Export current week to XLSM
-  const handleExportXlsm = async (group: WeeklyManifestGroup) => {
-    try {
-      setIsExporting(true);
+  // Open Export Dialog
+  const handleOpenExportDialog = (group: WeeklyManifestGroup) => {
+    setExportGroup(group);
+    // Initialize Hauling Date with current system date YYYY-MM-DD
+    const todayStr = new Date().toISOString().split("T")[0];
+    setHaulingDate(todayStr);
+    setHaulingDateError("");
+    setSignatoryError("");
+    setExportError("");
+    setIsExportDialogOpen(true);
+  };
 
+  // Execute XLSM export for selected week
+  const handleConfirmExport = async () => {
+    if (!exportGroup) return;
+
+    const trimmedHaulingDate = haulingDate.trim();
+    const trimmedName = signatoryName.trim();
+    const trimmedPosition = signatoryPosition.trim();
+
+    if (!trimmedHaulingDate) {
+      setHaulingDateError("Please select a hauling date before exporting the weekly manifest.");
+      return;
+    }
+    if (!trimmedName) {
+      setSignatoryError("Please enter the signatory name.");
+      return;
+    }
+    if (!trimmedPosition) {
+      setSignatoryError("Please enter the signatory position.");
+      return;
+    }
+
+    setHaulingDateError("");
+    setSignatoryError("");
+    setExportError("");
+    setIsExporting(true);
+
+    try {
       // Calculate sum of all extracted quantities in kg (MT * 1000)
-      const totalQtyKg = (group.records || []).reduce((sum, rec) => {
+      const totalQtyKg = (exportGroup.records || []).reduce((sum, rec) => {
         if (
           rec &&
           rec.quantity !== undefined &&
@@ -109,53 +166,72 @@ export default function ManifestSummaryModule() {
         ? totalQtyKg.toLocaleString("en-US")
         : totalQtyKg.toLocaleString("en-US", { maximumFractionDigits: 3 });
 
+      const formattedHaulingDate = formatDateDdMmmYy(trimmedHaulingDate) || trimmedHaulingDate;
+
+      // Gather all active weekly groups containing records
+      const allActiveGroups = getWeeklyManifestGroups().filter(
+        (g) => g.records && g.records.length > 0
+      );
+
+      // Sort groups chronologically ascending by weekStart
+      const sortedActiveGroups = [...allActiveGroups].sort((a, b) =>
+        a.weekStart.localeCompare(b.weekStart)
+      );
+
+      // Build export objects for each weekly group
+      const weeklyGroupsExport = sortedActiveGroups.map((g) => {
+        const sheetName = getWeeklySheetName(g, sortedActiveGroups);
+        const sumKg = (g.records || []).reduce((sum: number, rec: any) => {
+          if (rec && rec.quantity !== undefined && rec.quantity !== null && !isNaN(Number(rec.quantity))) {
+            return sum + Number(rec.quantity) * 1000;
+          }
+          return sum;
+        }, 0);
+        const formattedGroupQty = Number.isInteger(sumKg)
+          ? sumKg.toLocaleString("en-US")
+          : sumKg.toLocaleString("en-US", { maximumFractionDigits: 3 });
+
+        return {
+          sheetName,
+          weekId: g.weekId,
+          weekStart: g.weekStart,
+          weekEnd: g.weekEnd,
+          formattedWeekRange: g.formattedWeekRange,
+          haulingDate: formattedHaulingDate,
+          signatoryName: trimmedName,
+          signatoryPosition: trimmedPosition,
+          totalQty: formattedGroupQty,
+          records: g.records || [],
+        };
+      });
+
       const exportData: Record<string, any> = {
-        DATE_COMPLETED: group.formattedWeekRange,
-        SIGNED_BY: "ENVIRONMENTAL COMPLIANCE OFFICER",
-        POSITION: "POLLUTION CONTROL OFFICER",
-        TOTAL_QTY: formattedTotalQty,
-        TOTAL_QUANTITY: formattedTotalQty,
-        SUM_QTY: formattedTotalQty,
+        DATE_COMPLETED: formattedHaulingDate,
+        HAULING_DATE: formattedHaulingDate,
+        SIGNED_BY: trimmedName,
+        POSITION: trimmedPosition,
+        SIGNATORY_NAME: trimmedName,
+        SIGNATORY_POSITION: trimmedPosition,
+        _weeklyGroups: weeklyGroupsExport,
       };
 
-      for (let i = 1; i <= 6; i++) {
-        const record = group.records[i - 1];
-        exportData[`COMPANY_NAME${i}`] = record?.companyName ?? "";
-        exportData[`DELIVERY_DATE${i}`] = formatDateDdMmmYy(record?.deliveryDate);
-        exportData[`TP_NUMBER${i}`] = record?.tpNumber ?? "";
+      console.log(`[MANIFEST EXPORT] Triggered Manifest Summary workbook export: ${weeklyGroupsExport.length} sheet(s) included.`);
 
-        // Convert Quantity from Metric Tonnes (MT) to Kilograms (kg): MT * 1000
-        if (
-          record &&
-          record.quantity !== undefined &&
-          record.quantity !== null &&
-          record.quantity !== ("" as any) &&
-          !isNaN(Number(record.quantity))
-        ) {
-          const qtyKg = Number(record.quantity) * 1000;
-          exportData[`QUANTITY${i}`] = Number.isInteger(qtyKg)
-            ? qtyKg.toLocaleString("en-US")
-            : qtyKg.toLocaleString("en-US", { maximumFractionDigits: 3 });
-        } else {
-          exportData[`QUANTITY${i}`] = "";
-        }
-
-        exportData[`CONTROL_NO${i}`] = record?.controlNo ?? "";
-        exportData[`MANIFEST_NO${i}`] = record?.manifestNo ?? "";
-      }
-
-      const outputFilename = `WEEKLY_MANIFEST_${group.weekStart}_TO_${group.weekEnd}.xlsm`;
+      const currentYear = new Date().getFullYear();
+      const outputFilename = `Weekly Manifest Summary ${currentYear}.xlsm`;
 
       await exportExcelWithTemplate(
         "WEEKLY_MANIFEST_TEMPLATE.xlsm",
         exportData,
         "items",
-        group.records,
+        [],
         outputFilename
       );
+
+      setIsExportDialogOpen(false);
     } catch (err) {
       console.error("XLSM Export Error:", err);
-      alert("An error occurred during XLSM template export.");
+      setExportError("Unable to export the weekly manifest. Please try again.");
     } finally {
       setIsExporting(false);
     }
@@ -195,12 +271,12 @@ export default function ManifestSummaryModule() {
 
         {currentGroup && (
           <button
-            onClick={() => handleExportXlsm(currentGroup)}
+            onClick={() => handleOpenExportDialog(currentGroup)}
             disabled={isExporting}
             className="bg-smei-crimson hover:bg-smei-darkred text-white text-xs font-semibold py-2.5 px-4 rounded-lg shadow-xs transition-all flex items-center gap-2 self-start md:self-auto cursor-pointer active:scale-95 disabled:opacity-50"
           >
             <FileSpreadsheet className="w-4 h-4" />
-            <span>{isExporting ? "EXPORTING XLSM..." : "EXPORT WEEKLY XLSM"}</span>
+            <span>Export Weekly Manifest</span>
           </button>
         )}
       </div>
@@ -301,7 +377,12 @@ export default function ManifestSummaryModule() {
                     }[rec.confidence || "high"];
 
                     return (
-                      <tr key={rec.id} className="hover:bg-slate-50 dark:hover:bg-slate-950/50 transition-colors">
+                      <tr 
+                        key={rec.id} 
+                        onDoubleClick={() => setEditingRecord(rec)}
+                        className="hover:bg-slate-50 dark:hover:bg-slate-950/50 transition-colors cursor-pointer select-none"
+                        title="Double-click row to Edit / Review record"
+                      >
                         <td className="py-3 px-3 font-bold text-slate-400">{idx + 1}</td>
                         <td className="py-3 px-3 font-sans font-bold text-slate-800 dark:text-slate-200">
                           {rec.companyName}
@@ -450,6 +531,220 @@ export default function ManifestSummaryModule() {
                 </button>
               </div>
             </form>
+          </div>
+        </div>
+      )}
+
+      {/* ---------------- EXPORT WEEKLY MANIFEST DIALOG ---------------- */}
+      {isExportDialogOpen && exportGroup && (
+        <div id="export-weekly-manifest-dialog" className="fixed inset-0 z-50 bg-slate-900/60 backdrop-blur-xs flex items-center justify-center p-4 animate-fade-in">
+          <div className="bg-white dark:bg-slate-900 rounded-xl border border-gray-200 dark:border-slate-800 shadow-2xl max-w-4xl w-full flex flex-col max-h-[90vh] overflow-hidden">
+            {/* Modal Header */}
+            <div className="bg-slate-50 dark:bg-slate-950 p-4 md:p-5 border-b border-gray-200 dark:border-slate-800 flex items-start justify-between shrink-0">
+              <div>
+                <div className="flex items-center gap-2">
+                  <FileSpreadsheet className="w-5 h-5 text-smei-crimson" />
+                  <h3 className="text-sm md:text-base font-bold text-slate-800 dark:text-slate-100 font-display uppercase tracking-wider">
+                    Export Weekly Manifest
+                  </h3>
+                </div>
+                <p className="text-xs text-slate-500 dark:text-slate-400 mt-1">
+                  Review the manifests and signing information before exporting the weekly manifest.
+                </p>
+              </div>
+              <button
+                onClick={() => setIsExportDialogOpen(false)}
+                disabled={isExporting}
+                className="text-slate-400 hover:text-slate-600 dark:hover:text-slate-200 p-1 rounded-lg transition-colors cursor-pointer disabled:opacity-50"
+              >
+                <X className="w-5 h-5" />
+              </button>
+            </div>
+
+            {/* Modal Scrollable Body */}
+            <div className="p-4 md:p-6 overflow-y-auto space-y-5 flex-1">
+              {/* HAULING DATE */}
+              <div className="bg-slate-50 dark:bg-slate-950 p-3.5 rounded-lg border border-gray-200 dark:border-slate-800">
+                <div className="flex items-center justify-between mb-1.5">
+                  <label className="block text-[10px] font-mono font-bold text-gray-500 dark:text-slate-400 uppercase tracking-wider">
+                    HAULING DATE *
+                  </label>
+                  {haulingDate && (
+                    <span className="text-xs font-mono font-bold text-smei-crimson bg-red-50 dark:bg-red-950/30 px-2 py-0.5 rounded border border-red-100 dark:border-red-900/30">
+                      Format: {formatDateDdMmmYy(haulingDate)}
+                    </span>
+                  )}
+                </div>
+                <input
+                  type="date"
+                  value={haulingDate}
+                  disabled={isExporting}
+                  onChange={(e) => {
+                    setHaulingDate(e.target.value);
+                    if (haulingDateError) setHaulingDateError("");
+                  }}
+                  className="w-full md:w-64 bg-white dark:bg-slate-900 text-slate-800 dark:text-slate-200 border border-gray-200 dark:border-slate-800 rounded-lg p-2 text-xs font-mono font-bold focus:outline-none focus:ring-1 focus:ring-smei-crimson"
+                />
+                {haulingDateError && (
+                  <p className="text-xs text-rose-600 dark:text-rose-400 font-medium flex items-center gap-1.5 pt-1.5">
+                    <AlertTriangle className="w-3.5 h-3.5 shrink-0" />
+                    <span>{haulingDateError}</span>
+                  </p>
+                )}
+              </div>
+
+              {/* WEEKLY PERIOD */}
+              <div className="bg-slate-50 dark:bg-slate-950 p-3.5 rounded-lg border border-gray-200 dark:border-slate-800 flex items-center justify-between">
+                <div>
+                  <span className="text-[10px] font-mono font-bold text-gray-400 dark:text-slate-500 uppercase tracking-wider block">
+                    WEEKLY PERIOD
+                  </span>
+                  <span className="text-xs font-bold font-mono text-slate-800 dark:text-slate-200 mt-0.5 block">
+                    {exportGroup.formattedWeekRange}
+                  </span>
+                </div>
+                <div className="bg-white dark:bg-slate-900 px-3 py-1 rounded-md border border-gray-200 dark:border-slate-800 text-xs font-mono font-bold text-smei-crimson">
+                  {exportGroup.records.length} {exportGroup.records.length === 1 ? "Manifest" : "Manifests"}
+                </div>
+              </div>
+
+              {/* MANIFESTS INCLUDED */}
+              <div className="space-y-2">
+                <div className="flex items-center justify-between">
+                  <span className="text-[10px] font-mono font-bold text-gray-500 dark:text-slate-400 uppercase tracking-wider">
+                    MANIFESTS INCLUDED ({exportGroup.records.length})
+                  </span>
+                  <span className="text-[10px] text-slate-400 font-mono">
+                    All records in selected weekly period will be exported
+                  </span>
+                </div>
+
+                <div className="border border-gray-200 dark:border-slate-800 rounded-lg overflow-hidden shadow-2xs max-h-64 overflow-y-auto">
+                  <table className="w-full text-left border-collapse text-xs font-mono">
+                    <thead className="sticky top-0 bg-slate-100 dark:bg-slate-950 border-b border-gray-200 dark:border-slate-800 text-[10px] font-bold text-slate-600 dark:text-slate-400 uppercase tracking-wider z-10">
+                      <tr>
+                        <th className="py-2 px-3 font-display w-10">#</th>
+                        <th className="py-2 px-3 font-display">Company Name</th>
+                        <th className="py-2 px-3 font-display">Delivery Date</th>
+                        <th className="py-2 px-3 font-display">TP Number</th>
+                        <th className="py-2 px-3 font-display text-right">Quantity</th>
+                        <th className="py-2 px-3 font-display">CA No.</th>
+                        <th className="py-2 px-3 font-display">Manifest No.</th>
+                      </tr>
+                    </thead>
+                    <tbody className="divide-y divide-slate-100 dark:divide-slate-800 bg-white dark:bg-slate-900">
+                      {exportGroup.records.map((rec, idx) => {
+                        const formattedQty = rec.quantity !== undefined && rec.quantity !== null && !isNaN(Number(rec.quantity))
+                          ? `${((Number(rec.quantity) || 0) * 1000).toLocaleString("en-US")} kg`
+                          : "-";
+
+                        return (
+                          <tr key={rec.id || idx} className="hover:bg-slate-50 dark:hover:bg-slate-950/50">
+                            <td className="py-2 px-3 font-bold text-slate-400">{idx + 1}</td>
+                            <td className="py-2 px-3 font-sans font-bold text-slate-800 dark:text-slate-200">{rec.companyName || "-"}</td>
+                            <td className="py-2 px-3 text-slate-600 dark:text-slate-300 whitespace-nowrap">{formatDateDdMmmYy(rec.deliveryDate) || rec.deliveryDate || "-"}</td>
+                            <td className="py-2 px-3 text-slate-600 dark:text-slate-300">{rec.tpNumber || "-"}</td>
+                            <td className="py-2 px-3 text-smei-crimson font-bold text-right whitespace-nowrap">{formattedQty}</td>
+                            <td className="py-2 px-3 text-slate-800 dark:text-slate-200 font-bold whitespace-nowrap">{rec.controlNo || "-"}</td>
+                            <td className="py-2 px-3 text-slate-800 dark:text-slate-200 font-bold whitespace-nowrap">{rec.manifestNo || "-"}</td>
+                          </tr>
+                        );
+                      })}
+                    </tbody>
+                  </table>
+                </div>
+              </div>
+
+              {/* SIGNATORY INFORMATION */}
+              <div className="bg-slate-50 dark:bg-slate-950 p-4 rounded-lg border border-gray-200 dark:border-slate-800 space-y-3">
+                <div className="flex items-center gap-2 border-b border-gray-200 dark:border-slate-800 pb-2">
+                  <UserCheck className="w-4 h-4 text-smei-crimson" />
+                  <h4 className="text-xs font-bold text-slate-800 dark:text-slate-200 font-mono uppercase tracking-wider">
+                    SIGNATORY INFORMATION
+                  </h4>
+                </div>
+
+                <div className="grid grid-cols-1 md:grid-cols-2 gap-3 text-xs">
+                  <div>
+                    <label className="block text-[10px] font-mono font-bold text-gray-500 dark:text-slate-400 uppercase mb-1">
+                      Name *
+                    </label>
+                    <input
+                      type="text"
+                      value={signatoryName}
+                      disabled={isExporting}
+                      onChange={(e) => {
+                        setSignatoryName(e.target.value);
+                        if (signatoryError) setSignatoryError("");
+                      }}
+                      placeholder="Aprilyn J. Rogador"
+                      className="w-full bg-white dark:bg-slate-900 text-slate-800 dark:text-slate-200 border border-gray-200 dark:border-slate-800 rounded-lg p-2.5 font-sans font-semibold focus:outline-none focus:ring-1 focus:ring-smei-crimson"
+                    />
+                  </div>
+
+                  <div>
+                    <label className="block text-[10px] font-mono font-bold text-gray-500 dark:text-slate-400 uppercase mb-1">
+                      Position *
+                    </label>
+                    <input
+                      type="text"
+                      value={signatoryPosition}
+                      disabled={isExporting}
+                      onChange={(e) => {
+                        setSignatoryPosition(e.target.value);
+                        if (signatoryError) setSignatoryError("");
+                      }}
+                      placeholder="Technical Supervisor"
+                      className="w-full bg-white dark:bg-slate-900 text-slate-800 dark:text-slate-200 border border-gray-200 dark:border-slate-800 rounded-lg p-2.5 font-sans font-semibold focus:outline-none focus:ring-1 focus:ring-smei-crimson"
+                    />
+                  </div>
+                </div>
+
+                {signatoryError && (
+                  <p className="text-xs text-rose-600 dark:text-rose-400 font-medium flex items-center gap-1.5 pt-1">
+                    <AlertTriangle className="w-3.5 h-3.5 shrink-0" />
+                    <span>{signatoryError}</span>
+                  </p>
+                )}
+              </div>
+
+              {exportError && (
+                <div className="p-3 bg-rose-50 dark:bg-rose-950/40 border border-rose-200 dark:border-rose-900 rounded-lg text-xs text-rose-700 dark:text-rose-300 flex items-center gap-2">
+                  <AlertTriangle className="w-4 h-4 shrink-0" />
+                  <span>{exportError}</span>
+                </div>
+              )}
+            </div>
+
+            {/* Modal Footer */}
+            <div className="bg-slate-50 dark:bg-slate-950 p-4 border-t border-gray-200 dark:border-slate-800 flex items-center justify-end gap-2 shrink-0">
+              <button
+                type="button"
+                onClick={() => setIsExportDialogOpen(false)}
+                disabled={isExporting}
+                className="px-4 py-2 border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-900 text-slate-700 dark:text-slate-300 hover:bg-slate-50 dark:hover:bg-slate-800 rounded-lg text-xs font-bold font-mono uppercase tracking-wider transition-colors cursor-pointer disabled:opacity-50"
+              >
+                Cancel
+              </button>
+              <button
+                type="button"
+                onClick={handleConfirmExport}
+                disabled={isExporting}
+                className="bg-smei-crimson hover:bg-smei-darkred text-white px-5 py-2 rounded-lg text-xs font-bold font-mono uppercase tracking-wider flex items-center gap-2 shadow-sm transition-all cursor-pointer active:scale-95 disabled:opacity-50"
+              >
+                {isExporting ? (
+                  <>
+                    <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                    <span>Exporting...</span>
+                  </>
+                ) : (
+                  <>
+                    <FileSpreadsheet className="w-3.5 h-3.5" />
+                    <span>Export Manifest</span>
+                  </>
+                )}
+              </button>
+            </div>
           </div>
         </div>
       )}

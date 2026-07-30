@@ -1,99 +1,36 @@
 import React, { useState, useEffect, useRef } from "react";
-import { Lock, ShieldAlert, CheckCircle2, ArrowRight } from "lucide-react";
-import { User, UserRole } from "../types";
+import { Lock, ShieldAlert, ArrowRight } from "lucide-react";
+import { User } from "../types";
+import { SecurityService } from "../services/securityService";
 
 interface ModuleSecurityGateProps {
-  moduleName: "Purchase Order" | "Request For Supply" | "Payment Instruction Slip" | "Canvass Sheet" | "Request For Supply (RFS) Approval";
+  moduleName: string;
+  gateKey?: string;
   currentUser: User;
   children: React.ReactNode;
 }
 
-export default function ModuleSecurityGate({ moduleName, currentUser, children }: ModuleSecurityGateProps) {
+export default function ModuleSecurityGate({ moduleName, gateKey, currentUser, children }: ModuleSecurityGateProps) {
   const [isLocked, setIsLocked] = useState(false);
   const [pinInput, setPinInput] = useState("");
   const [error, setError] = useState("");
-  const [requiredPin, setRequiredPin] = useState("");
   const inputRef = useRef<HTMLInputElement>(null);
 
+  const targetKey = gateKey || moduleName;
+
+  const checkSecurity = () => {
+    const status = SecurityService.isPINRequired(targetKey, currentUser);
+    setIsLocked(status.required);
+  };
+
   useEffect(() => {
-    // Admin always bypasses security
-    if (currentUser.role === UserRole.Administrator) {
-      setIsLocked(false);
-      return;
-    }
-
-    // Check if security rule is enabled for this module
-    const checkSecurity = () => {
-      try {
-        const savedSetting = localStorage.getItem("smei_security_config");
-        const globalEnabled = savedSetting === null ? false : JSON.parse(savedSetting).enabled;
-
-        if (!globalEnabled) {
-          setIsLocked(false);
-          return;
-        }
-
-        const saved = localStorage.getItem("smei_module_pins");
-        if (saved) {
-          const rules = JSON.parse(saved);
-          // Find any rule that is enabled for this module name
-          const rule = rules.find(
-            (r: any) => r.moduleName === moduleName && r.isEnabled === true
-          );
-          
-          if (rule) {
-            setRequiredPin(rule.pinCode);
-            
-            // Check session storage if already unlocked in this session
-            const isUnlockedInSession = sessionStorage.getItem("smei_session_unlocked") === "true";
-            if (isUnlockedInSession) {
-              setIsLocked(false);
-            } else {
-              setIsLocked(true);
-            }
-          } else {
-            setIsLocked(false);
-          }
-        } else {
-          // Default initial settings
-          let isRuleEnabled = true;
-          let defaultPin = "1234";
-          if (moduleName === "Purchase Order") {
-            defaultPin = "1234";
-          } else if (moduleName === "Request For Supply") {
-            defaultPin = "5678";
-          } else if (moduleName === "Request For Supply (RFS) Approval") {
-            defaultPin = "7777";
-          } else if (moduleName === "Payment Instruction Slip") {
-            defaultPin = "4321";
-          } else if (moduleName === "Canvass Sheet") {
-            defaultPin = "9999";
-          } else {
-            isRuleEnabled = false;
-          }
-
-          setRequiredPin(defaultPin);
-          if (isRuleEnabled) {
-            const isUnlockedInSession = sessionStorage.getItem("smei_session_unlocked") === "true";
-            setIsLocked(!isUnlockedInSession);
-          } else {
-            setIsLocked(false);
-          }
-        }
-      } catch (err) {
-        console.error("Failed to parse module pin configuration", err);
-        setIsLocked(false);
-      }
-    };
-
     checkSecurity();
 
-    // Add event listener to recheck when rules are modified in other tabs or components
     window.addEventListener("storage", checkSecurity);
     return () => {
       window.removeEventListener("storage", checkSecurity);
     };
-  }, [moduleName, currentUser]);
+  }, [moduleName, gateKey, currentUser]);
 
   // Handle focus on lock mount
   useEffect(() => {
@@ -123,18 +60,13 @@ export default function ModuleSecurityGate({ moduleName, currentUser, children }
     e.preventDefault();
     if (!pinInput) return;
 
-    if (pinInput === requiredPin) {
-      // Unlock module and authorize the entire session
+    const res = SecurityService.verifyAndUnlock(targetKey, pinInput, currentUser);
+    if (res.success) {
       setIsLocked(false);
-      sessionStorage.setItem("smei_session_unlocked", "true");
-      sessionStorage.setItem(`smei_unlocked_${moduleName}`, "true");
       setPinInput("");
       setError("");
-      
-      // Dispatch storage event so other open security gates automatically unlock
-      window.dispatchEvent(new Event("storage"));
     } else {
-      setError("Invalid Administrative PIN code. Please try again.");
+      setError(res.error || "Invalid Administrative PIN code. Please try again.");
       setPinInput("");
       if (inputRef.current) {
         inputRef.current.focus();
@@ -145,6 +77,8 @@ export default function ModuleSecurityGate({ moduleName, currentUser, children }
   if (!isLocked) {
     return <>{children}</>;
   }
+
+  const resolvedName = SecurityService.resolveModuleName(targetKey);
 
   return (
     <div className="relative w-full h-full min-h-[400px]">
@@ -184,7 +118,7 @@ export default function ModuleSecurityGate({ moduleName, currentUser, children }
               Security Lock Active
             </h3>
             <p className="text-xs text-slate-500 dark:text-slate-400 max-w-xs mx-auto leading-relaxed">
-              Administrative credentials required. Enter the dynamic PIN to authorize access to the <span className="font-bold text-slate-700 dark:text-slate-300">{moduleName}</span> module.
+              Administrative credentials required. Enter the dynamic PIN to authorize access to the <span className="font-bold text-slate-700 dark:text-slate-300">{resolvedName}</span> module.
             </p>
           </div>
 

@@ -1,5 +1,6 @@
 import React, { useState, useEffect } from "react";
 import { motion } from "motion/react";
+import SystemMonitoringModule from "./SystemMonitoringModule";
 import { 
   LayoutDashboard, 
   Key, 
@@ -7,7 +8,6 @@ import {
   Layers, 
   TrendingUp, 
   Clock, 
-  FileCheck, 
   Activity, 
   ArrowRight,
   ShieldCheck,
@@ -108,6 +108,9 @@ export default function TsdDashboard({ onNavigate }: TsdDashboardProps) {
 
   return (
     <div id="tsd-dashboard" className="relative p-6 md:p-10 space-y-8 max-w-7xl mx-auto overflow-hidden">
+      {/* 1. System Resource & Storage Monitoring Section */}
+      <SystemMonitoringModule />
+
       {/* Banner / Header */}
       <div className="flex flex-col md:flex-row md:items-center justify-between gap-4 bg-white dark:bg-neutral-900 p-6 rounded-2xl border border-gray-100 dark:border-neutral-800 shadow-sm relative z-10">
         <div>

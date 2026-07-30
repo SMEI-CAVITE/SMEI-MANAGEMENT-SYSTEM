@@ -21,11 +21,13 @@ export interface UserDB {
   id: string;
   username: string;
   passwordHash: string;
+  password?: string;
   fullName: string;
   email: string;
   role: string;
   department: string;
   status: "Active" | "Disabled" | "Locked" | "Pending";
+  employeeId?: string;
   avatarUrl?: string;
   loginAttempts?: number;
   profile_image?: string;
@@ -150,6 +152,10 @@ export interface ApprovalLogDB {
 
 export interface NotificationDB {
   id: string;
+  portal?: string;
+  module?: string;
+  priority?: string;
+  workflowId?: string;
   userId: string;
   role: string;
   title: string;
@@ -158,6 +164,14 @@ export interface NotificationDB {
   time: string;
   isRead: boolean;
   poId?: string;
+  documentType?: string;
+  documentId?: string;
+  documentNumber?: string;
+  status?: string;
+  eventType?: string;
+  createdAt?: string;
+  readAt?: string;
+  createdBy?: string;
 }
 
 export interface AuditLogDB {
@@ -185,6 +199,7 @@ export interface InvitationDB {
 }
 
 export interface DBStructure {
+  employee_sequence?: number;
   users: UserDB[];
   roles: RoleDB[];
   departments: DepartmentDB[];
@@ -197,6 +212,10 @@ export interface DBStructure {
   payment_instruction_slips?: PaymentInstructionSlipDB[];
   requests_for_supply?: RequestForSupplyDB[];
   canvass_sheets?: CanvassSheetDB[];
+  monitoring_file_registry?: any[];
+  monitoring_operations_log?: any[];
+  monitoring_snapshots?: any[];
+  monitoring_settings?: any;
 }
 
 const DATA_DIR = path.join(process.cwd(), "data");
@@ -249,7 +268,113 @@ class Database {
         if (!this.data.invitations) this.data.invitations = [];
         if (!this.data.payment_instruction_slips) this.data.payment_instruction_slips = [];
         if (!this.data.requests_for_supply) this.data.requests_for_supply = [];
+        if (this.data.requests_for_supply.length === 0) {
+          this.data.requests_for_supply = [
+            {
+              id: "rfs-001",
+              rfsNumber: "2026-07-001",
+              dateRequested: "2026-07-15",
+              dueDate: "2026-07-30",
+              department: "Purchasing",
+              controlNumber: "SMEI-RFS-2026-001",
+              purchaseOrderNumber: "SMEI-2026-0001",
+              items: [
+                {
+                  id: "item-1",
+                  quantity: 10,
+                  unit: "pcs",
+                  description: "STRUCTURAL STEEL REINFORCEMENT SUPPORT GIRDERS",
+                  lastPurchaseDate: "2026-01-10",
+                  lastPurchaseQuantity: 10,
+                  lastPurchaseUnitPrice: 5000,
+                  currentPurchaseDate: "2026-07-15",
+                  currentPurchaseQuantity: 10,
+                  currentPurchaseUnitPrice: 5200,
+                  remarks: "Standard stock"
+                }
+              ],
+              status: "Complete",
+              approvalStatus: "Approved",
+              modeOfRequest: "Regular",
+              purpose: "STRUCTURAL STEEL REINFORCEMENT SUPPORT GIRDERS",
+              requestedBy: "VICEDO, Lalaine",
+              verifiedBy: "ORONGAN, Eliza C.",
+              approvedBy: "Agnes C. Vallejo",
+              approvedByName: "Agnes C. Vallejo",
+              approvedAt: "2026-07-16T10:00:00.000Z",
+              created_by: "Purchasing Staff",
+              createdAt: "2026-07-15T08:00:00.000Z",
+              updatedAt: "2026-07-16T10:00:00.000Z"
+            },
+            {
+              id: "rfs-002",
+              rfsNumber: "2026-07-002",
+              dateRequested: "2026-07-20",
+              dueDate: "2026-08-05",
+              department: "Production",
+              controlNumber: "SMEI-RFS-2026-002",
+              purchaseOrderNumber: "",
+              items: [
+                {
+                  id: "item-2",
+                  quantity: 50,
+                  unit: "kgs",
+                  description: "STAINLESS STEEL WELDING RODS 3.2MM E308L-16",
+                  lastPurchaseDate: "2026-03-01",
+                  lastPurchaseQuantity: 30,
+                  lastPurchaseUnitPrice: 450,
+                  currentPurchaseDate: "2026-07-20",
+                  currentPurchaseQuantity: 50,
+                  currentPurchaseUnitPrice: 480,
+                  remarks: "Urgent replenishment"
+                }
+              ],
+              status: "Complete",
+              approvalStatus: "Approved",
+              modeOfRequest: "Urgent",
+              purpose: "PRODUCTION WELDING CONSUMABLES REPLENISHMENT",
+              requestedBy: "ROGADOR, Aprilyn",
+              verifiedBy: "ORONGAN, Eliza C.",
+              approvedBy: "Agnes C. Vallejo",
+              approvedByName: "Agnes C. Vallejo",
+              approvedAt: "2026-07-21T09:30:00.000Z",
+              created_by: "Department Head",
+              createdAt: "2026-07-20T08:00:00.000Z",
+              updatedAt: "2026-07-21T09:30:00.000Z"
+            }
+          ];
+        }
         if (!this.data.canvass_sheets) this.data.canvass_sheets = [];
+
+        // Ensure user employeeIds are migrated and normalized to SMEI-EMPLOYEE-### format
+        let maxExistingSeq = 0;
+        let unassignedIndex = 1;
+        this.data.users.forEach((u) => {
+          if (!u.employeeId || !u.employeeId.startsWith("SMEI-EMPLOYEE-")) {
+            if (u.username.toLowerCase() === "admin" || u.id === "u1") {
+              u.employeeId = "SMEI-EMPLOYEE-001";
+            } else {
+              while (this.data.users.some(other => other.employeeId === `SMEI-EMPLOYEE-${String(unassignedIndex).padStart(3, '0')}`)) {
+                unassignedIndex++;
+              }
+              u.employeeId = `SMEI-EMPLOYEE-${String(unassignedIndex).padStart(3, '0')}`;
+              unassignedIndex++;
+            }
+          }
+          if (u.employeeId) {
+            const match = u.employeeId.match(/\d+/);
+            if (match) {
+              const num = parseInt(match[0], 10);
+              if (!isNaN(num) && num > maxExistingSeq) {
+                maxExistingSeq = num;
+              }
+            }
+          }
+        });
+
+        if (this.data.employee_sequence === undefined || this.data.employee_sequence < maxExistingSeq) {
+          this.data.employee_sequence = maxExistingSeq;
+        }
 
         // Force the admin's password to be "123!" and active status for user convenience
         const adminUser = this.data.users.find(u => u.username.toLowerCase() === "admin");
@@ -257,8 +382,8 @@ class Database {
           adminUser.passwordHash = hashPassword("123!");
           adminUser.status = "Active";
           adminUser.loginAttempts = 0;
-          this.save();
         }
+        this.save();
       } catch (err) {
         console.error("Error reading database file, resetting to seed data:", err);
         this.seed();
@@ -301,7 +426,7 @@ class Database {
       {
         id: "r2",
         name: "Purchasing Staff",
-        permissions: ["view_dashboard", "create_po", "edit_own_po", "submit_po", "view_all_pos", "view_suppliers", "import_excel", "export_excel"]
+        permissions: ["view_dashboard", "create_po", "edit_own_po", "submit_po", "view_all_pos", "view_suppliers"]
       },
       {
         id: "r3",
@@ -336,6 +461,7 @@ class Database {
         role: "Administrator",
         department: "Management",
         status: "Active",
+        employeeId: "SMEI-EMPLOYEE-001",
         avatarUrl: "https://images.unsplash.com/photo-1534528741775-53994a69daeb?w=150"
       }
     ];
@@ -411,7 +537,56 @@ class Database {
     const approvals: ApprovalLogDB[] = [];
 
     // Seed Notifications
-    const notifications: NotificationDB[] = [];
+    const notifications: NotificationDB[] = [
+      {
+        id: "notif_tsd_seed_1",
+        portal: "TSD",
+        module: "control-no",
+        priority: "MEDIUM",
+        userId: "",
+        role: "Administrator",
+        title: "Control Number Created",
+        message: "Control Number CA-01-0001-26 generated for Inbound Manifest #1002.",
+        date: new Date().toISOString().split("T")[0],
+        time: "09:00 AM",
+        isRead: false,
+        status: "ACTIVE",
+        eventType: "INFO",
+        createdAt: new Date().toISOString()
+      },
+      {
+        id: "notif_tsd_seed_2",
+        portal: "TSD",
+        module: "unloading-loading",
+        priority: "MEDIUM",
+        userId: "",
+        role: "Administrator",
+        title: "Unloading / Loading Completed",
+        message: "Unloading/Loading session verified for Control No: CA-01-0001-26.",
+        date: new Date().toISOString().split("T")[0],
+        time: "10:30 AM",
+        isRead: false,
+        status: "ACTIVE",
+        eventType: "INFO",
+        createdAt: new Date().toISOString()
+      },
+      {
+        id: "notif_tsd_seed_3",
+        portal: "TSD",
+        module: "hazardous-waste",
+        priority: "HIGH",
+        userId: "",
+        role: "Administrator",
+        title: "Hazardous Waste Processing Completed",
+        message: "Hazardous waste catalog breakdown completed for Control No: CA-01-0001-26.",
+        date: new Date().toISOString().split("T")[0],
+        time: "01:15 PM",
+        isRead: false,
+        status: "ACTIVE",
+        eventType: "INFO",
+        createdAt: new Date().toISOString()
+      }
+    ];
 
     // Seed Audit Logs
     const audit_logs: AuditLogDB[] = [];
@@ -448,6 +623,55 @@ class Database {
   public deleteUser(id: string) {
     this.data.users = this.data.users.filter((u) => u.id !== id);
     this.save();
+  }
+
+  public previewNextEmployeeId(): string {
+    let maxSeq = this.data.employee_sequence || 0;
+    this.data.users.forEach((u) => {
+      if (u.employeeId) {
+        const match = u.employeeId.match(/\d+/);
+        if (match) {
+          const num = parseInt(match[0], 10);
+          if (!isNaN(num) && num > maxSeq) {
+            maxSeq = num;
+          }
+        }
+      }
+    });
+
+    let nextSeq = maxSeq + 1;
+    let candidate = `SMEI-EMPLOYEE-${String(nextSeq).padStart(3, '0')}`;
+    while (this.data.users.some((u) => u.employeeId === candidate)) {
+      nextSeq++;
+      candidate = `SMEI-EMPLOYEE-${String(nextSeq).padStart(3, '0')}`;
+    }
+    return candidate;
+  }
+
+  public getNextEmployeeId(): string {
+    let maxSeq = this.data.employee_sequence || 0;
+    this.data.users.forEach((u) => {
+      if (u.employeeId) {
+        const match = u.employeeId.match(/\d+/);
+        if (match) {
+          const num = parseInt(match[0], 10);
+          if (!isNaN(num) && num > maxSeq) {
+            maxSeq = num;
+          }
+        }
+      }
+    });
+
+    let nextSeq = maxSeq + 1;
+    let candidate = `SMEI-EMPLOYEE-${String(nextSeq).padStart(3, '0')}`;
+    while (this.data.users.some((u) => u.employeeId === candidate)) {
+      nextSeq++;
+      candidate = `SMEI-EMPLOYEE-${String(nextSeq).padStart(3, '0')}`;
+    }
+
+    this.data.employee_sequence = nextSeq;
+    this.save();
+    return candidate;
   }
 
   public getRoles(): RoleDB[] {
@@ -635,6 +859,140 @@ class Database {
   public deleteCanvassSheet(id: string) {
     if (!this.data.canvass_sheets) this.data.canvass_sheets = [];
     this.data.canvass_sheets = this.data.canvass_sheets.filter((c) => c.id !== id);
+    this.save();
+  }
+
+  // ==========================================
+  // SYSTEM RESOURCE & STORAGE MONITORING METHODS
+  // ==========================================
+
+  public getMonitoringFiles(): any[] {
+    if (!this.data.monitoring_file_registry) this.data.monitoring_file_registry = [];
+    return this.data.monitoring_file_registry;
+  }
+
+  public saveMonitoringFile(fileRecord: any) {
+    if (!this.data.monitoring_file_registry) this.data.monitoring_file_registry = [];
+    const idx = this.data.monitoring_file_registry.findIndex((f) => f.id === fileRecord.id);
+    if (idx >= 0) {
+      this.data.monitoring_file_registry[idx] = {
+        ...this.data.monitoring_file_registry[idx],
+        ...fileRecord,
+        updatedAt: new Date().toISOString()
+      };
+    } else {
+      this.data.monitoring_file_registry.push({
+        ...fileRecord,
+        createdAt: fileRecord.createdAt || new Date().toISOString(),
+        updatedAt: new Date().toISOString()
+      });
+    }
+    this.save();
+  }
+
+  public bulkSyncMonitoringFiles(files: any[]) {
+    if (!this.data.monitoring_file_registry) this.data.monitoring_file_registry = [];
+    
+    files.forEach((f) => {
+      const idx = this.data.monitoring_file_registry!.findIndex((existing) => existing.id === f.id);
+      if (idx >= 0) {
+        this.data.monitoring_file_registry![idx] = {
+          ...this.data.monitoring_file_registry![idx],
+          ...f,
+          updatedAt: new Date().toISOString()
+        };
+      } else {
+        this.data.monitoring_file_registry!.push({
+          ...f,
+          createdAt: f.createdAt || new Date().toISOString(),
+          updatedAt: new Date().toISOString()
+        });
+      }
+    });
+
+    this.save();
+  }
+
+  public deleteMonitoringFile(id: string) {
+    if (!this.data.monitoring_file_registry) this.data.monitoring_file_registry = [];
+    const record = this.data.monitoring_file_registry.find((f) => f.id === id);
+    if (record) {
+      record.status = "DELETED";
+      record.updatedAt = new Date().toISOString();
+      this.save();
+    }
+  }
+
+  public logDatabaseOperation(portal: string, moduleName: string, operation: "READ" | "CREATE" | "UPDATE" | "DELETE", count: number = 1) {
+    if (!this.data.monitoring_operations_log) this.data.monitoring_operations_log = [];
+    const today = new Date().toISOString().split("T")[0];
+    
+    // Aggregate by day, portal, module, operation to keep data lightweight
+    const existing = this.data.monitoring_operations_log.find(
+      (log) => log.date === today && log.portal === portal && log.module === moduleName && log.operation === operation
+    );
+
+    if (existing) {
+      existing.count = (existing.count || 0) + count;
+      existing.timestamp = new Date().toISOString();
+    } else {
+      this.data.monitoring_operations_log.push({
+        id: `OP-${Date.now()}-${Math.random().toString(36).substring(2, 7)}`,
+        date: today,
+        timestamp: new Date().toISOString(),
+        portal,
+        module: moduleName,
+        operation,
+        count
+      });
+    }
+
+    this.save();
+  }
+
+  public getMonitoringOperations(date?: string): any[] {
+    if (!this.data.monitoring_operations_log) this.data.monitoring_operations_log = [];
+    if (date) {
+      return this.data.monitoring_operations_log.filter((log) => log.date === date);
+    }
+    return this.data.monitoring_operations_log;
+  }
+
+  public getMonitoringSnapshots(): any[] {
+    if (!this.data.monitoring_snapshots) this.data.monitoring_snapshots = [];
+    return this.data.monitoring_snapshots;
+  }
+
+  public createMonitoringSnapshot(snapshot: any) {
+    if (!this.data.monitoring_snapshots) this.data.monitoring_snapshots = [];
+    const today = snapshot.date || new Date().toISOString().split("T")[0];
+    const idx = this.data.monitoring_snapshots.findIndex((s) => s.date === today);
+    if (idx >= 0) {
+      this.data.monitoring_snapshots[idx] = { ...snapshot, date: today, timestamp: new Date().toISOString() };
+    } else {
+      this.data.monitoring_snapshots.push({ ...snapshot, date: today, timestamp: new Date().toISOString() });
+    }
+    this.save();
+  }
+
+  public getMonitoringSettings(): any {
+    if (!this.data.monitoring_settings) {
+      this.data.monitoring_settings = {
+        storageLimitBytes: 5368709120, // 5 GB
+        warningThresholdPct: 70,
+        criticalThresholdPct: 85,
+        extremeThresholdPct: 95
+      };
+      this.save();
+    }
+    return this.data.monitoring_settings;
+  }
+
+  public saveMonitoringSettings(settings: any) {
+    this.data.monitoring_settings = {
+      ...this.getMonitoringSettings(),
+      ...settings
+    };
     this.save();
   }
 }

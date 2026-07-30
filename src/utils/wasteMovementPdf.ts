@@ -230,15 +230,21 @@ export async function populateWasteMovementPdf(
     if (qty === undefined || qty === null || String(qty).trim() === "") return "-";
     const num = Number(qty);
     if (isNaN(num)) return String(qty).trim() || "-";
-    return String(num);
+    return num.toFixed(5);
   };
+
+  const q1Val = (m1 && m1.quantity !== undefined && m1.quantity !== null) ? m1.quantity : (record.quantity1 || 0);
+  const q2Val = (m2 && m2.quantity !== undefined && m2.quantity !== null) ? m2.quantity : (record.quantity2 || 0);
+  const q3Val = (m3 && m3.quantity !== undefined && m3.quantity !== null) ? m3.quantity : (record.quantity3 || 0);
 
   // Row 1: Export for recovery
   const row1 = WASTE_MOVEMENT_PDF_COORDINATES.methodRows[0];
   drawCenteredText("Export for recovery", row1.methodX, row1.y, 9);
-  drawRightAlignedText(formatQty(m1?.quantity), row1.quantityX, row1.y, 9);
+  drawRightAlignedText(formatQty(q1Val), row1.quantityX, row1.y, 9);
   drawText(m1?.destination || "Off-shore Treater", row1.destinationX, row1.y, 9);
-  if (m1?.remarks) drawText(String(m1.remarks).trim(), row1.remarksX, row1.y, 9);
+  if (m1?.remarks && String(m1.remarks).trim() !== "Auto-populated") {
+    drawText(String(m1.remarks).trim(), row1.remarksX, row1.y, 9);
+  }
 
   // Row 2: Disposal (Transport Date displays ONLY on this Disposal row)
   const row2 = WASTE_MOVEMENT_PDF_COORDINATES.methodRows[1];
@@ -246,19 +252,26 @@ export async function populateWasteMovementPdf(
     drawCenteredText(formattedDate, row2.transportDateX, row2.y, 9);
   }
   drawCenteredText("Disposal", row2.methodX, row2.y, 9);
-  drawRightAlignedText(formatQty(m2?.quantity), row2.quantityX, row2.y, 9);
+  drawRightAlignedText(formatQty(q2Val), row2.quantityX, row2.y, 9);
   drawText(m2?.destination || "Disposal by SMEI", row2.destinationX, row2.y, 9);
-  if (m2?.remarks) drawText(String(m2.remarks).trim(), row2.remarksX, row2.y, 9);
+  if (m2?.remarks && String(m2.remarks).trim() !== "Auto-populated") {
+    drawText(String(m2.remarks).trim(), row2.remarksX, row2.y, 9);
+  }
 
   // Row 3: Recycling/Recovery
   const row3 = WASTE_MOVEMENT_PDF_COORDINATES.methodRows[2];
   drawCenteredText("Recycling/Recovery", row3.methodX, row3.y, 9);
-  drawRightAlignedText(formatQty(m3?.quantity), row3.quantityX, row3.y, 9);
+  drawRightAlignedText(formatQty(q3Val), row3.quantityX, row3.y, 9);
   drawText(m3?.destination || "Local/Offshore", row3.destinationX, row3.y, 9);
-  if (m3?.remarks) drawText(String(m3.remarks).trim(), row3.remarksX, row3.y, 9);
+  if (m3?.remarks && String(m3.remarks).trim() !== "Auto-populated") {
+    drawText(String(m3.remarks).trim(), row3.remarksX, row3.y, 9);
+  }
 
   // 4. Draw Grand Total Quantity (Right-aligned)
-  const grandTotalStr = formatQty(record.totalQty);
+  const grandTotalVal = (record.totalQty !== undefined && record.totalQty !== null)
+    ? record.totalQty
+    : Number((q1Val + q2Val + q3Val).toFixed(5));
+  const grandTotalStr = formatQty(grandTotalVal);
   drawRightAlignedText(grandTotalStr, WASTE_MOVEMENT_PDF_COORDINATES.grandTotal.x, WASTE_MOVEMENT_PDF_COORDINATES.grandTotal.y, 9.5, true);
 
   return await pdfDoc.save();

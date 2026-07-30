@@ -1,4 +1,5 @@
 import { PurchaseOrder, PaymentInstructionSlip, RequestForSupply, CanvassSheet } from "../types";
+import { calculatePOFinancials } from "../store";
 
 export const formatCurrency = (val: number | string | undefined | null, symbol: string = "₱"): string => {
   if (val === undefined || val === null || val === "") return "";
@@ -104,7 +105,7 @@ export function mapPOData(po: PurchaseOrder): Record<string, any> {
   const rawRfs = po.rfsNumber || (po.poNumber ? po.poNumber.split("-").pop() || "10672" : "10672");
   const rfsNo = formatRFSNo(rawRfs, po.poDate);
   const symbol = po.currencySymbol || "₱";
-  const formattedPurpose = po.purpose ?? "";
+  const formattedPurpose = (po.purpose ?? "").toUpperCase();
   
   const itemsCount = po.items ? po.items.length : 0;
   const qtyLines: string[] = [];
@@ -157,6 +158,25 @@ export function mapPOData(po: PurchaseOrder): Record<string, any> {
   const UNIT_PRICE = priceLines.join("\n");
   const AMOUNT = amountLines.join("\n");
 
+  const itemIndexedData: Record<string, string> = {};
+  const maxItemsIndex = Math.max(8, itemsCount);
+  for (let idx = 1; idx <= maxItemsIndex; idx++) {
+    const item = po.items && po.items[idx - 1];
+    if (item) {
+      itemIndexedData[`QUANTITY${idx}`] = item.quantity !== undefined && item.quantity !== null && String(item.quantity) !== "" ? String(item.quantity) : "";
+      itemIndexedData[`UNIT${idx}`] = item.unit || "";
+      itemIndexedData[`DESCRIPTION${idx}`] = item.description || "";
+      itemIndexedData[`UNIT_PRICE${idx}`] = item.unitPrice !== undefined && item.unitPrice !== null && String(item.unitPrice) !== "" ? formatCurrency(item.unitPrice, symbol) : "";
+      itemIndexedData[`AMOUNT${idx}`] = item.amount !== undefined && item.amount !== null && String(item.amount) !== "" ? formatCurrency(item.amount, symbol) : "";
+    } else {
+      itemIndexedData[`QUANTITY${idx}`] = "";
+      itemIndexedData[`UNIT${idx}`] = "";
+      itemIndexedData[`DESCRIPTION${idx}`] = "";
+      itemIndexedData[`UNIT_PRICE${idx}`] = "";
+      itemIndexedData[`AMOUNT${idx}`] = "";
+    }
+  }
+
   const prepared = alignSignatory(po.preparedBy, po.preparedByTitle, po.excludePreparedBy);
   const checked = alignSignatory(po.checkedBy, po.checkedByTitle, po.excludeCheckedBy);
   const verified = alignSignatory(po.verifiedBy, po.verifiedByTitle, po.excludeVerifiedBy);
@@ -179,6 +199,50 @@ export function mapPOData(po: PurchaseOrder): Record<string, any> {
     }
   }
 
+  const category = po.category || "Vatable";
+  const catLower = category.toLowerCase();
+  const isVatable = catLower.includes("vatable");
+  const isExempt = catLower.includes("exempt") || catLower.includes("gas");
+  const isZero = catLower.includes("zero");
+
+  const partsEwtRate = po.partsEwtPercentage !== undefined ? po.partsEwtPercentage / 100 : 0.01;
+  const laborEwtRate = po.laborEwtPercentage !== undefined ? po.laborEwtPercentage / 100 : 0.02;
+
+  const computed = calculatePOFinancials(
+    po.items || [],
+    category,
+    po.discountVatAmount || 0,
+    partsEwtRate,
+    laborEwtRate
+  );
+
+  const itemsSum = po.items ? po.items.reduce((sum, item) => sum + (Number(item.quantity || 0) * Number(item.unitPrice || 0)), 0) : 0;
+
+  const isOverride = !!(po as any).overrideVat;
+
+  const vatableAmount = isVatable
+    ? (isOverride && po.vatableAmount !== undefined && po.vatableAmount !== null ? po.vatableAmount : computed.vatableAmount)
+    : 0;
+
+  const vat12 = isVatable
+    ? (isOverride && po.vat12 !== undefined && po.vat12 !== null ? po.vat12 : computed.vat12)
+    : 0;
+
+  const vatExemptAmount = isExempt
+    ? (isOverride && po.vatExemptAmount !== undefined && po.vatExemptAmount !== null ? po.vatExemptAmount : computed.vatExemptAmount)
+    : 0;
+
+  const zeroRatedAmount = isZero
+    ? (isOverride && po.zeroRatedAmount !== undefined && po.zeroRatedAmount !== null ? po.zeroRatedAmount : computed.zeroRatedAmount)
+    : 0;
+
+  const partsEwt1 = isOverride && po.partsEwt1 !== undefined && po.partsEwt1 !== null ? po.partsEwt1 : computed.partsEwt1;
+  const laborEwt2 = isOverride && po.laborEwt2 !== undefined && po.laborEwt2 !== null ? po.laborEwt2 : computed.laborEwt2;
+  const discountVatAmount = po.discountVatAmount || 0;
+
+  const grossAmount = isOverride && po.grossAmount !== undefined && po.grossAmount !== null ? po.grossAmount : computed.grossAmount;
+  const totalAmount = isOverride && po.totalAmount !== undefined && po.totalAmount !== null ? po.totalAmount : computed.totalAmount;
+
   return {
     DOCUMENT_NO: "FM-PPD-03",
     RFS_NO: rfsNo,
@@ -197,19 +261,21 @@ export function mapPOData(po: PurchaseOrder): Record<string, any> {
     UNIT_PRICE,
     AMOUNT,
 
+    ...itemIndexedData,
+
     items,
 
-    VATABLE_AMOUNT: po.category?.toLowerCase().includes("vatable") ? formatCurrency(po.vatableAmount, symbol) : "",
-    VAT_AMOUNT: po.category?.toLowerCase().includes("vatable") ? formatCurrency(po.vat12, symbol) : "",
-    VAT_EXEMPT_AMOUNT: po.category?.toLowerCase().includes("exempt") ? formatCurrency(po.vatExemptAmount, symbol) : "",
-    ZERO_RATED_AMOUNT: po.category?.toLowerCase().includes("zero") ? formatCurrency(po.zeroRatedAmount, symbol) : "",
-    TOTAL_AMOUNT: formatCurrency(po.totalAmount, symbol),
-    GROSS_AMOUNT: formatCurrency(po.grossAmount || po.totalAmount, symbol),
-    PARTS_EWT: po.partsEwt1 > 0 ? formatCurrency(po.partsEwt1, symbol) : "",
-    LABOR_EWT: po.laborEwt2 > 0 ? formatCurrency(po.laborEwt2, symbol) : "",
+    VATABLE_AMOUNT: isVatable ? formatCurrency(vatableAmount, symbol) : "",
+    VAT_AMOUNT: isVatable ? formatCurrency(vat12, symbol) : "",
+    VAT_EXEMPT_AMOUNT: isExempt ? formatCurrency(vatExemptAmount, symbol) : "",
+    ZERO_RATED_AMOUNT: isZero ? formatCurrency(zeroRatedAmount, symbol) : "",
+    TOTAL_AMOUNT: formatCurrency(totalAmount, symbol),
+    GROSS_AMOUNT: formatCurrency(grossAmount, symbol),
+    PARTS_EWT: partsEwt1 > 0 ? formatCurrency(partsEwt1, symbol) : "",
+    LABOR_EWT: laborEwt2 > 0 ? formatCurrency(laborEwt2, symbol) : "",
     EWT_TYPE: po.ewtType ?? "",
     EWT_PERCENTAGE: po.ewtPercentage !== undefined ? `${po.ewtPercentage}%` : "",
-    DISCOUNT_VAT_AMOUNT: po.discountVatAmount > 0 ? formatCurrency(po.discountVatAmount, symbol) : "",
+    DISCOUNT_VAT_AMOUNT: discountVatAmount > 0 ? formatCurrency(discountVatAmount, symbol) : "",
 
     PAYMENT_TERMS: po.paymentTerms ?? "",
     WORK_DURATION: po.workDuration ?? "",
@@ -319,22 +385,50 @@ export function mapPISData(slip: PaymentInstructionSlip): Record<string, any> {
   const position3 = slip.acceptedByPosition || "Purchasing Manager";
 
   const payments = slip.payments || [];
-  const hasPayments = payments.some(p => (p.paymentPurpose || "").trim() !== "" || (p.gross || 0) > 0 || (p.ewt || 0) > 0);
+  const rawPayments = (payments && payments.length > 0)
+    ? payments
+    : [
+        {
+          id: "1",
+          completedPOId: slip.completedPOId || "",
+          completedPONumber: slip.completedPONumber || slip.poNumber || "",
+          poNumber: slip.completedPONumber || slip.poNumber || "",
+          paymentPurpose: slip.remarks || "",
+          gross: slip.gross !== undefined ? slip.gross : slip.amount,
+          ewt: slip.ewt !== undefined ? slip.ewt : 0,
+          total: slip.total !== undefined ? slip.total : slip.amount
+        }
+      ];
+
+  const activePayments = rawPayments.filter(
+    p => (p.paymentPurpose || "").trim() !== "" || (p.completedPONumber || p.poNumber || "").trim() !== "" || (p.gross || 0) > 0 || (p.ewt || 0) > 0
+  );
+
+  const hasPayments = activePayments.length > 0;
   
   let sumGross = 0;
   let sumEwt = 0;
   let sumTotal = 0;
+  let ewtPercentageStr = "1%";
 
   if (hasPayments) {
-    payments.forEach(p => {
+    activePayments.forEach(p => {
       sumGross += p.gross || 0;
-      sumEwt += p.ewt || 0;
+      const absEwt = (p.gross || 0) * (p.ewt || 0) / 100;
+      sumEwt += absEwt;
       sumTotal += p.total || 0;
+      if (p.ewt > 0) {
+        ewtPercentageStr = `${p.ewt}%`;
+      }
     });
   } else {
     sumGross = Number(slip.gross) || 0;
-    sumEwt = Number(slip.ewt) || 0;
+    const absEwt = (slip.gross || 0) * (slip.ewt || 0) / 100;
+    sumEwt = absEwt || 0;
     sumTotal = Number(slip.total) || 0;
+    if (slip.ewt && slip.ewt > 0) {
+      ewtPercentageStr = `${slip.ewt}%`;
+    }
   }
 
   const hasGross = sumGross > 0;
@@ -357,27 +451,80 @@ export function mapPISData(slip: PaymentInstructionSlip): Record<string, any> {
   const formattedTotal = hasTotal ? formatVal(sumTotal) : "";
 
   const mappedPayments: Record<string, any> = {};
-  const maxPayments = Math.max(3, payments.length);
-  for (let i = 0; i < maxPayments; i++) {
-    const p = payments[i];
+  const pisPaymentEntries: Array<{ poNumber: string; purposeText: string; gross: number; ewt: number; total: number }> = [];
+
+  const maxEntries = Math.max(3, activePayments.length);
+  for (let i = 0; i < maxEntries; i++) {
+    const p = activePayments[i];
     const idx = i + 1;
-    if (p && ((p.paymentPurpose || "").trim() !== "" || (p.gross || 0) > 0 || (p.ewt || 0) > 0 || (p as any).poNumber)) {
-      mappedPayments[`PO_NO_${idx}`] = (p as any).poNumber || (p as any).po_no || "";
-      mappedPayments[`PAYMENT_PURPOSE_${idx}`] = p.paymentPurpose || "";
+    if (p && ((p.paymentPurpose || "").trim() !== "" || (p.completedPONumber || p.poNumber || "").trim() !== "" || (p.gross || 0) > 0 || (p.ewt || 0) > 0)) {
+      const poRef = (p.completedPONumber || p.poNumber || "").toUpperCase().slice(0, 40);
+      const purposeText = (p.paymentPurpose || "").toUpperCase();
+
+      mappedPayments[`COMPLETED_PO_${idx}`] = poRef;
+      mappedPayments[`COMPLETED_PO_NUMBER_${idx}`] = poRef;
+      mappedPayments[`COMPLETED_PO_NO_${idx}`] = poRef;
+      mappedPayments[`PO_NO_${idx}`] = poRef;
+      mappedPayments[`PO_NO${idx}`] = poRef;
+      mappedPayments[`PO_NUMBER_${idx}`] = poRef;
+      mappedPayments[`PO_REF_${idx}`] = poRef;
+      mappedPayments[`PO_REFERENCE_${idx}`] = poRef;
+      mappedPayments[`PO_${idx}`] = poRef;
+      mappedPayments[`PO${idx}`] = poRef;
+
+      mappedPayments[`PAYMENT_PURPOSE_${idx}`] = purposeText;
+      mappedPayments[`PURPOSE_${idx}`] = purposeText;
+      mappedPayments[`PURPOSE${idx}`] = purposeText;
+
+      const absEwt = (p.gross || 0) * (p.ewt || 0) / 100;
       mappedPayments[`GROSS_${idx}`] = p.gross > 0 ? formatVal(p.gross) : "";
-      mappedPayments[`EWT_${idx}`] = p.ewt > 0 ? formatVal(p.ewt) : "";
+      mappedPayments[`EWT_${idx}`] = absEwt > 0 ? formatVal(absEwt) : "";
       mappedPayments[`TOTAL_${idx}`] = p.total > 0 ? formatVal(p.total) : "";
+
+      pisPaymentEntries.push({
+        poNumber: poRef,
+        purposeText: purposeText,
+        gross: p.gross || 0,
+        ewt: p.ewt || 0,
+        total: p.total || 0
+      });
     } else {
+      mappedPayments[`COMPLETED_PO_${idx}`] = "";
+      mappedPayments[`COMPLETED_PO_NUMBER_${idx}`] = "";
+      mappedPayments[`COMPLETED_PO_NO_${idx}`] = "";
       mappedPayments[`PO_NO_${idx}`] = "";
+      mappedPayments[`PO_NO${idx}`] = "";
+      mappedPayments[`PO_NUMBER_${idx}`] = "";
+      mappedPayments[`PO_REF_${idx}`] = "";
+      mappedPayments[`PO_REFERENCE_${idx}`] = "";
+      mappedPayments[`PO_${idx}`] = "";
+      mappedPayments[`PO${idx}`] = "";
+
       mappedPayments[`PAYMENT_PURPOSE_${idx}`] = "";
+      mappedPayments[`PURPOSE_${idx}`] = "";
+      mappedPayments[`PURPOSE${idx}`] = "";
+
       mappedPayments[`GROSS_${idx}`] = "";
       mappedPayments[`EWT_${idx}`] = "";
       mappedPayments[`TOTAL_${idx}`] = "";
     }
   }
 
+  const primaryPO = (
+    payments.find(p => (p.completedPONumber || p.poNumber || "").trim() !== "")?.completedPONumber ||
+    payments.find(p => (p.completedPONumber || p.poNumber || "").trim() !== "")?.poNumber ||
+    slip.completedPONumber ||
+    slip.poNumber ||
+    ""
+  ).toUpperCase().slice(0, 40);
+
+  const primaryPurpose = (
+    payments.find(p => (p.paymentPurpose || "").trim() !== "")?.paymentPurpose ||
+    slip.remarks ||
+    ""
+  ).toUpperCase().slice(0, 40);
+
   return {
-    payments: slip.payments || [],
     PIS_NO: slip.pisNumber ?? "",
     "PIS NO": slip.pisNumber ?? "",
     SCHEDULE_DATE: slip.scheduleDate ?? "",
@@ -394,16 +541,37 @@ export function mapPISData(slip: PaymentInstructionSlip): Record<string, any> {
     HAS_GROSS: hasGross,
     HAS_EWT: hasEwt,
     HAS_TOTAL: hasTotal,
-    EWT_PERCENTAGE: hasEwt ? formattedEwt : "",
+    EWT_PERCENTAGE: ewtPercentageStr,
     ...mappedPayments,
+    PIS_PAYMENT_ENTRIES: pisPaymentEntries,
+    COMPLETED_PO: primaryPO,
+    "COMPLETED PO": primaryPO,
+    COMPLETED_PO_NUMBER: primaryPO,
+    "COMPLETED PO NUMBER": primaryPO,
+    COMPLETED_PO_NO: primaryPO,
+    "COMPLETED PO NO": primaryPO,
+    PO_NO: primaryPO,
+    "PO NO": primaryPO,
+    PO_NUMBER: primaryPO,
+    "PO NUMBER": primaryPO,
+    PO_REF: primaryPO,
+    "PO REF": primaryPO,
+    PO_REFERENCE: primaryPO,
+    "PO REFERENCE": primaryPO,
+    PAYMENT_PURPOSE: primaryPurpose,
+    "PAYMENT PURPOSE": primaryPurpose,
     CURRENCY: slip.currency === "Others" ? slip.currencyOthers : (slip.currency || ""),
     PAYMENT_MODE: slip.paymentMode === "Others" ? slip.paymentModeOthers : (slip.paymentMode || ""),
     REMARKS: slip.remarks || "",
     REMARKS_LINE_1: remarksLines[0] || "",
     REMARKS_LINE_2: remarksLines[1] || "",
-    REMARKS_LINE_3: remarksLines[2] || "",
-    REMARKS_LINE_4: remarksLines[3] || "",
-    REMARKS_LINE_5: remarksLines[4] || "",
+    REMARKS_LINE_3: "",
+    REMARKS_LINE_4: "",
+    REMARKS_LINE_5: "",
+    REMARKS3: "",
+    REMARKS4: "",
+    REMARKS_3: "",
+    REMARKS_4: "",
     REQUESTED_BY: slip.requestedBy ?? "",
     "REQUESTED BY": slip.requestedBy ?? "",
     REQUESTED_DATE: slip.requestedDate ?? "",
@@ -449,7 +617,6 @@ export function mapRFSData(req: RequestForSupply): { exportData: Record<string, 
     quantity: it.quantity || 0,
     unit: it.unit || "",
     description: it.description || "",
-    item: it.description || "",
     lastPurchaseDate: it.lastPurchaseDate || "",
     lastPurchaseQuantity: it.lastPurchaseQuantity || 0,
     lastPurchaseUnitPrice: it.lastPurchaseUnitPrice || 0,
@@ -457,26 +624,26 @@ export function mapRFSData(req: RequestForSupply): { exportData: Record<string, 
     currentPurchaseQuantity: it.currentPurchaseQuantity || 0,
     currentPurchaseUnitPrice: it.currentPurchaseUnitPrice || 0,
     remarks: it.remarks || "",
-    isItalic: false,
   }));
 
   if (req.addNothingFollows) {
     items.push({
       index: items.length + 1,
-      quantity: "",
+      quantity: "" as any,
       unit: "",
       description: "*****NOTHING FOLLOWS*****",
-      item: "*****NOTHING FOLLOWS*****",
       lastPurchaseDate: "",
-      lastPurchaseQuantity: "",
-      lastPurchaseUnitPrice: "",
+      lastPurchaseQuantity: 0,
+      lastPurchaseUnitPrice: 0,
       currentPurchaseDate: "",
-      currentPurchaseQuantity: "",
-      currentPurchaseUnitPrice: "",
+      currentPurchaseQuantity: 0,
+      currentPurchaseUnitPrice: 0,
       remarks: "",
-      isItalic: true,
-    } as any);
+    });
   }
+
+  const statusRaw = (req.status || "").toString().trim().toLowerCase();
+  const modeRaw = (req.modeOfRequest || "").toString().trim().toLowerCase();
 
   const exportData = {
     RFS_NO: formattedRFS,
@@ -492,6 +659,18 @@ export function mapRFSData(req: RequestForSupply): { exportData: Record<string, 
     REQUESTED_BY: req.requestedBy ?? "",
     VERIFIED_BY: req.verifiedBy || "",
     APPROVED_BY: req.approvedBy || "",
+
+    // RFS Status checkbox marks
+    complete: statusRaw === "complete" ? "x" : "",
+    on_time: statusRaw === "on time" || statusRaw === "on_time" || statusRaw === "ontime" ? "x" : "",
+    late: statusRaw === "late" ? "x" : "",
+    incomplete: statusRaw === "incomplete" ? "x" : "",
+
+    // Mode of Request checkbox marks
+    emergency: modeRaw === "emergency" ? "x" : "",
+    urgent: modeRaw === "urgent" ? "x" : "",
+    regular: modeRaw === "regular" ? "x" : "",
+    irregular: modeRaw === "irregular" ? "x" : "",
     
     // Add joined line mappings for single-cell Word templates
     QTY: items.map(it => String(it.quantity || "")).join("\n"),

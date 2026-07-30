@@ -55,8 +55,8 @@ export const CONTROL_NUMBER_FORMATS: Record<string, ControlNumberConfig> = {
   },
   rcNumber: {
     key: "rcNumber",
-    label: "RC No.",
-    placeholder: "R-123",
+    label: "Recycle Cert No.",
+    placeholder: "e.g. R-123",
     example: "R-123",
     template: "R-###",
     pattern: /^R-\d{1,6}$/
@@ -283,13 +283,15 @@ export function formatControlNumber(value: string | undefined | null, formatType
     return raw;
   }
 
-  // 7. RC No. formatting: R-###
-  if (configKey === "rcnumber" || configKey === "rcno" || configKey === "r") {
+  // 7. RC No. formatting: R-series (e.g., R-932, R-15402)
+  if (configKey === "rcnumber" || configKey === "rcno" || configKey === "rc" || configKey === "r") {
     if (raw === "N/A") return "N/A";
     if (/^R-\d{1,6}$/.test(raw)) return raw;
 
     const digits = raw.replace(/\D/g, "");
-    if (!digits) return raw.startsWith("R") ? raw : "";
+    if (!digits) {
+      return raw.toUpperCase().startsWith("R") ? "R-" : "";
+    }
 
     return `R-${digits}`;
   }
@@ -376,13 +378,13 @@ export function validateControlNumber(
     return { isValid: true };
   }
 
-  if (configKey === "rcnumber" || configKey === "rcno" || configKey === "r") {
+  if (configKey === "rcnumber" || configKey === "rcno" || configKey === "rc" || configKey === "r") {
     if (cleanVal === "N/A") return { isValid: true };
     const rcRegex = /^R-\d{1,6}$/;
     if (!rcRegex.test(cleanVal)) {
       return {
         isValid: false,
-        error: "RC Number must match the required format: R-123 (e.g., R-123)."
+        error: "Invalid Recycle Cert No. Expected format: R-123 (e.g., R-932, R-15402)."
       };
     }
     return { isValid: true };
@@ -422,5 +424,159 @@ export function validateControlNumber(
   }
 
   return { isValid: true };
+}
+
+/**
+ * Normalizes control numbers for clean relational matching
+ */
+export function normalizeControlNo(val: string | null | undefined): string {
+  if (!val) return "";
+  return String(val).trim().toUpperCase();
+}
+
+/**
+ * Resolves canonical tracking code across various module record structures.
+ * Priority: controlNo -> caNumber -> manifestNo -> trackingCode -> documentNumber -> ""
+ */
+export function getTrackingCode(record: any): string {
+  if (!record) return "";
+  if (typeof record === "string") return normalizeControlNo(record);
+  if (typeof record !== "object") return "";
+  const candidate =
+    record.controlNo ||
+    record.caNumber ||
+    record.manifestNo ||
+    record.trackingCode ||
+    record.documentNumber ||
+    "";
+  return normalizeControlNo(candidate);
+}
+
+/**
+ * Generates the next sequential Control Number (CA No.) based on an offset.
+ * Example: getNextCaNo("03-1233-26", 1) => "03-1234-26"
+ */
+export function getNextCaNo(baseCaNo: string, offset: number): string {
+  if (!baseCaNo || offset === 0) return baseCaNo;
+  const caMatch = baseCaNo.match(/^(0[1-9]|1[0-2])-(\d{4})-(\d{2})$/);
+  if (caMatch) {
+    const mm = caMatch[1];
+    const seq = parseInt(caMatch[2], 10) + offset;
+    const yy = caMatch[3];
+    const seqPadded = String(seq).padStart(4, "0");
+    return `${mm}-${seqPadded}-${yy}`;
+  }
+  const genericMatch = baseCaNo.match(/^(.*?)(\d+)$/);
+  if (genericMatch) {
+    const prefix = genericMatch[1];
+    const digits = genericMatch[2];
+    const newNum = parseInt(digits, 10) + offset;
+    const padded = String(newNum).padStart(digits.length, "0");
+    return `${prefix}${padded}`;
+  }
+  return baseCaNo;
+}
+
+/**
+ * Checks whether a Control Number (CA No. or unique identifier) already exists in the system.
+ * Checks compliance documents (tsd_uploaded_compliance_docs), manifest records (tsd_manifests),
+ * and workflows (tsd_workflows).
+ *
+ * @param candidateCaNo The Control Number string to check.
+ * @param excludeDocId Optional docId/id to exclude when editing an existing record.
+ * @returns Object indicating if duplicate exists and details.
+ */
+export function isControlNumberDuplicate(
+  candidateCaNo: string | null | undefined,
+  excludeDocId?: string
+): {
+  isDuplicate: boolean;
+  existingType?: "compliance_doc" | "manifest" | "workflow";
+  matchedNumber?: string;
+} {
+  const normCandidate = normalizeControlNo(candidateCaNo);
+  if (!normCandidate) return { isDuplicate: false };
+
+  // 1. Check Compliance Documents in LocalStorage
+  try {
+    const rawDocs = localStorage.getItem("tsd_uploaded_compliance_docs");
+    if (rawDocs) {
+      const docs = JSON.parse(rawDocs);
+      if (Array.isArray(docs)) {
+        for (const d of docs) {
+          if (excludeDocId && (d.id === excludeDocId || d.docId === excludeDocId)) {
+            continue;
+          }
+          if (normalizeControlNo(d.caNumber) === normCandidate || normalizeControlNo(d.controlNo) === normCandidate) {
+            return {
+              isDuplicate: true,
+              existingType: "compliance_doc",
+              matchedNumber: d.caNumber || d.controlNo || candidateCaNo || normCandidate,
+            };
+          }
+        }
+      }
+    }
+  } catch (err) {
+    console.error("[controlNumber] Error checking compliance docs storage:", err);
+  }
+
+  // 2. Check Manifest Records in LocalStorage
+  try {
+    const rawManifests = localStorage.getItem("tsd_manifests");
+    if (rawManifests) {
+      const manifests = JSON.parse(rawManifests);
+      if (Array.isArray(manifests)) {
+        for (const m of manifests) {
+          if (
+            excludeDocId &&
+            (m.docId === excludeDocId || m.id === excludeDocId || m.id === `manifest-${excludeDocId}`)
+          ) {
+            continue;
+          }
+          if (normalizeControlNo(m.controlNo) === normCandidate) {
+            return {
+              isDuplicate: true,
+              existingType: "manifest",
+              matchedNumber: m.controlNo || candidateCaNo || normCandidate,
+            };
+          }
+        }
+      }
+    }
+  } catch (err) {
+    console.error("[controlNumber] Error checking manifest records storage:", err);
+  }
+
+  // 3. Check Workflows in LocalStorage
+  try {
+    const rawWorkflows = localStorage.getItem("tsd_workflows");
+    if (rawWorkflows) {
+      const workflows = JSON.parse(rawWorkflows);
+      if (Array.isArray(workflows)) {
+        for (const w of workflows) {
+          if (
+            excludeDocId &&
+            (w.documentIds?.["control-no"] === excludeDocId ||
+              w.documentIds?.controlNumber === excludeDocId ||
+              w.id === excludeDocId)
+          ) {
+            continue;
+          }
+          if (normalizeControlNo(w.controlNo) === normCandidate) {
+            return {
+              isDuplicate: true,
+              existingType: "workflow",
+              matchedNumber: w.controlNo || candidateCaNo || normCandidate,
+            };
+          }
+        }
+      }
+    }
+  } catch (err) {
+    console.error("[controlNumber] Error checking workflows storage:", err);
+  }
+
+  return { isDuplicate: false };
 }
 
