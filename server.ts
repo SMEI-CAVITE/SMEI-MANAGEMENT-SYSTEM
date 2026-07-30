@@ -8,6 +8,9 @@ import path from "path";
 import { createServer as createViteServer } from "vite";
 import jwt from "jsonwebtoken";
 import crypto from "crypto";
+import dotenv from "dotenv";
+dotenv.config();
+
 import { getDatabase, hashPassword, UserDB, PurchaseOrderDB, AuditLogDB } from "./src/server/db.js";
 import { AuthService } from "./src/server/authService.js";
 import { UserRepository } from "./src/server/userRepository.js";
@@ -31,7 +34,8 @@ const JWT_SECRET = process.env.JWT_SECRET || "";
 if (!JWT_SECRET) {
   console.error("==================================================================");
   console.error("STARTUP ERROR: JWT_SECRET environment variable is not configured!");
-  console.error("Please configure JWT_SECRET in your environment or Vercel settings.");
+  console.error("The application cannot start because JWT_SECRET is required for signing and verifying user authentication tokens.");
+  console.error("Please configure JWT_SECRET in your environment variables or Vercel settings.");
   console.error("==================================================================");
 }
 
@@ -454,16 +458,7 @@ app.post("/api/auth/register", async (req, res) => {
   logAudit(userId, username, invite.role, "User Registered", "Auth", userId, "-", "New account created via invitation", req);
 
   // Auto log them in
-  const payload = {
-    id: userId,
-    username,
-    fullName,
-    email: newUser.email,
-    role: invite.role,
-    department: invite.department
-  };
-
-  const jwtToken = jwt.sign(payload, JWT_SECRET, { expiresIn: "1h" });
+  const jwtToken = AuthService.generateToken(newUser, JWT_SECRET, "1h");
 
   res.status(201).json({
     token: jwtToken,
